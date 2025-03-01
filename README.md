@@ -52,5 +52,5 @@ If you find this work useful in your research, please star our repository and co
 
 ## Contact
 
-Any comments, please email: guikunchen@gmail.com.
+Any comments, please email: guikunchen@gmail.com or jinli12334@gmail.com.
 
