@@ -33,7 +33,7 @@ We uploaded all the checkpoints to [BaiduDrive](https://pan.baidu.com/s/1YJXutOU
 
 ### 5. How to switch between different settings (base, novel, semantic, total):
 
-Check the <path>/maskrcnn_benchmark/config/default.py file or modify _C.OV_SETTING.TRAIN_PART, _C.OV_SETTING.VAL_PART, or _C.OV_SETTING.TEST_PART, you can set it to "base", "novel", "semantic", or "total". After making these changes, you may need to recompile the code.
+Check the <path>/maskrcnn_benchmark/config/defaults.py file or modify _C.OV_SETTING.TRAIN_PART, _C.OV_SETTING.VAL_PART, or _C.OV_SETTING.TEST_PART, you can set it to "base", "novel", "semantic", or "total". After making these changes, you may need to recompile the code.
 ```
 python setup.py build develop.
 ```
