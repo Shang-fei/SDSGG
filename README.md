@@ -22,6 +22,11 @@ We conducted evaluations on the VG and GQA datasets.
 │  ├── VG100K
 │  ├── ......
 ```
+### 3. CSV Files Documentation
+
+For detailed information about the CSV files used in the relation head module and their generation process, please refer to:
+[CSV Files Generation Documentation](/CSV_GENERATION_README.md)
+This document explains how the scene-specific description framework generates the CSV files under `maskrcnn_benchmark/modeling/roi_heads/relation_head/`.
 
 ### 3. Scripts
 
