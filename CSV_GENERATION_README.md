@@ -15,16 +15,16 @@ The CSV files are constructed based on a **Scene-specific Descriptions** approac
 As shown in the diagram above, our framework consists of three main categories:
 
 #### Certain Coexistence ($C_r^n = 1$)
-- **Description Type A (d_a^1)**: Two or more objects partially overlap
-- **Description Type P (d_p^1)**: Each object is completely separate
+- **Description Type A ($d_a^1$)**: Two or more objects partially overlap
+- **Description Type P ($d_p^1$)**: Each object is completely separate
 
 #### Possible Coexistence ($C_r^n = 0$)
-- **Description Type A (d_a^2)**: On a road
-- **Description Type P (d_p^2)**: In a non-road environment
+- **Description Type A ($d_a^2$)**: On a road
+- **Description Type P ($d_p^2$)**: In a non-road environment
 
 #### Contradiction ($C_r^n = -1$)
-- **Description Type A (d_a^3)**: Development of leaves, stem, etc.
-- **Description Type P (d_p^3)**: Lacks any botanical features
+- **Description Type A ($d_a^3$)**: Development of leaves, stem, etc.
+- **Description Type P ($d_p^3$)**: Lacks any botanical features
 
 ### 2. Score Generation Process
 
