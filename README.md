@@ -28,15 +28,15 @@ For detailed information about the CSV files used in the relation head module an
 [CSV Files Generation Documentation](/CSV_GENERATION_README.md)
 This document explains how the scene-specific description framework generates the CSV files under `maskrcnn_benchmark/modeling/roi_heads/relation_head/`.
 
-### 3. Scripts
+### 4. Scripts
 
 **See script.txt.**
 
-### 4. Checkpoints
+### 5. Checkpoints
 
 We uploaded all the checkpoints to [BaiduDrive](https://pan.baidu.com/s/1YJXutOUNx74ac1A0Lu5NSQ?pwd=ywhx). Feel free to download.
 
-### 5. How to switch between different settings (base, novel, semantic, total):
+### 6. How to switch between different settings (base, novel, semantic, total):
 
 Check the <path>/maskrcnn_benchmark/config/defaults.py file or modify _C.OV_SETTING.TRAIN_PART, _C.OV_SETTING.VAL_PART, or _C.OV_SETTING.TEST_PART, you can set it to "base", "novel", "semantic", or "total". After making these changes, you may need to recompile the code.
 ```
