@@ -14,7 +14,7 @@ Check INSTALL.md for installation instructions.
 We conducted evaluations on the VG and GQA datasets.
 
 ```
-│darasers/
+│darasets/
 ├──gqa/
 │  ├── images
 │  ├── ......
