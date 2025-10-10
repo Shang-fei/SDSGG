@@ -40,7 +40,7 @@ We uploaded all the checkpoints to [BaiduDrive](https://pan.baidu.com/s/1YJXutOU
 
 Check the <path>/maskrcnn_benchmark/config/defaults.py file or modify _C.OV_SETTING.TRAIN_PART, _C.OV_SETTING.VAL_PART, or _C.OV_SETTING.TEST_PART, you can set it to "base", "novel", "semantic", or "total". After making these changes, you may need to recompile the code.
 ```
-python setup.py build develop.
+python setup.py build develop
 ```
 ## Acknowledgment
 Our implementation is mainly based on the following codebases. We gratefully thank the authors for their wonderful works.
