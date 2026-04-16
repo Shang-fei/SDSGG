@@ -1,0 +1,23 @@
+# ninja log v7
+3	12553	1776244721446473341	/workspace/ccloud/sf/SDSGG/build/temp.linux-x86_64-cpython-38/workspace/ccloud/sf/SDSGG/maskrcnn_benchmark/csrc/cuda/deform_pool_cuda.o	91143dffbe147ddb
+4	12662	1776244721447473374	/workspace/ccloud/sf/SDSGG/build/temp.linux-x86_64-cpython-38/workspace/ccloud/sf/SDSGG/maskrcnn_benchmark/csrc/cuda/nms.o	2a39351e5b3cca5a
+2	12769	1776244721445473309	/workspace/ccloud/sf/SDSGG/build/temp.linux-x86_64-cpython-38/workspace/ccloud/sf/SDSGG/maskrcnn_benchmark/csrc/cuda/SigmoidFocalLoss_cuda.o	a4437798a2c17a69
+2	12788	1776244721445473309	/workspace/ccloud/sf/SDSGG/build/temp.linux-x86_64-cpython-38/workspace/ccloud/sf/SDSGG/maskrcnn_benchmark/csrc/cuda/deform_conv_cuda.o	4615314cdf18a187
+2	12816	1776244721445473309	/workspace/ccloud/sf/SDSGG/build/temp.linux-x86_64-cpython-38/workspace/ccloud/sf/SDSGG/maskrcnn_benchmark/csrc/cuda/ROIPool_cuda.o	c32457616e72119a
+1	12850	1776244721444473277	/workspace/ccloud/sf/SDSGG/build/temp.linux-x86_64-cpython-38/workspace/ccloud/sf/SDSGG/maskrcnn_benchmark/csrc/cuda/ROIAlign_cuda.o	ace14e37fcd385ef
+4	13034	1776244721447473374	/workspace/ccloud/sf/SDSGG/build/temp.linux-x86_64-cpython-38/workspace/ccloud/sf/SDSGG/maskrcnn_benchmark/csrc/cuda/deform_pool_kernel_cuda.o	ac8be6fbf87db1a4
+3	13711	1776244721446473341	/workspace/ccloud/sf/SDSGG/build/temp.linux-x86_64-cpython-38/workspace/ccloud/sf/SDSGG/maskrcnn_benchmark/csrc/cuda/deform_conv_kernel_cuda.o	2f5e23a72a6b8769
+0	16783	1776244721443473244	/workspace/ccloud/sf/SDSGG/build/temp.linux-x86_64-cpython-38/workspace/ccloud/sf/SDSGG/maskrcnn_benchmark/csrc/cpu/ROIAlign_cpu.o	8a4511aef814ed66
+1	17209	1776244721444473277	/workspace/ccloud/sf/SDSGG/build/temp.linux-x86_64-cpython-38/workspace/ccloud/sf/SDSGG/maskrcnn_benchmark/csrc/cpu/nms_cpu.o	480f7d689a6d7919
+4	21746	1776244721448473406	/workspace/ccloud/sf/SDSGG/build/temp.linux-x86_64-cpython-38/workspace/ccloud/sf/SDSGG/maskrcnn_benchmark/csrc/vision.o	213e4f98e77abae5
+4	12179	1776244744372212812	/workspace/ccloud/sf/SDSGG/build/temp.linux-x86_64-cpython-38/workspace/ccloud/sf/SDSGG/maskrcnn_benchmark/csrc/cuda/deform_pool_cuda.o	9a3d64f766adcbe4
+3	12470	1776244744371212780	/workspace/ccloud/sf/SDSGG/build/temp.linux-x86_64-cpython-38/workspace/ccloud/sf/SDSGG/maskrcnn_benchmark/csrc/cuda/deform_conv_cuda.o	cff29d881efaa24e
+5	12493	1776244744373212844	/workspace/ccloud/sf/SDSGG/build/temp.linux-x86_64-cpython-38/workspace/ccloud/sf/SDSGG/maskrcnn_benchmark/csrc/cuda/nms.o	6dff9fb6f307cf89
+3	12526	1776244744371212780	/workspace/ccloud/sf/SDSGG/build/temp.linux-x86_64-cpython-38/workspace/ccloud/sf/SDSGG/maskrcnn_benchmark/csrc/cuda/ROIPool_cuda.o	d3cb26cfd182541a
+3	12599	1776244744371212780	/workspace/ccloud/sf/SDSGG/build/temp.linux-x86_64-cpython-38/workspace/ccloud/sf/SDSGG/maskrcnn_benchmark/csrc/cuda/SigmoidFocalLoss_cuda.o	722f3489f9eb509d
+3	12629	1776244744371212780	/workspace/ccloud/sf/SDSGG/build/temp.linux-x86_64-cpython-38/workspace/ccloud/sf/SDSGG/maskrcnn_benchmark/csrc/cuda/ROIAlign_cuda.o	9f1a4a72107064cb
+5	12883	1776244744373212844	/workspace/ccloud/sf/SDSGG/build/temp.linux-x86_64-cpython-38/workspace/ccloud/sf/SDSGG/maskrcnn_benchmark/csrc/cuda/deform_pool_kernel_cuda.o	65bbe2ec51ab55ea
+4	13470	1776244744372212812	/workspace/ccloud/sf/SDSGG/build/temp.linux-x86_64-cpython-38/workspace/ccloud/sf/SDSGG/maskrcnn_benchmark/csrc/cuda/deform_conv_kernel_cuda.o	4b38544b0e89b876
+2	16627	1776244744370212748	/workspace/ccloud/sf/SDSGG/build/temp.linux-x86_64-cpython-38/workspace/ccloud/sf/SDSGG/maskrcnn_benchmark/csrc/cpu/ROIAlign_cpu.o	415704d1a5947fe6
+2	16879	1776244744370212748	/workspace/ccloud/sf/SDSGG/build/temp.linux-x86_64-cpython-38/workspace/ccloud/sf/SDSGG/maskrcnn_benchmark/csrc/cpu/nms_cpu.o	d7d0dd17521ae9f6
+6	21555	1776244744374212876	/workspace/ccloud/sf/SDSGG/build/temp.linux-x86_64-cpython-38/workspace/ccloud/sf/SDSGG/maskrcnn_benchmark/csrc/vision.o	ca9d9b1457352ff7

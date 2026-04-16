@@ -1,5 +1,5 @@
 Metadata-Version: 2.1
-Name: maskrcnn-benchmark
+Name: maskrcnn_benchmark
 Version: 0.1
 Summary: object detection in pytorch
 Home-page: https://github.com/facebookresearch/maskrcnn-benchmark
