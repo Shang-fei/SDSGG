@@ -37,6 +37,42 @@ from maskrcnn_benchmark.utils.metric_logger import MetricLogger
 from torch.cuda.amp import autocast as autocast, GradScaler
 from thop import  profile
 
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
+try:
+    import yaml
+except ImportError:
+    yaml = None
+
+NON_OPTIM_KEYS = {"loss_edge_distill_raw", "edge_teacher_student_cos"}
+
+
+def setup_wandb(cfg, logger):
+    if wandb is None:
+        logger.info("wandb not installed; skipping wandb logging")
+        return None
+    if get_rank() != 0:
+        return None
+    if os.environ.get("WANDB_DISABLED", "").lower() in ("true", "1", "yes"):
+        logger.info("WANDB_DISABLED is set; skipping wandb logging")
+        return None
+
+    project = os.environ.get("WANDB_PROJECT", "SDSGG")
+    run_name = os.environ.get("WANDB_NAME") or os.path.basename(cfg.OUTPUT_DIR.rstrip("/")) or None
+    config_dict = yaml.safe_load(cfg.dump()) if yaml is not None else None
+    run = wandb.init(
+        project=project,
+        name=run_name,
+        dir=cfg.OUTPUT_DIR if cfg.OUTPUT_DIR else None,
+        config=config_dict,
+        reinit=True,
+    )
+    logger.info("Initialized wandb run: project=%s name=%s", project, run.name)
+    return run
+
 def train(cfg, local_rank, distributed, logger):
     debug_print(logger, 'prepare training')
     model = build_detection_model(cfg) 
@@ -119,6 +155,7 @@ def train(cfg, local_rank, distributed, logger):
         #run_val(cfg, model, val_data_loaders, distributed, logger)
         #run_test(cfg, model, distributed, logger)
 
+    wandb_run = setup_wandb(cfg, logger)
     logger.info("Start training")
     meters = MetricLogger(delimiter="  ")
     max_iter = len(train_data_loader)
@@ -159,11 +196,12 @@ def train(cfg, local_rank, distributed, logger):
         loss_dict = model(images, targets, edge_maps=edge_maps)
 
 
-        losses = sum(loss for loss in loss_dict.values())
+        optim_loss_dict = {k: loss for k, loss in loss_dict.items() if k not in NON_OPTIM_KEYS}
+        losses = sum(loss for loss in optim_loss_dict.values())
         #print(losses)
         # reduce losses over all GPUs for logging purposes
         loss_dict_reduced = reduce_loss_dict(loss_dict)
-        losses_reduced = sum(loss for loss in loss_dict_reduced.values())
+        losses_reduced = sum(loss for key, loss in loss_dict_reduced.items() if key not in NON_OPTIM_KEYS)
         meters.update(loss=losses_reduced, **loss_dict_reduced)
 
         optimizer.zero_grad()
@@ -204,6 +242,20 @@ def train(cfg, local_rank, distributed, logger):
                     memory=torch.cuda.max_memory_allocated() / 1024.0 / 1024.0,
                 )
             )
+        if wandb_run is not None:
+            wandb_log = {
+                "train/iter": iteration,
+                "train/lr": optimizer.param_groups[-1]["lr"],
+                "train/loss": losses_reduced.item() if isinstance(losses_reduced, torch.Tensor) else losses_reduced,
+                "train/time": batch_time,
+                "train/data": data_time,
+                "train/max_mem_mb": torch.cuda.max_memory_allocated() / 1024.0 / 1024.0,
+            }
+            for key, value in loss_dict_reduced.items():
+                if isinstance(value, torch.Tensor):
+                    value = value.item()
+                wandb_log["train/{}".format(key)] = value
+            wandb.log(wandb_log, step=iteration)
 
         if iteration % checkpoint_period == 0 and iteration>=12000:
             checkpointer.save("model_{:07d}".format(iteration), **arguments)
@@ -216,6 +268,8 @@ def train(cfg, local_rank, distributed, logger):
             #run_test(cfg, model, distributed, logger)
             val_result = run_val(cfg, model, val_data_loaders, distributed, logger)
             logger.info("Validation Result: %.4f" % val_result)
+            if wandb_run is not None:
+                wandb.log({"val/result": val_result}, step=iteration)
 
              
         # scheduler should be called after optimizer.step() in pytorch>=1.1.0
@@ -235,6 +289,8 @@ def train(cfg, local_rank, distributed, logger):
             total_time_str, total_training_time / (max_iter)
         )
     )
+    if wandb_run is not None:
+        wandb_run.finish()
 
     return model
 

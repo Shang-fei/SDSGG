@@ -725,7 +725,10 @@ class ClipPredictor(nn.Module):
         rel_dists = tuple(rel_dists)
 
         if len(edge_distill_losses) > 0:
-            add_losses["loss_edge_distill"] = self.edge_distill_weight * torch.stack(edge_distill_losses).mean()
+            edge_distill_loss_raw = torch.stack(edge_distill_losses).mean()
+            add_losses["loss_edge_distill"] = self.edge_distill_weight * edge_distill_loss_raw
+            add_losses["loss_edge_distill_raw"] = edge_distill_loss_raw.detach()
+            add_losses["edge_teacher_student_cos"] = (1 - edge_distill_loss_raw).detach()
         return obj_dists, rel_dists, add_losses
 
 
