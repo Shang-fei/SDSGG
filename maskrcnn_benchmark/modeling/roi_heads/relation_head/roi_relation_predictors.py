@@ -131,6 +131,20 @@ class MVA(nn.Module):
 
         return sub_features
 
+class EdgePrivilegedAdapter(nn.Module):
+    def __init__(self, dim=512, hidden_dim=1024, init_scale=0.1):
+        super().__init__()
+        self.layer_norm = nn.LayerNorm(dim).half()
+        self.fc1 = nn.Linear(dim, hidden_dim, bias=False).half()
+        self.relu = nn.ReLU(inplace=True)
+        self.fc2 = nn.Linear(hidden_dim, dim, bias=False).half()
+        self.scale = nn.Parameter(torch.tensor(init_scale).half())
+
+    def forward(self, image_features):
+        residual = self.fc2(self.relu(self.fc1(self.layer_norm(image_features))))
+        image_features = image_features + self.scale.to(image_features.dtype) * residual
+        return image_features / image_features.norm(dim=-1, keepdim=True)
+
 @registry.ROI_RELATION_PREDICTOR.register("GQAClipPredictor")
 class GQAClipPredictor(nn.Module):
     def __init__(self, config, in_channels):
@@ -398,7 +412,10 @@ class ClipPredictor(nn.Module):
         self.use_vision = config.MODEL.ROI_RELATION_HEAD.PREDICT_USE_VISION
         self.use_bias = config.MODEL.ROI_RELATION_HEAD.PREDICT_USE_BIAS
         self.use_edge_map = config.MODEL.ROI_RELATION_HEAD.USE_EDGE_MAP
-        self.edge_map_beta = config.MODEL.ROI_RELATION_HEAD.EDGE_MAP_BETA
+        self.edge_map_beta = config.MODEL.ROI_RELATION_HEAD.EDGE_MAP_BETA if self.use_edge_map else 0.0
+        self.edge_map_train_only = config.MODEL.ROI_RELATION_HEAD.EDGE_MAP_TRAIN_ONLY if self.use_edge_map else True
+        self.use_edge_adapter = config.MODEL.ROI_RELATION_HEAD.USE_EDGE_ADAPTER if self.use_edge_map else False
+        self.edge_distill_weight = config.MODEL.ROI_RELATION_HEAD.EDGE_DISTILL_WEIGHT if self.use_edge_map else 0.0
 
         # load class dict
         statistics = get_dataset_statistics(config)
@@ -409,6 +426,7 @@ class ClipPredictor(nn.Module):
 
         self.adaper_clip1 = MVA()
         self.adaper_clip2 = MVA()
+        self.edge_adapter = EdgePrivilegedAdapter() if self.use_edge_adapter else None
         self.obj_names = obj_classes
         a=time.time()
         self.texts1=[]
@@ -597,8 +615,9 @@ class ClipPredictor(nn.Module):
         assert len(num_rels) == len(num_objs)
         obj_preds = obj_preds.split(num_objs, dim=0)
 
-
         rel_dists=[]
+        add_losses = {}
+        edge_distill_losses = []
         for i in range(len(num_rels)):
             rel_dist_per_batch=[]
             union_imges=[]
@@ -625,10 +644,24 @@ class ClipPredictor(nn.Module):
                 if self.use_edge_map and edge_maps is not None and len(edge_tensor) > 0:
                     edge_tensor = torch.cat(edge_tensor)
                     edge_features = self.clip_model.encode_image(edge_tensor)
-                    image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-                    edge_features = edge_features / edge_features.norm(dim=-1, keepdim=True)
-                    image_features = image_features + self.edge_map_beta * edge_features
-                    image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+                else:
+                    edge_features = None
+
+            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+            if self.use_edge_adapter:
+                student_features = self.edge_adapter(image_features)
+            else:
+                student_features = image_features
+
+            if self.training and self.use_edge_map and edge_features is not None and self.edge_distill_weight > 0:
+                edge_features = edge_features / edge_features.norm(dim=-1, keepdim=True)
+                teacher_features = image_features + self.edge_map_beta * edge_features
+                teacher_features = teacher_features / teacher_features.norm(dim=-1, keepdim=True)
+                teacher_features = teacher_features.detach()
+                edge_distill_loss = 1 - F.cosine_similarity(student_features, teacher_features, dim=-1).mean()
+                edge_distill_losses.append(edge_distill_loss)
+
+            image_features = student_features
 
             for la_count,rel_index in enumerate(rel_pair_idxs[i]):
 
@@ -691,7 +724,8 @@ class ClipPredictor(nn.Module):
         obj_dists = obj_dists.split(num_objs, dim=0)
         rel_dists = tuple(rel_dists)
 
-        add_losses = {}
+        if len(edge_distill_losses) > 0:
+            add_losses["loss_edge_distill"] = self.edge_distill_weight * torch.stack(edge_distill_losses).mean()
         return obj_dists, rel_dists, add_losses
 
 

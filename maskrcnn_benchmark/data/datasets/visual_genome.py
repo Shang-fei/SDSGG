@@ -51,6 +51,8 @@ class VGDataset(torch.utils.data.Dataset):
         self.filter_non_overlap = filter_non_overlap and self.split == 'train'
         self.filter_duplicate_rels = filter_duplicate_rels and self.split == 'train'
         self.transforms = transforms
+        self.edge_map_log_count = 0
+        self.edge_map_log_limit = 5
 
         self.ind_to_classes, self.ind_to_predicates, self.ind_to_attributes = load_info(
             dict_file)  # contiguous 151, 51 containing __background__
@@ -82,12 +84,41 @@ class VGDataset(torch.utils.data.Dataset):
         relative_path = os.path.relpath(image_path, self.img_dir)
         return os.path.join(edge_dir, relative_path)
 
+    def _use_edge_map_for_split(self):
+        if not cfg.MODEL.ROI_RELATION_HEAD.USE_EDGE_MAP:
+            return False
+        if cfg.MODEL.ROI_RELATION_HEAD.EDGE_MAP_TRAIN_ONLY and self.split != 'train':
+            return False
+        return True
+
+    def _log_edge_map_status(self, image_path, image_size, edge_size, edge_array, edge_path, loaded):
+        if self.split != 'train' or self.edge_map_log_count >= self.edge_map_log_limit:
+            return
+        nonzero_ratio = float(np.count_nonzero(edge_array)) / float(edge_array.size) if edge_array.size else 0.0
+        print(
+            "[VG EdgeMap] image={} edge={} loaded={} image_size={} edge_size={} aligned={} nonzero_ratio={:.6f}".format(
+                image_path,
+                edge_path if edge_path else "<empty EDGE_MAP_DIR>",
+                loaded,
+                image_size,
+                edge_size,
+                image_size == edge_size,
+                nonzero_ratio,
+            )
+        )
+        self.edge_map_log_count += 1
+
     def _load_edge_map(self, image_path, image_size):
         edge_path = self._get_edge_map_path(image_path)
         if edge_path and os.path.exists(edge_path):
-            return Image.open(edge_path).convert("L")
-        width, height = image_size
-        return Image.new("L", (width, height), color=0)
+            edge_map = Image.open(edge_path).convert("L")
+            loaded = True
+        else:
+            width, height = image_size
+            edge_map = Image.new("L", (width, height), color=0)
+            loaded = False
+        self._log_edge_map_status(image_path, image_size, edge_map.size, np.array(edge_map), edge_path, loaded)
+        return edge_map
 
     def _filter_labels(self, obj_names, prdc_names, split):
         # class name and idx mapping
@@ -228,7 +259,7 @@ class VGDataset(torch.utils.data.Dataset):
             img = Image.open(self.custom_files[index]).convert("RGB")
             target = torch.LongTensor([-1])
             edge_map = None
-            if cfg.MODEL.ROI_RELATION_HEAD.USE_EDGE_MAP:
+            if self._use_edge_map_for_split():
                 edge_map = self._load_edge_map(self.custom_files[index], img.size)
             if self.transforms is not None:
                 if edge_map is None:
@@ -241,7 +272,7 @@ class VGDataset(torch.utils.data.Dataset):
         img_truth = Image.open(self.filenames[index])
         img = Image.open(self.filenames[index]).convert("RGB")
         edge_map = None
-        if cfg.MODEL.ROI_RELATION_HEAD.USE_EDGE_MAP:
+        if self._use_edge_map_for_split():
             edge_map = self._load_edge_map(self.filenames[index], img.size)
         if img.size[0] != self.img_info[index]['width'] or img.size[1] != self.img_info[index]['height']:
             print('=' * 20, ' ERROR index ', str(index), ' ', str(img.size), ' ', str(self.img_info[index]['width']),
