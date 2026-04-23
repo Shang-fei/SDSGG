@@ -145,6 +145,8 @@ class GQAClipPredictor(nn.Module):
 
         self.use_vision = config.MODEL.ROI_RELATION_HEAD.PREDICT_USE_VISION
         self.use_bias = config.MODEL.ROI_RELATION_HEAD.PREDICT_USE_BIAS
+        self.use_edge_map = config.MODEL.ROI_RELATION_HEAD.USE_EDGE_MAP
+        self.edge_map_beta = config.MODEL.ROI_RELATION_HEAD.EDGE_MAP_BETA
 
         # load class dict
         statistics = get_dataset_statistics(config)
@@ -280,7 +282,7 @@ class GQAClipPredictor(nn.Module):
                 text_features5 = text_features5
                 self.texts5.append(text_features5.detach().cpu().numpy())
 
-    def forward(self, proposals, rel_pair_idxs, rel_labels, rel_binarys, roi_features, union_features, logger=None,img=None):
+    def forward(self, proposals, rel_pair_idxs, rel_labels, rel_binarys, roi_features, union_features, logger=None, img=None, edge_maps=None):
         """
         Returns:
             obj_dists (list[Tensor]): logits of object label distribution
@@ -395,6 +397,8 @@ class ClipPredictor(nn.Module):
 
         self.use_vision = config.MODEL.ROI_RELATION_HEAD.PREDICT_USE_VISION
         self.use_bias = config.MODEL.ROI_RELATION_HEAD.PREDICT_USE_BIAS
+        self.use_edge_map = config.MODEL.ROI_RELATION_HEAD.USE_EDGE_MAP
+        self.edge_map_beta = config.MODEL.ROI_RELATION_HEAD.EDGE_MAP_BETA
 
         # load class dict
         statistics = get_dataset_statistics(config)
@@ -573,7 +577,7 @@ class ClipPredictor(nn.Module):
                 text_features5 = text_features5
                 self.texts5.append(text_features5.detach().cpu().numpy())
 
-    def forward(self, proposals, rel_pair_idxs, rel_labels, rel_binarys, roi_features, union_features, logger=None,img=None):
+    def forward(self, proposals, rel_pair_idxs, rel_labels, rel_binarys, roi_features, union_features, logger=None, img=None, edge_maps=None):
         """
         Returns:
             obj_dists (list[Tensor]): logits of object label distribution
@@ -599,6 +603,7 @@ class ClipPredictor(nn.Module):
             rel_dist_per_batch=[]
             union_imges=[]
             image_tensor=[]
+            edge_tensor=[]
             with torch.no_grad():
                 for j in range(len(proposals[i].bbox)):
                     union_img = crop_and_resize(img[i].unsqueeze(0), proposals[i].bbox[j], proposals[i].bbox[j])
@@ -606,9 +611,24 @@ class ClipPredictor(nn.Module):
                     iimg = Image.fromarray(np.uint8(iimg))
                     union_img = self.clip_preprocess(iimg).unsqueeze(0).to(self.device)
                     image_tensor.append(union_img)
+                    if self.use_edge_map and edge_maps is not None:
+                        edge_img = crop_and_resize(edge_maps[i].unsqueeze(0), proposals[i].bbox[j], proposals[i].bbox[j])
+                        if edge_img.shape[1] == 1:
+                            edge_img = edge_img.repeat(1, 3, 1, 1)
+                        eimg = edge_img[0].permute(1, 2, 0).detach().cpu().numpy() * 255
+                        eimg = Image.fromarray(np.uint8(eimg))
+                        edge_img = self.clip_preprocess(eimg).unsqueeze(0).to(self.device)
+                        edge_tensor.append(edge_img)
                 image_tensor = torch.cat(image_tensor)
 
                 image_features = self.clip_model.encode_image(image_tensor)
+                if self.use_edge_map and edge_maps is not None and len(edge_tensor) > 0:
+                    edge_tensor = torch.cat(edge_tensor)
+                    edge_features = self.clip_model.encode_image(edge_tensor)
+                    image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+                    edge_features = edge_features / edge_features.norm(dim=-1, keepdim=True)
+                    image_features = image_features + self.edge_map_beta * edge_features
+                    image_features = image_features / image_features.norm(dim=-1, keepdim=True)
 
             for la_count,rel_index in enumerate(rel_pair_idxs[i]):
 

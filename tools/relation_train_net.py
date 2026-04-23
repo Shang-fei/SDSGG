@@ -128,7 +128,12 @@ def train(cfg, local_rank, distributed, logger):
     
     scaler = GradScaler()
     print_first_grad = True
-    for iteration, (images, targets, _) in enumerate(train_data_loader, start_iter):
+    for iteration, batch in enumerate(train_data_loader, start_iter):
+        if len(batch) == 4:
+            images, targets, _, edge_maps = batch
+        else:
+            images, targets, _ = batch
+            edge_maps = None
         tmp=0
         for data in targets:
 
@@ -147,9 +152,11 @@ def train(cfg, local_rank, distributed, logger):
         fix_eval_modules(eval_modules)
 
         images = images.to(device)
+        if edge_maps is not None:
+            edge_maps = edge_maps.to(device)
         targets = [target.to(device) for target in targets]
         
-        loss_dict = model(images, targets)
+        loss_dict = model(images, targets, edge_maps=edge_maps)
 
 
         losses = sum(loss for loss in loss_dict.values())

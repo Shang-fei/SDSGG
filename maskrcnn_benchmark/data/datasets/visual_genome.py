@@ -75,6 +75,20 @@ class VGDataset(torch.utils.data.Dataset):
             if cfg.OV_SETTING.USE_OV:
                 self._change_part()  # split base and novel for open-vocabular
 
+    def _get_edge_map_path(self, image_path):
+        edge_dir = cfg.MODEL.ROI_RELATION_HEAD.EDGE_MAP_DIR
+        if not edge_dir:
+            return None
+        relative_path = os.path.relpath(image_path, self.img_dir)
+        return os.path.join(edge_dir, relative_path)
+
+    def _load_edge_map(self, image_path, image_size):
+        edge_path = self._get_edge_map_path(image_path)
+        if edge_path and os.path.exists(edge_path):
+            return Image.open(edge_path).convert("L")
+        width, height = image_size
+        return Image.new("L", (width, height), color=0)
+
     def _filter_labels(self, obj_names, prdc_names, split):
         # class name and idx mapping
         obj_names = set(obj_names + ['__background__'])
@@ -213,11 +227,22 @@ class VGDataset(torch.utils.data.Dataset):
         if self.custom_eval:
             img = Image.open(self.custom_files[index]).convert("RGB")
             target = torch.LongTensor([-1])
+            edge_map = None
+            if cfg.MODEL.ROI_RELATION_HEAD.USE_EDGE_MAP:
+                edge_map = self._load_edge_map(self.custom_files[index], img.size)
             if self.transforms is not None:
-                img, target = self.transforms(img, target)
-            return img, target, index
+                if edge_map is None:
+                    img, target = self.transforms(img, target)
+                else:
+                    img, target, edge_map = self.transforms(img, target, edge_map)
+            if edge_map is None:
+                return img, target, index
+            return img, target, index, edge_map
         img_truth = Image.open(self.filenames[index])
         img = Image.open(self.filenames[index]).convert("RGB")
+        edge_map = None
+        if cfg.MODEL.ROI_RELATION_HEAD.USE_EDGE_MAP:
+            edge_map = self._load_edge_map(self.filenames[index], img.size)
         if img.size[0] != self.img_info[index]['width'] or img.size[1] != self.img_info[index]['height']:
             print('=' * 20, ' ERROR index ', str(index), ' ', str(img.size), ' ', str(self.img_info[index]['width']),
                   ' ', str(self.img_info[index]['height']), ' ', '=' * 20)
@@ -228,11 +253,18 @@ class VGDataset(torch.utils.data.Dataset):
 
         if flip_img:
             img = img.transpose(method=Image.FLIP_LEFT_RIGHT)
+            if edge_map is not None:
+                edge_map = edge_map.transpose(method=Image.FLIP_LEFT_RIGHT)
 
         if self.transforms is not None:
-            img, target = self.transforms(img, target)
+            if edge_map is None:
+                img, target = self.transforms(img, target)
+            else:
+                img, target, edge_map = self.transforms(img, target, edge_map)
 
-        return img, target, index
+        if edge_map is None:
+            return img, target, index
+        return img, target, index, edge_map
 
     def get_statistics(self):
         fg_matrix, bg_matrix = get_VG_statistics(img_dir=self.img_dir, roidb_file=self.roidb_file,

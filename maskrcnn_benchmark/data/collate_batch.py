@@ -17,7 +17,10 @@ class BatchCollator(object):
         images = to_image_list(transposed_batch[0], self.size_divisible)
         targets = transposed_batch[1]
         img_ids = transposed_batch[2]
-        return images, targets, img_ids
+        if len(transposed_batch) < 4:
+            return images, targets, img_ids
+        edge_maps = to_image_list(transposed_batch[3], self.size_divisible)
+        return images, targets, img_ids, edge_maps
 
 
 class BBoxAugCollator(object):
@@ -29,4 +32,3 @@ class BBoxAugCollator(object):
 
     def __call__(self, batch):
         return list(zip(*batch))
-

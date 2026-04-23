@@ -53,7 +53,7 @@ class GeneralizedRCNN(nn.Module):
     def updata(self,mode):
         self.roi_heads.updata(mode)
 
-    def forward(self, images, targets=None, logger=None):
+    def forward(self, images, targets=None, logger=None, edge_maps=None):
         """
         Arguments:
             images (list[Tensor] or ImageList): images to be processed
@@ -69,6 +69,7 @@ class GeneralizedRCNN(nn.Module):
         if self.training and targets is None:
             raise ValueError("In training mode, targets should be passed")
         images2=images.tensors.clone()
+        edge_maps2 = edge_maps.tensors.clone() if edge_maps is not None else None
         normalize_transform = Normalize(
         mean=self.cfg.INPUT.PIXEL_MEAN, std=self.cfg.INPUT.PIXEL_STD, to_bgr255=self.cfg.INPUT.TO_BGR255
         )
@@ -81,7 +82,7 @@ class GeneralizedRCNN(nn.Module):
         
         if self.roi_heads:
             
-            x, result, detector_losses = self.roi_heads(features, proposals, targets, logger,images2)
+            x, result, detector_losses = self.roi_heads(features, proposals, targets, logger, images2, edge_maps2)
             
         else:
             # RPN-only models don't have roi_heads

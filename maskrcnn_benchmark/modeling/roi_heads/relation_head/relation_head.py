@@ -31,6 +31,7 @@ class ROIRelationHead(torch.nn.Module):
             self.box_feature_extractor = make_roi_box_feature_extractor(cfg, in_channels)
             feat_dim = self.box_feature_extractor.out_channels
         self.predictor = make_roi_relation_predictor(cfg, feat_dim)
+        self.predictor_name = cfg.MODEL.ROI_RELATION_HEAD.PREDICTOR
 
         self.post_processor = make_roi_relation_post_processor(cfg)
         self.loss_evaluator = make_roi_relation_loss_evaluator(cfg)
@@ -42,7 +43,7 @@ class ROIRelationHead(torch.nn.Module):
     def updata(self,mode):
         self.predictor.updata(mode)
 
-    def forward(self, features, proposals, targets=None, logger=None,img=None):
+    def forward(self, features, proposals, targets=None, logger=None, img=None, edge_maps=None):
         """
         Arguments:
             features (list[Tensor]): feature-maps from possibly several levels
@@ -86,7 +87,14 @@ class ROIRelationHead(torch.nn.Module):
         
         # final classifier that converts the features into predictions
         # should corresponding to all the functions and layers after the self.context class
-        refine_logits, relation_logits, add_losses = self.predictor(proposals, rel_pair_idxs, rel_labels, rel_binarys, roi_features, union_features, logger,img)
+        if self.predictor_name in ("ClipPredictor", "GQAClipPredictor"):
+            refine_logits, relation_logits, add_losses = self.predictor(
+                proposals, rel_pair_idxs, rel_labels, rel_binarys, roi_features, union_features, logger, img, edge_maps
+            )
+        else:
+            refine_logits, relation_logits, add_losses = self.predictor(
+                proposals, rel_pair_idxs, rel_labels, rel_binarys, roi_features, union_features, logger, img
+            )
 
         # for test
         if not self.training:

@@ -26,7 +26,7 @@ class CombinedROIHeads(torch.nn.ModuleDict):
         self.relation.updata(mode)
 
 
-    def forward(self, features, proposals, targets=None, logger=None,img=None,model_clip=None):
+    def forward(self, features, proposals, targets=None, logger=None, img=None, edge_maps=None, model_clip=None):
         losses = {}
         
         x, detections, loss_box = self.box(features, proposals, targets)
@@ -71,7 +71,7 @@ class CombinedROIHeads(torch.nn.ModuleDict):
             # it may be not safe to share features due to post processing
             # During training, self.box() will return the unaltered proposals as "detections"
             # this makes the API consistent during training and testing
-            x, detections, loss_relation = self.relation(features, detections, targets, logger,img)
+            x, detections, loss_relation = self.relation(features, detections, targets, logger, img, edge_maps)
             losses.update(loss_relation)
 
         return x, detections, losses

@@ -132,7 +132,12 @@ def train(cfg, local_rank, distributed, logger):
     model.eval()
     samp_processor = make_roi_relation_samp_processor(cfg)
     
-    for iteration, (images, targets, _) in enumerate(train_data_loader, start_iter):
+    for iteration, batch in enumerate(train_data_loader, start_iter):
+        if len(batch) == 4:
+            images, targets, _, edge_maps = batch
+        else:
+            images, targets, _ = batch
+            edge_maps = None
         if any(len(target) < 1 for target in targets):
             logger.error(f"Iteration={iteration + 1} || Image Ids used for training {_} || targets Length={[len(target) for target in targets]}" )
         data_time = time.time() - end
@@ -143,9 +148,11 @@ def train(cfg, local_rank, distributed, logger):
         #fix_eval_modules(eval_modules)
 
         images = images.to(device)
+        if edge_maps is not None:
+            edge_maps = edge_maps.to(device)
         targets = [target.to(device) for target in targets]
         
-        result = model(images, targets)
+        result = model(images, targets, edge_maps=edge_maps)
         soft_log=[(result[i].extra_fields['pred_rel_scores'].detach().cpu().numpy()) for i in range(4)]
         
         

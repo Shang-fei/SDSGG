@@ -23,8 +23,14 @@ def compute_on_dataset(model, data_loader, device, synchronize_gather=True, time
     torch.cuda.empty_cache()
     for _, batch in enumerate(tqdm(data_loader)):
         with torch.no_grad():
-            images, targets, image_ids = batch
+            if len(batch) == 4:
+                images, targets, image_ids, edge_maps = batch
+            else:
+                images, targets, image_ids = batch
+                edge_maps = None
             targets = [target.to(device) for target in targets]
+            if edge_maps is not None:
+                edge_maps = edge_maps.to(device)
             if timer:
                 timer.tic()
             if cfg.TEST.BBOX_AUG.ENABLED:
@@ -32,7 +38,7 @@ def compute_on_dataset(model, data_loader, device, synchronize_gather=True, time
             else:
                 # relation detection needs the targets
 
-                output = model(images.to(device), targets)
+                output = model(images.to(device), targets, edge_maps=edge_maps)
             if timer:
                 if not cfg.MODEL.DEVICE == 'cpu':
                     torch.cuda.synchronize()

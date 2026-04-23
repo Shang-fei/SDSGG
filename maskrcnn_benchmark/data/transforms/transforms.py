@@ -12,10 +12,15 @@ class Compose(object):
     def __init__(self, transforms):
         self.transforms = transforms
 
-    def __call__(self, image, target):
+    def __call__(self, image, target, edge_map=None):
         for t in self.transforms:
-            image, target = t(image, target)
-        return image, target
+            if edge_map is None:
+                image, target = t(image, target)
+            else:
+                image, target, edge_map = t(image, target, edge_map)
+        if edge_map is None:
+            return image, target
+        return image, target, edge_map
 
     def __repr__(self):
         format_string = self.__class__.__name__ + "("
@@ -56,35 +61,47 @@ class Resize(object):
 
         return (oh, ow)
 
-    def __call__(self, image, target=None):
+    def __call__(self, image, target=None, edge_map=None):
         size = self.get_size(image.size)
         image = F.resize(image, size)
+        if edge_map is not None:
+            edge_map = F.resize(edge_map, size)
         if target is None:
             return image
         if isinstance(target, BoxList):
             target = target.resize(image.size)
-        return image, target
+        if edge_map is None:
+            return image, target
+        return image, target, edge_map
 
 
 class RandomHorizontalFlip(object):
     def __init__(self, prob=0.5):
         self.prob = prob
 
-    def __call__(self, image, target):
+    def __call__(self, image, target, edge_map=None):
         if random.random() < self.prob:
             image = F.hflip(image)
             target = target.transpose(0)
-        return image, target
+            if edge_map is not None:
+                edge_map = F.hflip(edge_map)
+        if edge_map is None:
+            return image, target
+        return image, target, edge_map
 
 class RandomVerticalFlip(object):
     def __init__(self, prob=0.5):
         self.prob = prob
 
-    def __call__(self, image, target):
+    def __call__(self, image, target, edge_map=None):
         if random.random() < self.prob:
             image = F.vflip(image)
             target = target.transpose(1)
-        return image, target
+            if edge_map is not None:
+                edge_map = F.vflip(edge_map)
+        if edge_map is None:
+            return image, target
+        return image, target, edge_map
 
 class ColorJitter(object):
     def __init__(self,
@@ -99,14 +116,20 @@ class ColorJitter(object):
             saturation=saturation,
             hue=hue,)
 
-    def __call__(self, image, target):
+    def __call__(self, image, target, edge_map=None):
         image = self.color_jitter(image)
-        return image, target
+        if edge_map is None:
+            return image, target
+        return image, target, edge_map
 
 
 class ToTensor(object):
-    def __call__(self, image, target):
-        return F.to_tensor(image), target
+    def __call__(self, image, target, edge_map=None):
+        image = F.to_tensor(image)
+        if edge_map is None:
+            return image, target
+        edge_map = F.to_tensor(edge_map)
+        return image, target, edge_map
 
 
 class Normalize(object):
@@ -115,10 +138,12 @@ class Normalize(object):
         self.std = std
         self.to_bgr255 = to_bgr255
 
-    def __call__(self, image, target=None):
+    def __call__(self, image, target=None, edge_map=None):
         if self.to_bgr255:
             image = image[[2, 1, 0]] * 255
         image = F.normalize(image, mean=self.mean, std=self.std)
         if target is None:
             return image
-        return image, target
+        if edge_map is None:
+            return image, target
+        return image, target, edge_map
