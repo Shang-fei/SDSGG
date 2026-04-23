@@ -11,7 +11,9 @@ import argparse
 import os
 import time
 import datetime
+import random
 
+import numpy as np
 import torch
 from torch.nn.utils import clip_grad_norm_
 
@@ -50,6 +52,13 @@ except ImportError:
 NON_OPTIM_KEYS = {"loss_edge_distill_raw", "edge_teacher_student_cos"}
 
 
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
 def setup_wandb(cfg, logger):
     if wandb is None:
         logger.info("wandb not installed; skipping wandb logging")
@@ -63,15 +72,19 @@ def setup_wandb(cfg, logger):
     project = os.environ.get("WANDB_PROJECT", "SDSGG")
     run_name = os.environ.get("WANDB_NAME") or os.path.basename(cfg.OUTPUT_DIR.rstrip("/")) or None
     config_dict = yaml.safe_load(cfg.dump()) if yaml is not None else None
-    run = wandb.init(
-        project=project,
-        name=run_name,
-        dir=cfg.OUTPUT_DIR if cfg.OUTPUT_DIR else None,
-        config=config_dict,
-        reinit=True,
-    )
-    logger.info("Initialized wandb run: project=%s name=%s", project, run.name)
-    return run
+    try:
+        run = wandb.init(
+            project=project,
+            name=run_name,
+            dir=cfg.OUTPUT_DIR if cfg.OUTPUT_DIR else None,
+            config=config_dict,
+            reinit=True,
+        )
+        logger.info("Initialized wandb run: project=%s name=%s", project, run.name)
+        return run
+    except Exception as exc:
+        logger.warning("wandb init failed; disabling wandb logging. error=%s", exc)
+        return None
 
 def train(cfg, local_rank, distributed, logger):
     debug_print(logger, 'prepare training')
@@ -443,6 +456,8 @@ def main():
         config_str = "\n" + cf.read()
         logger.info(config_str)
     logger.info("Running with config:\n{}".format(cfg))
+    set_seed(cfg.SEED + get_rank())
+    logger.info("Using random seed {}".format(cfg.SEED + get_rank()))
 
     output_config_path = os.path.join(cfg.OUTPUT_DIR, 'config.yml')
     logger.info("Saving config into: {}".format(output_config_path))

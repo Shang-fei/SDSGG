@@ -19,6 +19,7 @@ from yacs.config import CfgNode as CN
 # -----------------------------------------------------------------------------
 
 _C = CN()
+_C.SEED = 42
 
 _C.MODEL = CN()
 _C.MODEL.FLIP_AUG = False
