@@ -82,7 +82,17 @@ class VGDataset(torch.utils.data.Dataset):
         if not edge_dir:
             return None
         relative_path = os.path.relpath(image_path, self.img_dir)
-        return os.path.join(edge_dir, relative_path)
+        edge_path = os.path.join(edge_dir, relative_path)
+        if os.path.exists(edge_path):
+            return edge_path
+
+        stem, _ = os.path.splitext(relative_path)
+        for extension in (".png", ".jpg", ".jpeg"):
+            candidate = os.path.join(edge_dir, stem + extension)
+            if os.path.exists(candidate):
+                return candidate
+
+        return edge_path
 
     def _use_edge_map_for_split(self):
         if not cfg.MODEL.ROI_RELATION_HEAD.USE_EDGE_MAP:
