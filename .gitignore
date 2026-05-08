@@ -1,0 +1,71 @@
+### Python cache and bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+### Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+### Packaging and build artifacts
+build/
+dist/
+*.egg-info/
+*.egg
+pip-wheel-metadata/
+
+### Test and type-check caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+
+### Notebook and IDE files
+.ipynb_checkpoints/
+.idea/
+.vscode/
+
+### Project outputs and generated artifacts
+output/
+checkpoint/
+datasets/
+logs/
+*.txt
+*.csv
+*.log
+*.out
+*.err
+
+### Model and training checkpoints
+*.pth
+*.pt
+*.ckpt
+*.bin
+*.onnx
+
+### Large generated data files
+*.h5
+*.hdf5
+*.npz
+*.npy
+
+### Optional local data and intermediate exports
+datasets/*/generated/
+datasets/*_generated/
+datasets/**/cache/
+datasets/**/tmp/
+
+### OS metadata
+.DS_Store
+Thumbs.db
+
+### Editor and workspace leftovers
+*.swp
+*.swo
+*~
