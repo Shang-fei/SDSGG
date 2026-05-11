@@ -161,6 +161,36 @@ cells = [
                 return yaml.safe_load(f)
 
 
+        def normalize_dataset_names(dataset_value) -> List[str]:
+            """
+            把配置中的数据集字段统一规范成字符串列表。
+
+            这里主要兼容两类写法：
+            - 合法 YAML 列表，例如 ["VG_xxx_train"]
+            - 项目里常见的 Python tuple 风格字符串，例如 ("VG_xxx_train",)
+            """
+            if dataset_value is None:
+                return []
+            if isinstance(dataset_value, (list, tuple)):
+                return [str(item).strip() for item in dataset_value if str(item).strip()]
+            if isinstance(dataset_value, str):
+                text = dataset_value.strip()
+                if not text:
+                    return []
+                if text.startswith("(") and text.endswith(")"):
+                    text = text[1:-1].strip()
+                if not text:
+                    return []
+                parts = [part.strip() for part in text.split(",")]
+                cleaned = []
+                for part in parts:
+                    part = part.strip().strip('"').strip("'")
+                    if part:
+                        cleaned.append(part)
+                return cleaned
+            return [str(dataset_value).strip()]
+
+
         def resolve_dataset_paths(config_path: Path) -> dict:
             """
             根据配置文件解析 VG 数据集路径。
@@ -168,7 +198,7 @@ cells = [
             优先尝试复用仓库内部的 DatasetCatalog；如果失败，则回退到仓库默认 VG 路径。
             """
             config_data = load_yaml_config(config_path)
-            dataset_names = config_data.get("DATASETS", {}).get("TRAIN", [])
+            dataset_names = normalize_dataset_names(config_data.get("DATASETS", {}).get("TRAIN", []))
             train_dataset_name = dataset_names[0] if dataset_names else "VG_stanford_filtered_with_attribute_train"
             resolved = {
                 "train_dataset_name": train_dataset_name,
