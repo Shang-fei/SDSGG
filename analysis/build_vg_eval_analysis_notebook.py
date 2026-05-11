@@ -64,7 +64,6 @@ cells = [
         import numpy as np
         import pandas as pd
         import torch
-        import yaml
         from IPython.display import Markdown, display
         from PIL import Image
         from tqdm.auto import tqdm
@@ -154,11 +153,22 @@ cells = [
             return False
 
 
-        def load_yaml_config(config_path: Path) -> dict:
-            """读取 YAML 配置文件，返回普通字典。"""
+        def load_runtime_cfg(config_path: Path):
+            """
+            按训练脚本的方式构造运行时配置。
+
+            这里显式复用 `maskrcnn_benchmark.config.cfg`，它本身来自
+            `defaults.py`，因此会先带上全部默认参数，再和传入的
+            config_file 做 merge，行为与 `tools/relation_train_net.py`
+            保持一致。
+            """
             ensure_path_exists(config_path, "配置文件")
-            with config_path.open("r", encoding="utf-8") as f:
-                return yaml.safe_load(f)
+            from maskrcnn_benchmark.config import cfg as global_cfg
+
+            cfg_local = global_cfg.clone()
+            cfg_local.merge_from_file(str(config_path))
+            cfg_local.freeze()
+            return cfg_local
 
 
         def normalize_dataset_names(dataset_value) -> List[str]:
@@ -191,14 +201,13 @@ cells = [
             return [str(dataset_value).strip()]
 
 
-        def resolve_dataset_paths(config_path: Path) -> dict:
+        def resolve_dataset_paths(runtime_cfg) -> dict:
             """
             根据配置文件解析 VG 数据集路径。
 
             优先尝试复用仓库内部的 DatasetCatalog；如果失败，则回退到仓库默认 VG 路径。
             """
-            config_data = load_yaml_config(config_path)
-            dataset_names = normalize_dataset_names(config_data.get("DATASETS", {}).get("TRAIN", []))
+            dataset_names = normalize_dataset_names(runtime_cfg.DATASETS.TRAIN)
             train_dataset_name = dataset_names[0] if dataset_names else "VG_stanford_filtered_with_attribute_train"
             resolved = {
                 "train_dataset_name": train_dataset_name,
@@ -209,12 +218,9 @@ cells = [
             }
 
             try:
-                from maskrcnn_benchmark.config import cfg as global_cfg
                 from maskrcnn_benchmark.config.paths_catalog import DatasetCatalog
 
-                cfg_local = global_cfg.clone()
-                cfg_local.merge_from_file(str(config_path))
-                dataset_entry = DatasetCatalog.get(train_dataset_name, cfg_local)
+                dataset_entry = DatasetCatalog.get(train_dataset_name, runtime_cfg)
                 args = dataset_entry["args"]
                 resolved.update({
                     "dict_file": Path(args["dict_file"]),
@@ -235,16 +241,12 @@ cells = [
             return resolved
 
 
-        def resolve_iou_threshold(config_path: Path, user_value: Optional[float]) -> float:
+        def resolve_iou_threshold(runtime_cfg, user_value: Optional[float]) -> float:
             """优先使用用户显式设置的阈值，否则从配置读取，最后回退到 0.5。"""
             if user_value is not None:
                 return float(user_value)
             try:
-                from maskrcnn_benchmark.config import cfg as global_cfg
-
-                cfg_local = global_cfg.clone()
-                cfg_local.merge_from_file(str(config_path))
-                return float(cfg_local.TEST.RELATION.IOU_THRESHOLD)
+                return float(runtime_cfg.TEST.RELATION.IOU_THRESHOLD)
             except Exception:
                 return 0.5
 
@@ -340,41 +342,57 @@ cells = [
             return {idx: item for idx, item in enumerate(visual_info)}
 
 
-        def compute_training_statistics(dataset_paths: dict, ind_to_classes: List[str], ind_to_predicates: List[str]) -> dict:
+        def build_train_dataset_from_config(runtime_cfg):
+            """
+            按照真实训练配置构造训练数据集实例。
+
+            这样可以确保以下过滤逻辑全部生效：
+            - OV_SETTING 下的 base / novel / semantic / total 划分
+            - 训练时的数据集 split 选择
+            - 与 DatasetCatalog 一致的数据路径解析
+            """
+            from maskrcnn_benchmark.config.paths_catalog import DatasetCatalog
+            from maskrcnn_benchmark.data import datasets as D
+
+            dataset_names = normalize_dataset_names(runtime_cfg.DATASETS.TRAIN)
+            if not dataset_names:
+                raise ValueError("配置文件中的 DATASETS.TRAIN 为空，无法构造训练集。")
+
+            train_dataset_name = dataset_names[0]
+            dataset_entry = DatasetCatalog.get(train_dataset_name, runtime_cfg)
+            factory = getattr(D, dataset_entry["factory"])
+            args = dict(dataset_entry["args"])
+            if "capgraphs_file" in args:
+                del args["capgraphs_file"]
+            args["transforms"] = None
+            return factory(**args)
+
+
+        def compute_training_statistics(runtime_cfg, ind_to_classes: List[str], ind_to_predicates: List[str]) -> dict:
             """
             统计训练集中每个谓词和每个三元组的出现次数。
 
-            统计口径直接对齐 VG 数据集的原始训练关系标注，而不是测试集或评估输出。
+            这里必须按“真实训练数据集”统计，而不是直接读取全量 VG 原始标注。
+            原因是项目里的 VGDataset 会在实例化时根据 OV_SETTING 对 base / novel / semantic
+            词表做过滤；如果绕过这一步，统计出来的频次会包含训练时根本没见过的关系。
             """
             try:
-                from maskrcnn_benchmark.data.datasets.visual_genome import load_graphs
+                train_dataset = build_train_dataset_from_config(runtime_cfg)
             except Exception as exc:
-                warnings.warn(f"无法导入 visual_genome.load_graphs，训练频次统计将不可用。详细原因: {exc}")
+                warnings.warn(f"无法按真实配置构造训练数据集，训练频次统计将不可用。详细原因: {exc}")
                 return {
                     "predicate_counter": Counter(),
                     "triplet_counter": Counter(),
                     "triplet_name_counter": Counter(),
                 }
 
-            roidb_file = dataset_paths["roidb_file"]
-            ensure_path_exists(roidb_file, "VG roidb 文件")
-
-            _, _, gt_classes, _, relationships = load_graphs(
-                roidb_file=str(roidb_file),
-                split="train",
-                num_im=-1,
-                num_val_im=5000,
-                filter_empty_rels=True,
-                filter_non_overlap=False,
-            )
-
             predicate_counter = Counter()
             triplet_counter = Counter()
             triplet_name_counter = Counter()
 
             for classes_per_image, rels_per_image in tqdm(
-                zip(gt_classes, relationships),
-                total=len(relationships),
+                zip(train_dataset.gt_classes, train_dataset.relationships),
+                total=len(train_dataset.relationships),
                 desc="统计训练集谓词与三元组频次",
             ):
                 for sub_idx, obj_idx, predicate_id in rels_per_image:
@@ -398,8 +416,9 @@ cells = [
             }
 
 
-        dataset_paths = resolve_dataset_paths(CONFIG_PATH)
-        iou_threshold = resolve_iou_threshold(CONFIG_PATH, IOU_THRESH)
+        runtime_cfg = load_runtime_cfg(CONFIG_PATH)
+        dataset_paths = resolve_dataset_paths(runtime_cfg)
+        iou_threshold = resolve_iou_threshold(runtime_cfg, IOU_THRESH)
         dict_file = dataset_paths.get("dict_file")
         if dict_file and Path(dict_file).exists():
             label_mapping = load_label_mappings(Path(dict_file))
@@ -414,7 +433,7 @@ cells = [
                 raise FileNotFoundError("结果文件已找到，但 VG 字典文件缺失，无法把类别 id 转成可读字符串。请检查 CONFIG_PATH 和数据集路径。")
 
             train_statistics = compute_training_statistics(
-                dataset_paths=dataset_paths,
+                runtime_cfg=runtime_cfg,
                 ind_to_classes=label_mapping["ind_to_classes"],
                 ind_to_predicates=label_mapping["ind_to_predicates"],
             )
@@ -430,6 +449,7 @@ cells = [
             export_dir = Path(EXPORT_DIR) if EXPORT_DIR else RESULT_DIR / "analysis_exports"
             context = {
                 "dataset_paths": dataset_paths,
+                "runtime_cfg": runtime_cfg,
                 "label_mapping": label_mapping,
                 "artifacts": artifacts,
                 "train_statistics": train_statistics,
