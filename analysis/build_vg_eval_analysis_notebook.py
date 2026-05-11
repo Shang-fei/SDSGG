@@ -919,10 +919,9 @@ cells = [
                 suffix = metric_name.replace(f"{mode}_", "")
                 if isinstance(metric_value, dict):
                     for k, values in metric_value.items():
-                        if isinstance(values, list):
-                            scalar = float(np.mean(values)) if len(values) > 0 else np.nan
-                        else:
-                            scalar = float(values)
+                        scalar = safe_metric_to_scalar(values)
+                        if pd.isna(scalar):
+                            continue
                         metric_rows.append({
                             "mode": mode,
                             "metric_name": suffix,
@@ -930,6 +929,40 @@ cells = [
                             "value": scalar,
                         })
             return pd.DataFrame(metric_rows).sort_values(["metric_name", "k"]).reset_index(drop=True)
+
+
+        def safe_metric_to_scalar(values) -> float:
+            """
+            尝试把官方 result_dict 中的指标项转换成单个浮点数。
+
+            只接受以下两类值：
+            - 单个标量
+            - 一维数值列表
+
+            对于 `mean_recall_collect` 这类嵌套列表结构，直接返回 NaN 并跳过，
+            避免 notebook 在展示官方指标时中断。
+            """
+            if isinstance(values, (int, float, np.integer, np.floating)):
+                return float(values)
+
+            if isinstance(values, np.ndarray):
+                if values.ndim == 0:
+                    return float(values.item())
+                if values.ndim == 1 and np.issubdtype(values.dtype, np.number):
+                    return float(np.mean(values)) if len(values) > 0 else np.nan
+                return np.nan
+
+            if isinstance(values, list):
+                if len(values) == 0:
+                    return np.nan
+                if all(isinstance(item, (int, float, np.integer, np.floating)) for item in values):
+                    return float(np.mean(values))
+                return np.nan
+
+            try:
+                return float(values)
+            except Exception:
+                return np.nan
 
 
         def summarize_notebook_recall(gt_df: pd.DataFrame, pred_df: pd.DataFrame, topk_list: List[int]) -> pd.DataFrame:
