@@ -16,6 +16,7 @@ from .model_motifs import LSTMContext, FrequencyBias
 from .model_motifs_with_attribute import AttributeLSTMContext
 from .model_transformer import TransformerContext
 from .utils_relation import layer_init, get_box_info, get_box_pair_info
+from .common_prompt import CLIPTextCommonPromptEncoder
 from maskrcnn_benchmark.data import get_dataset_statistics
 from CLIP import clip
 import time
@@ -395,6 +396,8 @@ class ClipPredictor(nn.Module):
 
         self.use_vision = config.MODEL.ROI_RELATION_HEAD.PREDICT_USE_VISION
         self.use_bias = config.MODEL.ROI_RELATION_HEAD.PREDICT_USE_BIAS
+        self.use_common_relation_prompt = config.MODEL.ROI_RELATION_HEAD.USE_COMMON_RELATION_PROMPT
+        self.common_prompt_length = config.MODEL.ROI_RELATION_HEAD.COMMON_PROMPT_LENGTH
 
         # load class dict
         statistics = get_dataset_statistics(config)
@@ -457,7 +460,16 @@ class ClipPredictor(nn.Module):
                 'not intended for decorative purposes.',
                 'Have a straight body',
                 'It has a negative directionality']
+        self.register_buffer("relation_text_tokens1", clip.tokenize(["a photo of " + rel for rel in all_rel1]), persistent=False)
+        self.register_buffer("relation_text_tokens2", clip.tokenize(["a photo of " + rel for rel in all_rel2]), persistent=False)
         self.id_dict={'__background__': 0, 'above': 1, 'across': 2, 'against': 3, 'along': 4, 'and': 5, 'at': 6, 'attached to': 7, 'behind': 8, 'belonging to': 9, 'between': 10, 'carrying': 11, 'covered in': 12, 'covering': 13, 'eating': 14, 'flying in': 15, 'for': 16, 'from': 17, 'growing on': 18, 'hanging from': 19, 'has': 20, 'holding': 21, 'in': 22, 'in front of': 23, 'laying on': 24, 'looking at': 25, 'lying on': 26, 'made of': 27, 'mounted on': 28, 'near': 29, 'of': 30, 'on': 31, 'on back of': 32, 'over': 33, 'painted on': 34, 'parked on': 35, 'part of': 36, 'playing': 37, 'riding': 38, 'says': 39, 'sitting on': 40, 'standing on': 41, 'to': 42, 'under': 43, 'using': 44, 'walking in': 45, 'walking on': 46, 'watching': 47, 'wearing': 48, 'wears': 49, 'with': 50}
+
+        if self.use_common_relation_prompt:
+            self.common_relation_prompt_encoder = CLIPTextCommonPromptEncoder(
+                self.clip_model,
+                prompt_length=self.common_prompt_length,
+                init_std=config.MODEL.ROI_RELATION_HEAD.COMMON_PROMPT_INIT_STD,
+            )
 
         self.base=[0]+[self.id_dict[x] for x in sorted(config.OV_SETTING.PRDCS_BASE)]
         self.novel=[0]+[self.id_dict[x] for x in sorted(config.OV_SETTING.PRDCS_NOVEL)]
@@ -488,15 +500,13 @@ class ClipPredictor(nn.Module):
         self.description_relation=np.array(self.description_relation)
         self.description_relation = np.array([[np.array(item) for item in inner_list] for inner_list in self.description_relation])
         self.description_relation=torch.Tensor(self.description_relation).to(self.device)
+        self.filter_text_tokens = []
 
         with torch.no_grad():
-
-            text1=clip.tokenize( ["a photo of "+rel for rel in all_rel1]).to(self.device)
-            text_features1 = self.clip_model.encode_text(text1)
+            text_features1 = self.clip_model.encode_text(self.relation_text_tokens1.to(self.device))
             self.text_features1=text_features1
 
-            text2=clip.tokenize( ["a photo of "+rel for rel in all_rel2]).to(self.device)
-            text_features2 = self.clip_model.encode_text(text2)
+            text_features2 = self.clip_model.encode_text(self.relation_text_tokens2.to(self.device))
             self.text_features2=text_features2
 
             text3=clip.tokenize(["a photo of subject " for x in self.obj_names]).to(self.device)
@@ -510,9 +520,9 @@ class ClipPredictor(nn.Module):
             self.texts5=[]
 
             for obj in self.obj_names:
-                text5 = clip.tokenize(["a photo of " + tex for tex in list(self.sub_filter_novel[obj])]).to(
-                    self.device)
-                text_features5 = self.clip_model.encode_text(text5)
+                text5 = clip.tokenize(["a photo of " + tex for tex in list(self.sub_filter_novel[obj])])
+                self.filter_text_tokens.append(text5)
+                text_features5 = self.clip_model.encode_text(text5.to(self.device))
                 text_features5 = text_features5
                 self.texts5.append(text_features5.detach().cpu().numpy())
 
@@ -523,6 +533,19 @@ class ClipPredictor(nn.Module):
         self.count=0
 
         self.linear1=nn.Linear(1024,512, bias=False).to(self.device).half()
+
+    def _get_relation_text_features(self):
+        if not self.use_common_relation_prompt:
+            return self.text_features1, self.text_features2
+
+        text_features1 = self.common_relation_prompt_encoder(self.relation_text_tokens1)
+        text_features2 = self.common_relation_prompt_encoder(self.relation_text_tokens2)
+        return text_features1, text_features2
+
+    def _get_filter_text_features(self, obj_idx):
+        if not self.use_common_relation_prompt:
+            return torch.as_tensor(self.texts5[obj_idx], device=self.device).half()
+        return self.common_relation_prompt_encoder(self.filter_text_tokens[obj_idx]).to(self.device)
 
     def updata(self,mode):
         print("now is "+mode)
@@ -560,16 +583,17 @@ class ClipPredictor(nn.Module):
 
         with torch.no_grad():
             self.texts5=[]
+            self.filter_text_tokens=[]
 
             for obj in self.obj_names:
-                text5 = clip.tokenize(["a photo of " + tex for tex in list(self.sub_filter_novel[obj])]).to(
-                    self.device)
+                text5 = clip.tokenize(["a photo of " + tex for tex in list(self.sub_filter_novel[obj])])
+                self.filter_text_tokens.append(text5)
 
                 timing = []
 
                 a = time.time()
 
-                text_features5 = self.clip_model.encode_text(text5)
+                text_features5 = self.clip_model.encode_text(text5.to(self.device))
                 text_features5 = text_features5
                 self.texts5.append(text_features5.detach().cpu().numpy())
 
@@ -592,6 +616,7 @@ class ClipPredictor(nn.Module):
         num_objs = [len(b) for b in proposals]
         assert len(num_rels) == len(num_objs)
         obj_preds = obj_preds.split(num_objs, dim=0)
+        text_features1, text_features2 = self._get_relation_text_features()
 
 
         rel_dists=[]
@@ -613,9 +638,6 @@ class ClipPredictor(nn.Module):
             for la_count,rel_index in enumerate(rel_pair_idxs[i]):
 
                 obj_n1,obj_n2=obj_preds[i][rel_index[0]],obj_preds[i][rel_index[1]]#two object names
-
-                text_features1=self.text_features1
-                text_features2=self.text_features2
 
                 text_sub=self.text_features3[obj_n1]
                 text_obj=self.text_features4[obj_n2]
@@ -654,7 +676,7 @@ class ClipPredictor(nn.Module):
 
                     probs = (probs.sum(-1) ).unsqueeze(0)
 
-                    text_features5 = torch.Tensor(self.texts5[obj_n1]).to(self.device).half()
+                    text_features5 = self._get_filter_text_features(int(obj_n1.item()))
                     similarity31 = ((image_features[rel_index[0]][0].unsqueeze(0)/image_features[rel_index[0]][0].unsqueeze(0).norm(dim=-1, keepdim=True)) @ (text_features5/text_features5.norm(dim=-1, keepdim=True)).T/0.05)
                     similarity32 = ((image_features[rel_index[1]][0].unsqueeze(0)/image_features[rel_index[1]][0].unsqueeze(0).norm(dim=-1, keepdim=True)) @ (text_features5/text_features5.norm(dim=-1, keepdim=True)).T/0.05)
                     similarity3=(similarity31+similarity32)/2
