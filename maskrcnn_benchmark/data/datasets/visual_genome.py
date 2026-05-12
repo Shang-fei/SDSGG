@@ -40,7 +40,6 @@ class VGDataset(torch.utils.data.Dataset):
         # for debug
         # num_im = 10000
         # num_val_im = 4
-
         assert split in {'train', 'val', 'test'}
         self.flip_aug = flip_aug
         self.split = split
@@ -237,7 +236,7 @@ class VGDataset(torch.utils.data.Dataset):
     def get_statistics(self):
         fg_matrix, bg_matrix = get_VG_statistics(img_dir=self.img_dir, roidb_file=self.roidb_file,
                                                  dict_file=self.dict_file,
-                                                 image_file=self.image_file, must_overlap=True)
+                                                 image_file=self.image_file, must_overlap=True, train_data=self)
         eps = 1e-3
         bg_matrix += 1
         fg_matrix[:, :, 0] = bg_matrix
@@ -328,10 +327,11 @@ class VGDataset(torch.utils.data.Dataset):
         return len(self.filenames)
 
 
-def get_VG_statistics(img_dir, roidb_file, dict_file, image_file, must_overlap=True):
-    train_data = VGDataset(split='train', img_dir=img_dir, roidb_file=roidb_file,
-                           dict_file=dict_file, image_file=image_file, num_val_im=5000,
-                           filter_duplicate_rels=False)
+def get_VG_statistics(img_dir, roidb_file, dict_file, image_file, must_overlap=True, train_data=None):
+    if train_data is None:
+        train_data = VGDataset(split='train', img_dir=img_dir, roidb_file=roidb_file,
+                            dict_file=dict_file, image_file=image_file, num_val_im=5000,
+                            filter_duplicate_rels=False)
     num_obj_classes = len(train_data.ind_to_classes)
     num_rel_classes = len(train_data.ind_to_predicates)
     fg_matrix = np.zeros((num_obj_classes, num_obj_classes, num_rel_classes), dtype=np.int64)
