@@ -15,6 +15,8 @@ from maskrcnn_benchmark.modeling.box_coder import BoxCoder
 from maskrcnn_benchmark.modeling.matcher import Matcher
 from maskrcnn_benchmark.structures.boxlist_ops import boxlist_iou
 from maskrcnn_benchmark.modeling.utils import cat
+from maskrcnn_benchmark.data import get_dataset_statistics
+from .low_rank_text import build_split_indices
 import pandas as pd
 
 from  defaults import PRDCS_BASE ,PRDCS_NOVEL,SEMAN,TRAIN_PART,DATA_OPTION
@@ -36,7 +38,8 @@ class RelationLossComputation(object):
         attribute_bgfg_ratio,
         use_label_smoothing,
         predicate_proportion,
-        device
+        device,
+        cfg=None
     ):
         """
         Arguments:
@@ -50,6 +53,17 @@ class RelationLossComputation(object):
         self.attribute_bgfg_ratio = attribute_bgfg_ratio
         self.use_label_smoothing = use_label_smoothing
         self.pred_weight = (1.0 / torch.FloatTensor([0.5,] + predicate_proportion)).cuda()
+        self.use_low_rank_text = (
+            cfg is not None and cfg.MODEL.ROI_RELATION_HEAD.LOW_RANK_TEXT.ENABLED
+        )
+        if self.use_low_rank_text:
+            self.low_rank_relation_ids = self._build_low_rank_relation_ids(cfg)
+            max_rel_id = max(self.low_rank_relation_ids)
+            label_map = torch.full((max_rel_id + 1,), -1, dtype=torch.long, device=torch.device(device))
+            for local_idx, global_idx in enumerate(self.low_rank_relation_ids):
+                label_map[global_idx] = local_idx
+            self.low_rank_label_map = label_map
+            self.low_rank_criterion = nn.CrossEntropyLoss(ignore_index=-1)
 
         if self.use_label_smoothing:
             self.criterion_loss = Label_Smoothing_Regression(e=0.01)
@@ -57,6 +71,15 @@ class RelationLossComputation(object):
             self.criterion_loss = nn.CrossEntropyLoss()
         self.loss=Loss(gamma=0.0, alpha=1, size_average=True,device=device)
         #self.focal_loss=MultiCEFocalLoss(class_num=25,device=device)
+
+    @staticmethod
+    def _build_low_rank_relation_ids(cfg):
+        rel_classes = get_dataset_statistics(cfg)["rel_classes"]
+        split_indices = build_split_indices(cfg, rel_classes)
+        part = cfg.OV_SETTING.TRAIN_PART
+        if part not in split_indices:
+            raise ValueError("Unsupported OV_SETTING.TRAIN_PART: {}".format(part))
+        return split_indices[part]
 
     def __call__(self, proposals, rel_labels, relation_logits, refine_logits):
         """
@@ -86,8 +109,15 @@ class RelationLossComputation(object):
 
         fg_labels = cat([proposal.get_field("labels") for proposal in proposals], dim=0)
         rel_labels = cat(rel_labels, dim=0)
-        
-        loss_relation = self.loss(relation_logits, rel_labels.long())
+
+        if self.use_low_rank_text:
+            rel_labels = rel_labels.long()
+            mapped_rel_labels = torch.full_like(rel_labels, -1)
+            valid = rel_labels < self.low_rank_label_map.numel()
+            mapped_rel_labels[valid] = self.low_rank_label_map[rel_labels[valid]]
+            loss_relation = self.low_rank_criterion(relation_logits.float(), mapped_rel_labels)
+        else:
+            loss_relation = self.loss(relation_logits, rel_labels.long())
         #loss_relation = self.criterion_loss(relation_logits, rel_labels.long())
         loss_refine_obj = self.criterion_loss(refine_obj_logits, fg_labels.long())
 
@@ -251,7 +281,8 @@ def make_roi_relation_loss_evaluator(cfg):
         cfg.MODEL.ROI_ATTRIBUTE_HEAD.ATTRIBUTE_BGFG_RATIO,
         cfg.MODEL.ROI_RELATION_HEAD.LABEL_SMOOTHING_LOSS,
         cfg.MODEL.ROI_RELATION_HEAD.REL_PROP,
-        cfg.MODEL.DEVICE
+        cfg.MODEL.DEVICE,
+        cfg=cfg
     )
 
     return loss_evaluator

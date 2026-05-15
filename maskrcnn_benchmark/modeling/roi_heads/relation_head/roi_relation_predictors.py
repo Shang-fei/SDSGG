@@ -16,6 +16,11 @@ from .model_motifs import LSTMContext, FrequencyBias
 from .model_motifs_with_attribute import AttributeLSTMContext
 from .model_transformer import TransformerContext
 from .utils_relation import layer_init, get_box_info, get_box_pair_info
+from .low_rank_text import (
+    LowRankRelationTextAdapter,
+    PredicateNameTextProvider,
+    build_split_indices,
+)
 from maskrcnn_benchmark.data import get_dataset_statistics
 from CLIP import clip
 import time
@@ -395,6 +400,8 @@ class ClipPredictor(nn.Module):
 
         self.use_vision = config.MODEL.ROI_RELATION_HEAD.PREDICT_USE_VISION
         self.use_bias = config.MODEL.ROI_RELATION_HEAD.PREDICT_USE_BIAS
+        self.use_low_rank_text = config.MODEL.ROI_RELATION_HEAD.LOW_RANK_TEXT.ENABLED
+        self.low_rank_cfg = config.MODEL.ROI_RELATION_HEAD.LOW_RANK_TEXT
 
         # load class dict
         statistics = get_dataset_statistics(config)
@@ -463,6 +470,11 @@ class ClipPredictor(nn.Module):
         self.novel=[0]+[self.id_dict[x] for x in sorted(config.OV_SETTING.PRDCS_NOVEL)]
 
         self.semantic = [0]+[self.id_dict[x] for x in sorted(config.OV_SETTING.SEMAN)]
+        self.predicate_names = rel_classes
+        self.low_rank_split_indices = build_split_indices(config, self.predicate_names)
+        self.active_low_rank_indices = torch.as_tensor(
+            self.low_rank_split_indices["base"], device=self.device, dtype=torch.long
+        )
         mode="base"
 
         if mode=="base":
@@ -507,6 +519,17 @@ class ClipPredictor(nn.Module):
             text_features4 = self.clip_model.encode_text(text4)
             self.text_features4=text_features4
 
+            if self.use_low_rank_text:
+                relation_text_features = self._encode_low_rank_relation_texts()
+                self.low_rank_text_adapter = LowRankRelationTextAdapter(
+                    relation_text_features,
+                    rank=self.low_rank_cfg.RANK,
+                    recon_loss_weight=self.low_rank_cfg.RECON_LOSS_WEIGHT,
+                    sparsity_weight=self.low_rank_cfg.SPARSITY_WEIGHT,
+                    basis_decorr_weight=self.low_rank_cfg.BASIS_DECORR_WEIGHT,
+                    train_basis=self.low_rank_cfg.TRAIN_BASIS,
+                ).to(self.device)
+
             self.texts5=[]
 
             for obj in self.obj_names:
@@ -524,8 +547,36 @@ class ClipPredictor(nn.Module):
 
         self.linear1=nn.Linear(1024,512, bias=False).to(self.device).half()
 
+    def _encode_low_rank_relation_texts(self):
+        if self.low_rank_cfg.TEXT_SOURCE != "predicate_name":
+            raise ValueError(
+                "Unsupported LOW_RANK_TEXT.TEXT_SOURCE: {}".format(
+                    self.low_rank_cfg.TEXT_SOURCE
+                )
+            )
+        provider = PredicateNameTextProvider(self.low_rank_cfg.TEMPLATE)
+        texts = provider(self.predicate_names)
+        text_tokens = clip.tokenize(texts).to(self.device)
+        text_features = self.clip_model.encode_text(text_tokens)
+        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+        text_features[0].zero_()
+        return text_features
+
+    def _set_low_rank_mode(self, mode):
+        if not self.use_low_rank_text:
+            return
+        if mode not in self.low_rank_split_indices:
+            raise ValueError("Unsupported OV relation split: {}".format(mode))
+        self.active_low_rank_indices = torch.as_tensor(
+            self.low_rank_split_indices[mode], device=self.device, dtype=torch.long
+        )
+
+    def _get_low_rank_relation_text_features(self):
+        return self.low_rank_text_adapter(self.active_low_rank_indices)
+
     def updata(self,mode):
         print("now is "+mode)
+        self._set_low_rank_mode(mode)
         self.description_relation = pd.read_csv(
             curpath+"/description_relation.csv")
         if mode == "base":
@@ -593,6 +644,8 @@ class ClipPredictor(nn.Module):
         assert len(num_rels) == len(num_objs)
         obj_preds = obj_preds.split(num_objs, dim=0)
 
+        if self.use_low_rank_text:
+            text_features_low_rank = self._get_low_rank_relation_text_features()
 
         rel_dists=[]
         for i in range(len(num_rels)):
@@ -627,6 +680,13 @@ class ClipPredictor(nn.Module):
                 cross_output2=self.adaper_clip2(image_features[rel_index[1]].unsqueeze(0),image_features[rel_index[0]].unsqueeze(0),text_obj)
 
                 cross_output=(cross_output1+cross_output2)/2
+
+                if self.use_low_rank_text:
+                    cross_output_norm = F.normalize(cross_output, dim=-1)
+                    text_features_low_rank = F.normalize(text_features_low_rank, dim=-1)
+                    probs = (cross_output_norm.float() @ text_features_low_rank.float().T) / 0.05
+                    rel_dist_per_batch.append(probs)
+                    continue
 
                 similarity1 = ((cross_output/ cross_output.norm(dim=-1, keepdim=True)) @ (text_features1/text_features1.norm(dim=-1, keepdim=True)).T)
 
@@ -672,6 +732,8 @@ class ClipPredictor(nn.Module):
         rel_dists = tuple(rel_dists)
 
         add_losses = {}
+        if self.use_low_rank_text and self.training:
+            add_losses.update(self.low_rank_text_adapter.losses())
         return obj_dists, rel_dists, add_losses
 
 
