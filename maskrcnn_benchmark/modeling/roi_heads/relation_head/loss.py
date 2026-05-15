@@ -54,7 +54,11 @@ class RelationLossComputation(object):
         self.use_label_smoothing = use_label_smoothing
         self.pred_weight = (1.0 / torch.FloatTensor([0.5,] + predicate_proportion)).cuda()
         self.use_low_rank_text = (
-            cfg is not None and cfg.MODEL.ROI_RELATION_HEAD.LOW_RANK_TEXT.ENABLED
+            cfg is not None
+            and (
+                cfg.MODEL.ROI_RELATION_HEAD.LOW_RANK_TEXT.ENABLED
+                or cfg.MODEL.ROI_RELATION_HEAD.PREDICTOR == "LowRankClipPredictor"
+            )
         )
         if self.use_low_rank_text:
             self.low_rank_relation_ids = self._build_low_rank_relation_ids(cfg)
