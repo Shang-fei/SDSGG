@@ -19,6 +19,7 @@ from .utils_relation import layer_init, get_box_info, get_box_pair_info
 from .low_rank_text import (
     LowRankRelationTextAdapter,
     PredicateNameTextProvider,
+    RelationTextMemoryAdapter,
     build_full_predicate_names,
     build_split_indices,
 )
@@ -690,6 +691,7 @@ class LowRankClipPredictor(nn.Module):
         self.num_rel_cls = config.MODEL.ROI_RELATION_HEAD.NUM_CLASSES
         self.device = config.MODEL.DEVICE
         self.low_rank_cfg = config.MODEL.ROI_RELATION_HEAD.LOW_RANK_TEXT
+        self.weight_adapt_cfg = self.low_rank_cfg.WEIGHT_ADAPTATION
 
         statistics = get_dataset_statistics(config)
         obj_classes = statistics["obj_classes"]
@@ -723,6 +725,15 @@ class LowRankClipPredictor(nn.Module):
             basis_decorr_weight=self.low_rank_cfg.BASIS_DECORR_WEIGHT,
             train_basis=self.low_rank_cfg.TRAIN_BASIS,
         ).to(self.device)
+        self.text_memory_adapter = None
+        if self.weight_adapt_cfg.ENABLED:
+            self.text_memory_adapter = RelationTextMemoryAdapter(
+                feature_dim=relation_text_features.size(-1),
+                prior_dim=relation_text_features.size(-1),
+                bottleneck_dim=self.weight_adapt_cfg.BOTTLENECK_DIM,
+                num_layers=self.weight_adapt_cfg.NUM_LAYERS,
+                scale=self.weight_adapt_cfg.SCALE,
+            ).to(self.device)
 
     def _encode_relation_texts(self):
         if self.low_rank_cfg.TEXT_SOURCE != "predicate_name":
@@ -748,7 +759,7 @@ class LowRankClipPredictor(nn.Module):
         )
 
     def _get_relation_text_features(self):
-        return self.low_rank_text_adapter(self.active_low_rank_indices)
+        return self.low_rank_text_adapter.reconstruct()[self.active_low_rank_indices]
 
     def _encode_object_crops(self, proposal, image):
         image_tensor = []
@@ -771,9 +782,10 @@ class LowRankClipPredictor(nn.Module):
         num_objs = [len(b) for b in proposals]
         assert len(num_rels) == len(num_objs)
         obj_preds = obj_preds.split(num_objs, dim=0)
-        relation_text_features = F.normalize(self._get_relation_text_features(), dim=-1)
+        relation_text_features = self._get_relation_text_features()
 
         rel_dists = []
+        weight_adapt_losses = []
         for i in range(len(num_rels)):
             with torch.no_grad():
                 image_features = self._encode_object_crops(proposals[i], img[i])
@@ -796,7 +808,23 @@ class LowRankClipPredictor(nn.Module):
                     text_obj,
                 )
                 pair_feature = F.normalize((cross_output1 + cross_output2) / 2, dim=-1)
-                probs = (pair_feature.float() @ relation_text_features.float().T) / 0.05
+                if self.text_memory_adapter is None:
+                    text_features = F.normalize(relation_text_features, dim=-1)
+                else:
+                    text_features = self.text_memory_adapter(relation_text_features, pair_feature)
+                    if self.active_low_rank_indices[0].item() == 0:
+                        text_features = text_features.clone()
+                        text_features[0].zero_()
+                    if self.training:
+                        weight_adapt_losses.append(
+                            self.low_rank_text_adapter.weight_adaptation_loss(
+                                text_features,
+                                self.active_low_rank_indices,
+                                self.weight_adapt_cfg.REG_WEIGHT,
+                            )
+                        )
+                    text_features = F.normalize(text_features, dim=-1)
+                probs = (pair_feature.float() @ text_features.float().T) / 0.05
                 rel_dist_per_batch.append(probs)
 
             rel_dists.append(torch.cat(rel_dist_per_batch))
@@ -805,6 +833,8 @@ class LowRankClipPredictor(nn.Module):
         add_losses = {}
         if self.training:
             add_losses.update(self.low_rank_text_adapter.losses())
+            if weight_adapt_losses:
+                add_losses["loss_lr_weight_adapt"] = torch.stack(weight_adapt_losses).mean()
         return obj_dists, tuple(rel_dists), add_losses
 
 

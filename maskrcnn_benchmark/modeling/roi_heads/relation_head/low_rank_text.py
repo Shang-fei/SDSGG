@@ -115,6 +115,23 @@ class LowRankRelationTextAdapter(nn.Module):
             return text_features
         return text_features[active_indices]
 
+    def active_class_weights(self, active_indices):
+        weights = self.class_weights[active_indices]
+        if weights.size(0) > 0 and active_indices[0].item() == 0:
+            weights = weights.clone()
+            weights[0].zero_()
+        return weights
+
+    def basis_pinv(self):
+        return torch.pinverse(self.basis.float())
+
+    def weight_adaptation_loss(self, adapted_text_features, active_indices, weight):
+        if weight <= 0:
+            return adapted_text_features.new_tensor(0.0)
+        adapted_weights = adapted_text_features.float() @ self.basis_pinv()
+        target_weights = self.active_class_weights(active_indices).float().detach()
+        return F.mse_loss(adapted_weights, target_weights) * weight
+
     def losses(self):
         losses = {}
         reconstructed = self.reconstruct()
@@ -130,3 +147,51 @@ class LowRankRelationTextAdapter(nn.Module):
             off_diag = corr - torch.eye(corr.size(0), device=corr.device).type_as(corr)
             losses["loss_lr_basis_decorr"] = off_diag.abs().mean() * self.basis_decorr_weight
         return losses
+
+
+class RelationTextMemoryAdapter(nn.Module):
+    def __init__(
+        self,
+        feature_dim,
+        prior_dim=None,
+        bottleneck_dim=64,
+        num_layers=1,
+        scale=1.0,
+        dropout=0.1,
+    ):
+        super(RelationTextMemoryAdapter, self).__init__()
+        prior_dim = feature_dim if prior_dim is None else prior_dim
+        self.scale = float(scale)
+        self.down_proj_mem = nn.Linear(feature_dim, bottleneck_dim)
+        self.down_proj_prior = nn.Linear(prior_dim, bottleneck_dim)
+        self.non_linear = nn.ReLU()
+        self.layers = nn.ModuleList([
+            nn.TransformerDecoderLayer(
+                d_model=bottleneck_dim,
+                nhead=2,
+                dim_feedforward=bottleneck_dim * 2,
+                dropout=dropout,
+                activation="relu",
+            )
+            for _ in range(num_layers)
+        ])
+        self.up_proj_mem = nn.Linear(bottleneck_dim, feature_dim)
+
+        nn.init.zeros_(self.up_proj_mem.weight)
+        nn.init.zeros_(self.up_proj_mem.bias)
+
+    def forward(self, text_features, visual_context):
+        text_dtype = text_features.dtype
+        query = self.non_linear(self.down_proj_mem(text_features.float())).unsqueeze(1)
+        memory = self.down_proj_prior(visual_context.float())
+        if memory.dim() == 1:
+            memory = memory.unsqueeze(0)
+        if memory.size(0) == 1:
+            memory = memory.expand(text_features.size(0), -1)
+
+        query = query.transpose(0, 1)
+        memory = memory.unsqueeze(0)
+        for layer in self.layers:
+            query = layer(query, memory)
+        delta = self.up_proj_mem(query.transpose(0, 1).squeeze(1))
+        return (text_features.float() + delta * self.scale).to(text_dtype)
