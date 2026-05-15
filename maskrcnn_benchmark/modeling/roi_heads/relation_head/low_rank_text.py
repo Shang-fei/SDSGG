@@ -40,6 +40,19 @@ def build_full_predicate_names(cfg):
     return predicate_names
 
 
+def build_split_indices(cfg, predicate_names):
+    def ids_for(names):
+        selected = set(names)
+        return [idx for idx, name in enumerate(predicate_names) if idx == 0 or name in selected]
+
+    return {
+        "base": ids_for(cfg.OV_SETTING.PRDCS_BASE),
+        "novel": ids_for(cfg.OV_SETTING.PRDCS_NOVEL),
+        "semantic": ids_for(cfg.OV_SETTING.SEMAN),
+        "total": list(range(len(predicate_names))),
+    }
+
+
 class LowRankRelationTextAdapter(nn.Module):
     def __init__(
         self,

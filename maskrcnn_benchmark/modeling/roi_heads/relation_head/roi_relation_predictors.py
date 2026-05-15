@@ -20,6 +20,7 @@ from .low_rank_text import (
     LowRankRelationTextAdapter,
     PredicateNameTextProvider,
     build_full_predicate_names,
+    build_split_indices,
 )
 from maskrcnn_benchmark.data import get_dataset_statistics
 from CLIP import clip
@@ -261,7 +262,7 @@ class GQAClipPredictor(nn.Module):
         print('init complete : '+str(b-a))
         self.linear1=nn.Linear(1024,512, bias=False).to(self.device).half()
 
-    def updata(self,mode,predicate_names=None):
+    def updata(self,mode):
         print("now is "+mode)
         self.description_relation = pd.read_csv(
             curpath+"/description_relation_loss.csv")
@@ -529,7 +530,7 @@ class ClipPredictor(nn.Module):
 
         self.linear1=nn.Linear(1024,512, bias=False).to(self.device).half()
 
-    def updata(self,mode,predicate_names=None):
+    def updata(self,mode):
         print("now is "+mode)
         self.description_relation = pd.read_csv(
             curpath+"/description_relation.csv")
@@ -700,11 +701,12 @@ class LowRankClipPredictor(nn.Module):
         self.adaper_clip2 = MVA()
         self.obj_names = obj_classes
         self.train_predicate_names = rel_classes
-        self.predicate_names = build_full_predicate_names(config)
+        self.predicate_names = statistics.get("global_rel_classes", build_full_predicate_names(config))
         self.predicate_to_low_rank_idx = {
             name: idx for idx, name in enumerate(self.predicate_names)
         }
-        self.set_active_predicates(self.train_predicate_names)
+        self.active_indices_by_mode = build_split_indices(config, self.predicate_names)
+        self.updata(config.OV_SETTING.TRAIN_PART)
 
         with torch.no_grad():
             relation_text_features = self._encode_relation_texts()
@@ -737,22 +739,13 @@ class LowRankClipPredictor(nn.Module):
         text_features[0].zero_()
         return text_features
 
-    def set_active_predicates(self, predicate_names):
-        missing_names = [name for name in predicate_names if name not in self.predicate_to_low_rank_idx]
-        if len(missing_names) > 0:
-            raise ValueError("Unknown predicate names for low-rank text: {}".format(missing_names))
-        self.active_low_rank_indices = torch.as_tensor(
-            [self.predicate_to_low_rank_idx[name] for name in predicate_names],
-            device=self.device,
-            dtype=torch.long,
-        )
-        self.active_predicate_names = list(predicate_names)
-
-    def updata(self, mode, predicate_names=None):
+    def updata(self, mode):
         print("now is " + mode)
-        if predicate_names is None:
-            predicate_names = self.train_predicate_names
-        self.set_active_predicates(predicate_names)
+        if mode not in self.active_indices_by_mode:
+            raise ValueError("Unsupported OV relation split: {}".format(mode))
+        self.active_low_rank_indices = torch.as_tensor(
+            self.active_indices_by_mode[mode], device=self.device, dtype=torch.long
+        )
 
     def _get_relation_text_features(self):
         return self.low_rank_text_adapter(self.active_low_rank_indices)

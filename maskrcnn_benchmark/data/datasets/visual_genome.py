@@ -54,6 +54,7 @@ class VGDataset(torch.utils.data.Dataset):
 
         self.ind_to_classes, self.ind_to_predicates, self.ind_to_attributes = load_info(
             dict_file)  # contiguous 151, 51 containing __background__
+        self.global_ind_to_predicates = list(self.ind_to_predicates)
         self.categories = {i: self.ind_to_classes[i] for i in range(len(self.ind_to_classes))}
         print(self.ind_to_classes)
         self.custom_eval = custom_eval
@@ -248,6 +249,7 @@ class VGDataset(torch.utils.data.Dataset):
             'pred_dist': torch.from_numpy(pred_dist).float(),
             'obj_classes': self.ind_to_classes,
             'rel_classes': self.ind_to_predicates,
+            'global_rel_classes': self.global_ind_to_predicates,
             'att_classes': self.ind_to_attributes,
         }
         return result

@@ -20,17 +20,6 @@ from maskrcnn_benchmark.utils.miscellaneous import mkdir
 # Check if we can enable mixed-precision via apex.amp
 
 
-def get_predicate_names(data_loader):
-    dataset = data_loader.dataset
-    if hasattr(dataset, "ind_to_predicates"):
-        return dataset.ind_to_predicates
-    if hasattr(dataset, "datasets") and len(dataset.datasets) == 1:
-        child = dataset.datasets[0]
-        if hasattr(child, "ind_to_predicates"):
-            return child.ind_to_predicates
-    return None
-
-
 def main():
     parser = argparse.ArgumentParser(description="PyTorch Object Detection Inference")
     parser.add_argument(
@@ -111,7 +100,7 @@ def main():
             output_folders[idx] = output_folder
     data_loaders_val = make_data_loader(cfg=cfg, mode="test", is_distributed=distributed, dataset_to_test=cfg.DATASETS.TO_TEST)
     for output_folder, dataset_name, data_loader_val in zip(output_folders, dataset_names, data_loaders_val):
-        model.updata(cfg.OV_SETTING.TEST_PART, get_predicate_names(data_loader_val))
+        model.updata(cfg.OV_SETTING.TEST_PART)
         inference(
             cfg,
             model,
