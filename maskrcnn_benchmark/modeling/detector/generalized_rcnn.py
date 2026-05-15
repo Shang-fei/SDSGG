@@ -50,8 +50,8 @@ class GeneralizedRCNN(nn.Module):
         self.roi_heads = build_roi_heads(cfg, self.backbone.out_channels)
 
 
-    def updata(self,mode):
-        self.roi_heads.updata(mode)
+    def updata(self,mode,predicate_names=None):
+        self.roi_heads.updata(mode,predicate_names)
 
     def forward(self, images, targets=None, logger=None):
         """

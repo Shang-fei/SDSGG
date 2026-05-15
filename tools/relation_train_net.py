@@ -237,11 +237,20 @@ def fix_eval_modules(eval_modules):
             param.requires_grad = False
         # DO NOT use module.eval(), otherwise the module will be in the test mode, i.e., all self.training condition is set to False
 
+def get_predicate_names(data_loader):
+    dataset = data_loader.dataset
+    if hasattr(dataset, "ind_to_predicates"):
+        return dataset.ind_to_predicates
+    if hasattr(dataset, "datasets") and len(dataset.datasets) == 1:
+        child = dataset.datasets[0]
+        if hasattr(child, "ind_to_predicates"):
+            return child.ind_to_predicates
+    return None
+
 def run_val(cfg, model, val_data_loaders, distributed, logger):
     if distributed:
         model = model.module
     torch.cuda.empty_cache()
-    model.updata(cfg.OV_SETTING.VAL_PART)
     iou_types = ("bbox",)
     if cfg.MODEL.MASK_ON:
         iou_types = iou_types + ("segm",)
@@ -256,6 +265,7 @@ def run_val(cfg, model, val_data_loaders, distributed, logger):
     val_result = []
     
     for dataset_name, val_data_loader in zip(dataset_names, val_data_loaders):
+        model.updata(cfg.OV_SETTING.VAL_PART, get_predicate_names(val_data_loader))
         dataset_result = inference(
                             cfg,
                             model,
@@ -288,7 +298,6 @@ def run_test(cfg, model, distributed, logger):
         model = model.module
 
     torch.cuda.empty_cache()
-    model.updata(cfg.OV_SETTING.TEST_PART)
     iou_types = ("bbox",)
     if cfg.MODEL.MASK_ON:
         iou_types = iou_types + ("segm",)
@@ -308,6 +317,7 @@ def run_test(cfg, model, distributed, logger):
             output_folders[idx] = output_folder
     data_loaders_val = make_data_loader(cfg, mode='test', is_distributed=distributed)
     for output_folder, dataset_name, data_loader_val in zip(output_folders, dataset_names, data_loaders_val):
+        model.updata(cfg.OV_SETTING.TEST_PART, get_predicate_names(data_loader_val))
         inference(
             cfg,
             model,

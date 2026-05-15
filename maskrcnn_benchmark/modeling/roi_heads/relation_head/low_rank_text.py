@@ -3,6 +3,17 @@ from torch import nn
 from torch.nn import functional as F
 
 
+VG_PREDICATES = [
+    "__background__", "above", "across", "against", "along", "and", "at", "attached to",
+    "behind", "belonging to", "between", "carrying", "covered in", "covering", "eating",
+    "flying in", "for", "from", "growing on", "hanging from", "has", "holding", "in",
+    "in front of", "laying on", "looking at", "lying on", "made of", "mounted on",
+    "near", "of", "on", "on back of", "over", "painted on", "parked on", "part of",
+    "playing", "riding", "says", "sitting on", "standing on", "to", "under", "using",
+    "walking in", "walking on", "watching", "wearing", "wears", "with",
+]
+
+
 class PredicateNameTextProvider(object):
     def __init__(self, template):
         self.template = template
@@ -17,18 +28,16 @@ class PredicateNameTextProvider(object):
         return texts
 
 
-def build_split_indices(cfg, predicate_names):
-    name_to_idx = {name: idx for idx, name in enumerate(predicate_names)}
-
-    def ids_for(names):
-        return [0] + [name_to_idx[name] for name in sorted(names) if name in name_to_idx]
-
-    return {
-        "base": ids_for(cfg.OV_SETTING.PRDCS_BASE),
-        "novel": ids_for(cfg.OV_SETTING.PRDCS_NOVEL),
-        "semantic": ids_for(cfg.OV_SETTING.SEMAN),
-        "total": list(range(len(predicate_names))),
-    }
+def build_full_predicate_names(cfg):
+    predicate_names = ["__background__"]
+    allowed = set(cfg.OV_SETTING.PRDCS_BASE + cfg.OV_SETTING.PRDCS_NOVEL)
+    for name in VG_PREDICATES:
+        if name in allowed and name not in predicate_names:
+            predicate_names.append(name)
+    for name in cfg.OV_SETTING.PRDCS_BASE + cfg.OV_SETTING.PRDCS_NOVEL:
+        if name not in predicate_names:
+            predicate_names.append(name)
+    return predicate_names
 
 
 class LowRankRelationTextAdapter(nn.Module):

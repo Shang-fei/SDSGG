@@ -20,6 +20,17 @@ from maskrcnn_benchmark.utils.miscellaneous import mkdir
 # Check if we can enable mixed-precision via apex.amp
 
 
+def get_predicate_names(data_loader):
+    dataset = data_loader.dataset
+    if hasattr(dataset, "ind_to_predicates"):
+        return dataset.ind_to_predicates
+    if hasattr(dataset, "datasets") and len(dataset.datasets) == 1:
+        child = dataset.datasets[0]
+        if hasattr(child, "ind_to_predicates"):
+            return child.ind_to_predicates
+    return None
+
+
 def main():
     parser = argparse.ArgumentParser(description="PyTorch Object Detection Inference")
     parser.add_argument(
@@ -63,7 +74,6 @@ def main():
     model = build_detection_model(cfg)
 
     model.to(cfg.MODEL.DEVICE)
-    model.updata(cfg.OV_SETTING.TEST_PART)
     # Initialize mixed-precision if necessary
     use_mixed_precision = cfg.DTYPE == 'float16'
     #amp_handle = amp.init(enabled=use_mixed_precision, verbose=cfg.AMP_VERBOSE)
@@ -99,9 +109,9 @@ def main():
             output_folder = os.path.join(cfg.OUTPUT_DIR, "inference", dataset_name)
             mkdir(output_folder)
             output_folders[idx] = output_folder
-    model.updata(cfg.OV_SETTING.TEST_PART)
     data_loaders_val = make_data_loader(cfg=cfg, mode="test", is_distributed=distributed, dataset_to_test=cfg.DATASETS.TO_TEST)
     for output_folder, dataset_name, data_loader_val in zip(output_folders, dataset_names, data_loaders_val):
+        model.updata(cfg.OV_SETTING.TEST_PART, get_predicate_names(data_loader_val))
         inference(
             cfg,
             model,

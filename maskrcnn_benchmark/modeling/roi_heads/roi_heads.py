@@ -22,8 +22,8 @@ class CombinedROIHeads(torch.nn.ModuleDict):
         if cfg.MODEL.KEYPOINT_ON and cfg.MODEL.ROI_KEYPOINT_HEAD.SHARE_BOX_FEATURE_EXTRACTOR:
             self.keypoint.feature_extractor = self.box.feature_extractor
 
-    def updata(self,mode):
-        self.relation.updata(mode)
+    def updata(self,mode,predicate_names=None):
+        self.relation.updata(mode,predicate_names)
 
 
     def forward(self, features, proposals, targets=None, logger=None,img=None,model_clip=None):
