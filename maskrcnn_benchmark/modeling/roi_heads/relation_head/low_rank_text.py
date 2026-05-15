@@ -70,13 +70,23 @@ class LowRankRelationTextAdapter(nn.Module):
 
     @staticmethod
     def _init_low_rank(text_features, rank):
-        centered = text_features - text_features.mean(dim=0, keepdim=True)
-        max_rank = min(centered.size(0), centered.size(1))
+        try:
+            from sklearn.decomposition import PCA
+        except ImportError:
+            raise ImportError(
+                "LOW_RANK_TEXT uses sklearn.decomposition.PCA to match HOLa. "
+                "Please install scikit-learn in the training environment."
+            )
+
+        temp_text = text_features.t().cpu().numpy()
+        max_rank = min(temp_text.shape[0], temp_text.shape[1])
         rank = max(1, min(int(rank), max_rank))
 
-        _, _, v = torch.svd(centered)
-        basis = F.normalize(v[:, :rank].t(), dim=-1)
-        weights = text_features @ torch.pinverse(basis)
+        pca = PCA(n_components=rank)
+        pca.fit(temp_text)
+        basis = torch.tensor(pca.transform(temp_text).T).type_as(text_features)
+        basis = F.normalize(basis, dim=-1)
+        weights = torch.tensor(pca.components_.T).type_as(text_features)
         return basis, weights
 
     def reconstruct(self):
