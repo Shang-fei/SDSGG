@@ -72,6 +72,18 @@ def parse_args():
     parser.add_argument("--model", default=os.environ.get("OPENAI_MODEL", "gpt-4.1-mini"))
     parser.add_argument("--api-key", default=os.environ.get("OPENAI_API_KEY"))
     parser.add_argument("--base-url", default=os.environ.get("OPENAI_BASE_URL"))
+    parser.add_argument(
+        "--api-mode",
+        default="auto",
+        choices=("auto", "responses", "chat"),
+        help="OpenAI API endpoint to use.",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=None,
+        help="Sampling temperature. Omit by default for better proxy/model compatibility.",
+    )
     parser.add_argument("--top-k", type=int, default=30, help="Most frequent triples per predicate.")
     parser.add_argument("--tail-k", type=int, default=10, help="Least frequent triples per predicate.")
     parser.add_argument("--sleep", type=float, default=0.2, help="Seconds to sleep between calls.")
@@ -159,33 +171,50 @@ def validate_result(predicate, result):
     return result
 
 
-def call_openai(client, model, prompt):
+def call_responses(client, model, prompt, temperature):
+    kwargs = {"model": model, "input": prompt}
+    if temperature is not None:
+        kwargs["temperature"] = temperature
+    response = client.responses.create(**kwargs)
+    return response.output_text
+
+
+def call_chat(client, model, prompt, temperature):
+    kwargs = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    if temperature is not None:
+        kwargs["temperature"] = temperature
+    response = client.chat.completions.create(**kwargs)
+    return response.choices[0].message.content
+
+
+def call_openai(client, args, prompt):
+    if args.api_mode == "responses":
+        return call_responses(client, args.model, prompt, args.temperature)
+    if args.api_mode == "chat":
+        return call_chat(client, args.model, prompt, args.temperature)
+
     try:
-        response = client.responses.create(
-            model=model,
-            input=prompt,
-            temperature=0.2,
-        )
-        return response.output_text
-    except AttributeError:
-        response = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
-        )
-        return response.choices[0].message.content
+        return call_responses(client, args.model, prompt, args.temperature)
+    except Exception as responses_error:
+        try:
+            return call_chat(client, args.model, prompt, args.temperature)
+        except Exception:
+            raise responses_error
 
 
-def generate_one(client, model, predicate, triples, max_retries):
+def generate_one(client, args, predicate, triples):
     prompt = PROMPT_TEMPLATE.format(
         predicate=predicate,
         triples=format_triples(predicate, triples),
     )
 
     last_error = None
-    for attempt in range(max_retries):
+    for attempt in range(args.max_retries):
         try:
-            text = call_openai(client, model, prompt)
+            text = call_openai(client, args, prompt)
             return validate_result(predicate, extract_json(text))
         except Exception as error:
             last_error = error
@@ -232,10 +261,9 @@ def main():
         ))
         outputs[predicate] = generate_one(
             client=client,
-            model=args.model,
+            args=args,
             predicate=predicate,
             triples=triples,
-            max_retries=args.max_retries,
         )
         save_json(args.output_json, outputs)
         time.sleep(args.sleep)
