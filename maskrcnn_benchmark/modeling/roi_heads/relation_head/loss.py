@@ -21,6 +21,28 @@ from  defaults import PRDCS_BASE ,PRDCS_NOVEL,SEMAN,TRAIN_PART,DATA_OPTION
 curpath=os.path.dirname(__file__)
 
 
+class MultiClassFocalLoss(nn.Module):
+    def __init__(self, gamma=2.0, alpha=1.0, ignore_index=-1):
+        super(MultiClassFocalLoss, self).__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+        self.ignore_index = ignore_index
+
+    def forward(self, logits, targets):
+        valid = targets != self.ignore_index
+        logits = logits[valid].float()
+        targets = targets[valid].long()
+        if targets.numel() == 0:
+            return logits.sum() * 0
+
+        log_probs = F.log_softmax(logits, dim=-1)
+        probs = log_probs.exp()
+        target_log_probs = log_probs.gather(1, targets.view(-1, 1)).squeeze(1)
+        target_probs = probs.gather(1, targets.view(-1, 1)).squeeze(1)
+        loss = -self.alpha * torch.pow(1 - target_probs, self.gamma) * target_log_probs
+        return loss.mean()
+
+
 class RelationLossComputation(object):
     """
     Computes the loss for relation triplet.
@@ -59,7 +81,11 @@ class RelationLossComputation(object):
             )
         )
         if self.use_low_rank_text:
-            self.low_rank_criterion = nn.CrossEntropyLoss(ignore_index=-1)
+            self.low_rank_criterion = MultiClassFocalLoss(
+                gamma=cfg.MODEL.ROI_RELATION_HEAD.LOW_RANK_TEXT.FOCAL_GAMMA,
+                alpha=cfg.MODEL.ROI_RELATION_HEAD.LOW_RANK_TEXT.FOCAL_ALPHA,
+                ignore_index=-1,
+            )
 
         if self.use_label_smoothing:
             self.criterion_loss = Label_Smoothing_Regression(e=0.01)

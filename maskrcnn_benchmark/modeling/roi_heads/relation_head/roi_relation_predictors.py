@@ -17,11 +17,11 @@ from .model_motifs_with_attribute import AttributeLSTMContext
 from .model_transformer import TransformerContext
 from .utils_relation import layer_init, get_box_info, get_box_pair_info
 from .low_rank_text import (
-    LowRankRelationTextAdapter,
-    PredicateNameTextProvider,
-    RelationTextMemoryAdapter,
+    FactorizedRelationTextAdapter,
+    RelationRegionPrompt,
     build_full_predicate_names,
     build_split_indices,
+    load_factor_prompt_texts,
 )
 from maskrcnn_benchmark.data import get_dataset_statistics
 from CLIP import clip
@@ -691,7 +691,7 @@ class LowRankClipPredictor(nn.Module):
         self.num_rel_cls = config.MODEL.ROI_RELATION_HEAD.NUM_CLASSES
         self.device = config.MODEL.DEVICE
         self.low_rank_cfg = config.MODEL.ROI_RELATION_HEAD.LOW_RANK_TEXT
-        self.weight_adapt_cfg = self.low_rank_cfg.WEIGHT_ADAPTATION
+        self.union_dim = config.MODEL.ROI_RELATION_HEAD.CONTEXT_POOLING_DIM
 
         statistics = get_dataset_statistics(config)
         obj_classes = statistics["obj_classes"]
@@ -711,44 +711,44 @@ class LowRankClipPredictor(nn.Module):
         self.updata(config.OV_SETTING.TRAIN_PART)
 
         with torch.no_grad():
-            relation_text_features = self._encode_relation_texts()
+            factor_text_features = self._encode_factor_texts()
             text3 = clip.tokenize(["a photo of subject " for _ in self.obj_names]).to(self.device)
             self.text_features3 = self.clip_model.encode_text(text3)
             text4 = clip.tokenize(["a photo of object " for _ in self.obj_names]).to(self.device)
             self.text_features4 = self.clip_model.encode_text(text4)
 
-        self.low_rank_text_adapter = LowRankRelationTextAdapter(
-            relation_text_features,
+        self.factor_text_adapter = FactorizedRelationTextAdapter(
+            factor_text_features,
             rank=self.low_rank_cfg.RANK,
+            router_hidden_dim=self.low_rank_cfg.ROUTER_HIDDEN_DIM,
+            temperature=self.low_rank_cfg.TEMPERATURE,
             recon_loss_weight=self.low_rank_cfg.RECON_LOSS_WEIGHT,
             sparsity_weight=self.low_rank_cfg.SPARSITY_WEIGHT,
             basis_decorr_weight=self.low_rank_cfg.BASIS_DECORR_WEIGHT,
+            gate_entropy_weight=self.low_rank_cfg.GATE_ENTROPY_WEIGHT,
             train_basis=self.low_rank_cfg.TRAIN_BASIS,
         ).to(self.device)
-        self.text_memory_adapter = None
-        if self.weight_adapt_cfg.ENABLED:
-            self.text_memory_adapter = RelationTextMemoryAdapter(
-                feature_dim=relation_text_features.size(-1),
-                prior_dim=relation_text_features.size(-1),
-                bottleneck_dim=self.weight_adapt_cfg.BOTTLENECK_DIM,
-                num_layers=self.weight_adapt_cfg.NUM_LAYERS,
-                scale=self.weight_adapt_cfg.SCALE,
-            ).to(self.device)
+        self.core_union_proj = nn.Linear(self.union_dim, 512)
+        self.region_prompt = RelationRegionPrompt(
+            union_dim=self.union_dim,
+            feature_dim=512,
+            grid_size=7,
+            num_prompt_tokens=self.low_rank_cfg.REGION_PROMPT_TOKENS,
+        ).to(self.device)
 
-    def _encode_relation_texts(self):
-        if self.low_rank_cfg.TEXT_SOURCE != "predicate_name":
-            raise ValueError(
-                "Unsupported LOW_RANK_TEXT.TEXT_SOURCE: {}".format(
-                    self.low_rank_cfg.TEXT_SOURCE
-                )
-            )
-        provider = PredicateNameTextProvider(self.low_rank_cfg.TEMPLATE)
-        texts = provider(self.predicate_names)
-        text_tokens = clip.tokenize(texts).to(self.device)
-        text_features = self.clip_model.encode_text(text_tokens)
-        text_features = F.normalize(text_features, dim=-1)
-        text_features[0].zero_()
-        return text_features
+    def _encode_factor_texts(self):
+        factor_texts = load_factor_prompt_texts(
+            self.low_rank_cfg.PROMPT_JSON,
+            self.predicate_names,
+        )
+        factor_features = {}
+        for factor, texts in factor_texts.items():
+            text_tokens = clip.tokenize(texts).to(self.device)
+            text_features = self.clip_model.encode_text(text_tokens)
+            text_features = F.normalize(text_features, dim=-1)
+            text_features[0].zero_()
+            factor_features[factor] = text_features
+        return factor_features
 
     def updata(self, mode):
         print("now is " + mode)
@@ -757,9 +757,6 @@ class LowRankClipPredictor(nn.Module):
         self.active_low_rank_indices = torch.as_tensor(
             self.active_indices_by_mode[mode], device=self.device, dtype=torch.long
         )
-
-    def _get_relation_text_features(self):
-        return self.low_rank_text_adapter.reconstruct()[self.active_low_rank_indices]
 
     def _encode_object_crops(self, proposal, image):
         image_tensor = []
@@ -772,7 +769,19 @@ class LowRankClipPredictor(nn.Module):
         image_tensor = torch.cat(image_tensor)
         return self.clip_model.encode_image(image_tensor)
 
+    def _encode_full_image_tokens(self, image):
+        image = image.permute(1, 2, 0).detach().cpu().numpy() * 255
+        image = Image.fromarray(np.uint8(image))
+        image = self.clip_preprocess(image).unsqueeze(0).to(self.device)
+        return self.clip_model.encode_image(image)
+
+    def _pair_geometry(self, proposal, pair_idxs):
+        box_info = get_box_info(proposal.bbox, proposal=proposal)
+        return get_box_pair_info(box_info[pair_idxs[:, 0]], box_info[pair_idxs[:, 1]])
+
     def forward(self, proposals, rel_pair_idxs, rel_labels, rel_binarys, roi_features, union_features, logger=None, img=None):
+        if union_features is None:
+            raise ValueError("LowRankClipPredictor requires PREDICT_USE_VISION=True for union features.")
         if self.attribute_on:
             obj_dists, obj_preds, att_dists, edge_ctx = self.context_layer(roi_features, proposals, logger)
         else:
@@ -782,16 +791,30 @@ class LowRankClipPredictor(nn.Module):
         num_objs = [len(b) for b in proposals]
         assert len(num_rels) == len(num_objs)
         obj_preds = obj_preds.split(num_objs, dim=0)
-        relation_text_features = self._get_relation_text_features()
 
         rel_dists = []
-        weight_adapt_losses = []
+        gate_list = []
+        rel_offset = 0
         for i in range(len(num_rels)):
             with torch.no_grad():
                 image_features = self._encode_object_crops(proposals[i], img[i])
+                full_image_tokens = self._encode_full_image_tokens(img[i])
 
-            rel_dist_per_batch = []
-            for rel_index in rel_pair_idxs[i]:
+            pair_idxs = rel_pair_idxs[i]
+            union_per_image = union_features[rel_offset:rel_offset + num_rels[i]]
+            rel_offset += num_rels[i]
+            geometry = self._pair_geometry(proposals[i], pair_idxs)
+            subject_boxes = proposals[i].bbox[pair_idxs[:, 0]]
+            object_boxes = proposals[i].bbox[pair_idxs[:, 1]]
+            region_masks = self.region_prompt.build_region_masks(
+                subject_boxes,
+                object_boxes,
+                proposals[i].size,
+            )
+
+            pair_features = []
+            attribute_features = []
+            for rel_index in pair_idxs:
                 obj_n1 = obj_preds[i][rel_index[0]]
                 obj_n2 = obj_preds[i][rel_index[1]]
 
@@ -808,33 +831,33 @@ class LowRankClipPredictor(nn.Module):
                     text_obj,
                 )
                 pair_feature = F.normalize((cross_output1 + cross_output2) / 2, dim=-1)
-                if self.text_memory_adapter is None:
-                    text_features = F.normalize(relation_text_features, dim=-1)
-                else:
-                    text_features = self.text_memory_adapter(relation_text_features, pair_feature)
-                    if self.active_low_rank_indices[0].item() == 0:
-                        text_features = text_features.clone()
-                        text_features[0].zero_()
-                    if self.training:
-                        weight_adapt_losses.append(
-                            self.low_rank_text_adapter.weight_adaptation_loss(
-                                text_features,
-                                self.active_low_rank_indices,
-                                self.weight_adapt_cfg.REG_WEIGHT,
-                            )
-                        )
-                    text_features = F.normalize(text_features, dim=-1)
-                probs = (pair_feature.float() @ text_features.float().T) / 0.05
-                rel_dist_per_batch.append(probs)
+                pair_features.append(pair_feature)
+                attribute_feature = (image_features[rel_index[0], 0] + image_features[rel_index[1], 0]) / 2
+                attribute_features.append(F.normalize(attribute_feature, dim=-1).unsqueeze(0))
 
-            rel_dists.append(torch.cat(rel_dist_per_batch))
+            pair_features = torch.cat(pair_features, dim=0)
+            attribute_features = torch.cat(attribute_features, dim=0)
+            evidences = {
+                "core": self.core_union_proj(union_per_image.float()),
+                "spatial": self.region_prompt(
+                    full_image_tokens,
+                    union_per_image,
+                    geometry,
+                    region_masks,
+                ),
+                "interaction": pair_features,
+                "attribute": attribute_features,
+            }
+            text_features, gates = self.factor_text_adapter(self.active_low_rank_indices, evidences)
+            logits = torch.einsum("nd,ncd->nc", pair_features.float(), text_features.float()) / 0.05
+            rel_dists.append(logits)
+            gate_list.append(gates)
 
         obj_dists = obj_dists.split(num_objs, dim=0)
         add_losses = {}
         if self.training:
-            add_losses.update(self.low_rank_text_adapter.losses())
-            if weight_adapt_losses:
-                add_losses["loss_lr_weight_adapt"] = torch.stack(weight_adapt_losses).mean()
+            gates = torch.cat(gate_list, dim=0) if gate_list else None
+            add_losses.update(self.factor_text_adapter.losses(gates))
         return obj_dists, tuple(rel_dists), add_losses
 
 
