@@ -708,6 +708,10 @@ class LowRankClipPredictor(nn.Module):
             name: idx for idx, name in enumerate(self.predicate_names)
         }
         self.active_indices_by_mode = build_split_indices(config, self.predicate_names)
+        self.register_buffer(
+            "predicate_log_prior",
+            self._build_predicate_log_prior(statistics),
+        )
         self.updata(config.OV_SETTING.TRAIN_PART)
 
         with torch.no_grad():
@@ -728,12 +732,12 @@ class LowRankClipPredictor(nn.Module):
             gate_entropy_weight=self.low_rank_cfg.GATE_ENTROPY_WEIGHT,
             train_basis=self.low_rank_cfg.TRAIN_BASIS,
         ).to(self.device)
-        self.core_union_proj = nn.Linear(self.union_dim, 512)
-        self.region_prompt = RelationRegionPrompt(
+        self.spatial_region_prompt = RelationRegionPrompt(
             union_dim=self.union_dim,
             feature_dim=512,
             grid_size=7,
             num_prompt_tokens=self.low_rank_cfg.REGION_PROMPT_TOKENS,
+            union_residual_init=self.low_rank_cfg.UNION_RESIDUAL_INIT,
         ).to(self.device)
 
     def _encode_factor_texts(self):
@@ -749,6 +753,23 @@ class LowRankClipPredictor(nn.Module):
             text_features[0].zero_()
             factor_features[factor] = text_features
         return factor_features
+
+    def _build_predicate_log_prior(self, statistics):
+        counts = torch.ones(len(self.predicate_names), dtype=torch.float32)
+        fg_matrix = statistics.get("fg_matrix", None)
+        rel_classes = statistics.get("rel_classes", [])
+        if fg_matrix is not None and len(rel_classes) == fg_matrix.size(-1):
+            rel_counts = fg_matrix.float().sum(dim=(0, 1))
+            for src_idx, name in enumerate(rel_classes):
+                dst_idx = self.predicate_to_low_rank_idx.get(name)
+                if dst_idx is not None and dst_idx > 0:
+                    counts[dst_idx] = rel_counts[src_idx].clamp_min(1.0)
+
+        if counts.numel() > 1:
+            counts[1:] = counts[1:] / counts[1:].mean().clamp_min(1.0)
+        log_prior = counts.log()
+        log_prior[0] = 0.0
+        return log_prior
 
     def updata(self, mode):
         print("now is " + mode)
@@ -806,7 +827,7 @@ class LowRankClipPredictor(nn.Module):
             geometry = self._pair_geometry(proposals[i], pair_idxs)
             subject_boxes = proposals[i].bbox[pair_idxs[:, 0]]
             object_boxes = proposals[i].bbox[pair_idxs[:, 1]]
-            region_masks = self.region_prompt.build_region_masks(
+            region_masks = self.spatial_region_prompt.build_region_masks(
                 subject_boxes,
                 object_boxes,
                 proposals[i].size,
@@ -838,8 +859,7 @@ class LowRankClipPredictor(nn.Module):
             pair_features = torch.cat(pair_features, dim=0)
             attribute_features = torch.cat(attribute_features, dim=0)
             evidences = {
-                "core": self.core_union_proj(union_per_image.float()),
-                "spatial": self.region_prompt(
+                "spatial": self.spatial_region_prompt(
                     full_image_tokens,
                     union_per_image,
                     geometry,
@@ -848,8 +868,18 @@ class LowRankClipPredictor(nn.Module):
                 "interaction": pair_features,
                 "attribute": attribute_features,
             }
-            text_features, gates = self.factor_text_adapter(self.active_low_rank_indices, evidences)
-            logits = torch.einsum("nd,ncd->nc", pair_features.float(), text_features.float()) / 0.05
+            factor_texts = self.factor_text_adapter.factor_classifiers(self.active_low_rank_indices)
+            gates = self.factor_text_adapter.factor_gates(self.active_low_rank_indices, evidences)
+            factor_logits = []
+            for factor_idx, factor in enumerate(self.factor_text_adapter.factors):
+                evidence = F.normalize(evidences[factor].float(), dim=-1)
+                text = factor_texts[factor_idx].float()
+                factor_logits.append(evidence @ text.t())
+            factor_logits = torch.stack(factor_logits, dim=-1) / 0.05
+            logits = (factor_logits * gates.float()).sum(dim=-1)
+            if self.low_rank_cfg.LOGIT_ADJUSTMENT_TAU > 0:
+                log_prior = self.predicate_log_prior[self.active_low_rank_indices].to(logits.device)
+                logits = logits - self.low_rank_cfg.LOGIT_ADJUSTMENT_TAU * log_prior.view(1, -1)
             rel_dists.append(logits)
             gate_list.append(gates)
 

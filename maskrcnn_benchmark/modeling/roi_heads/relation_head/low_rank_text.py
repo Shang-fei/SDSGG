@@ -16,9 +16,8 @@ VG_PREDICATES = [
     "walking in", "walking on", "watching", "wearing", "wears", "with",
 ]
 
-FACTOR_NAMES = ("core", "spatial", "interaction", "attribute")
+FACTOR_NAMES = ("spatial", "interaction", "attribute")
 PROMPT_FIELDS = {
-    "core": "core_prompt",
     "spatial": "spatial_prompt",
     "interaction": "interaction_prompt",
     "attribute": "attribute_prompt",
@@ -161,10 +160,29 @@ class FactorizedRelationTextAdapter(nn.Module):
         return text_features
 
     def forward(self, active_indices, evidences):
+        factor_texts = self.factor_classifiers(active_indices)
+        gates = self.factor_gates(active_indices, evidences)
+        texts = factor_texts.permute(1, 0, 2)
+        pair_texts = torch.einsum("ncf,cfd->ncd", gates.float(), texts.float())
+        if active_indices.numel() > 0 and active_indices[0].item() == 0:
+            pair_texts = pair_texts.clone()
+            pair_texts[:, 0].zero_()
+        return F.normalize(pair_texts, dim=-1), gates
+
+    def factor_classifiers(self, active_indices):
         factor_texts = []
-        factor_scores = []
         for factor in self.factors:
             reconstructed = F.normalize(self.reconstruct_factor(factor)[active_indices], dim=-1)
+            factor_texts.append(reconstructed)
+        factor_texts = torch.stack(factor_texts, dim=0)
+        if active_indices.numel() > 0 and active_indices[0].item() == 0:
+            factor_texts = factor_texts.clone()
+            factor_texts[:, 0].zero_()
+        return factor_texts
+
+    def factor_gates(self, active_indices, evidences):
+        factor_scores = []
+        for factor in self.factors:
             anchors = self.original_text_features(factor)[active_indices]
             keys = self.key_proj[factor](anchors.float())
             keys = keys + self.factor_tokens[self.factor_to_idx[factor]].view(1, -1)
@@ -172,17 +190,10 @@ class FactorizedRelationTextAdapter(nn.Module):
 
             queries = F.normalize(self.query_proj[factor](evidences[factor].float()), dim=-1)
             scores = queries @ keys.t()
-            factor_texts.append(reconstructed)
             factor_scores.append(scores)
 
         scores = torch.stack(factor_scores, dim=-1) / self.temperature
-        gates = F.softmax(scores, dim=-1)
-        texts = torch.stack(factor_texts, dim=0).permute(1, 0, 2)
-        pair_texts = torch.einsum("ncf,cfd->ncd", gates.float(), texts.float())
-        if active_indices.numel() > 0 and active_indices[0].item() == 0:
-            pair_texts = pair_texts.clone()
-            pair_texts[:, 0].zero_()
-        return F.normalize(pair_texts, dim=-1), gates
+        return F.softmax(scores, dim=-1)
 
     def losses(self, last_gates=None):
         losses = {}
@@ -230,6 +241,7 @@ class RelationRegionPrompt(nn.Module):
         grid_size=7,
         num_prompt_tokens=1,
         num_heads=8,
+        union_residual_init=0.0,
     ):
         super(RelationRegionPrompt, self).__init__()
         self.grid_size = grid_size
@@ -241,12 +253,9 @@ class RelationRegionPrompt(nn.Module):
         self.mask_proj = nn.Linear(3 * grid_size * grid_size, feature_dim)
         self.geometry_proj = nn.Linear(geometry_dim, feature_dim)
         self.union_proj = nn.Linear(union_dim, feature_dim)
+        self.union_residual_scale = nn.Parameter(torch.tensor(float(union_residual_init)))
         self.attn = nn.MultiheadAttention(feature_dim, num_heads)
-        self.fusion = nn.Sequential(
-            nn.Linear(feature_dim * 2, feature_dim),
-            nn.ReLU(inplace=True),
-            nn.LayerNorm(feature_dim),
-        )
+        self.out_norm = nn.LayerNorm(feature_dim)
 
     def _boxes_to_mask(self, boxes, image_size):
         width, height = image_size
@@ -298,4 +307,4 @@ class RelationRegionPrompt(nn.Module):
         attended, _ = self.attn(prompt.transpose(0, 1), memory, memory)
         region_evidence = attended.transpose(0, 1).mean(1)
         union_evidence = self.union_proj(union_features.float())
-        return self.fusion(torch.cat((region_evidence, union_evidence), dim=-1))
+        return self.out_norm(region_evidence + self.union_residual_scale * union_evidence)
