@@ -95,13 +95,11 @@ def save_json(path, data):
 
 
 def parse_pair_key(key):
-    if isinstance(key, (list, tuple)) and len(key) == 2:
-        return str(key[0]), str(key[1])
+    text = str(key).strip()
+    if " - " in text:
+        subject, obj = text.split(" - ", 1)
+        return subject.strip(), obj.strip()
 
-    if not isinstance(key, str):
-        return str(key), ""
-
-    text = key.strip()
     try:
         value = ast.literal_eval(text)
         if isinstance(value, (list, tuple)) and len(value) == 2:
@@ -109,59 +107,32 @@ def parse_pair_key(key):
     except (SyntaxError, ValueError):
         pass
 
-    for sep in ["|||", "||", "|", "\t", ","]:
-        if sep in text:
-            subject, obj = text.split(sep, 1)
-            return subject.strip(), obj.strip()
-
-    return text, ""
+    raise ValueError("Expected pair key like 'subject - object', got: {}".format(key))
 
 
 def normalize_triples(raw_triples):
-    triples = []
-
-    if isinstance(raw_triples, dict):
-        iterator = raw_triples.items()
-        for pair_key, count in iterator:
-            subject, obj = parse_pair_key(pair_key)
-            triples.append((subject, obj, int(count)))
-        return triples
-
-    if isinstance(raw_triples, list):
-        for item in raw_triples:
-            if isinstance(item, dict):
-                subject = item.get("subject") or item.get("subject_name") or item.get("s")
-                obj = item.get("object") or item.get("object_name") or item.get("o")
-                count = item.get("count") or item.get("frequency") or item.get("freq") or 1
-                triples.append((str(subject), str(obj), int(count)))
-            elif isinstance(item, (list, tuple)) and len(item) >= 3:
-                triples.append((str(item[0]), str(item[1]), int(item[2])))
-        return triples
-
-    raise ValueError("Unsupported triplet statistics format: {}".format(type(raw_triples)))
+    if not isinstance(raw_triples, dict):
+        raise ValueError("Expected predicate value to be a pair-count dict.")
+    return [
+        (*parse_pair_key(pair_key), int(count))
+        for pair_key, count in raw_triples.items()
+    ]
 
 
 def select_triples(triples, top_k, tail_k):
-    triples = sorted(triples, key=lambda x: x[2], reverse=True)
+    # Input JSON is expected to be frequency-sorted. Keep that order for top-k.
     selected = triples[:top_k]
     if tail_k > 0 and len(triples) > top_k:
         selected.extend(triples[-tail_k:])
 
-    seen = set()
-    unique = []
-    for subject, obj, count in selected:
-        key = (subject, obj)
-        if key not in seen:
-            seen.add(key)
-            unique.append((subject, obj, count))
-    return unique
+    return selected
 
 
-def format_triples(triples):
+def format_triples(predicate, triples):
     if not triples:
         return "No observed triples are available."
     return "\n".join(
-        "{}-predicate-{}: {}".format(subject, obj, count)
+        "{}-{}-{}: {}".format(subject, predicate, obj, count)
         for subject, obj, count in triples
     )
 
@@ -208,7 +179,7 @@ def call_openai(client, model, prompt):
 def generate_one(client, model, predicate, triples, max_retries):
     prompt = PROMPT_TEMPLATE.format(
         predicate=predicate,
-        triples=format_triples(triples),
+        triples=format_triples(predicate, triples),
     )
 
     last_error = None
@@ -232,7 +203,10 @@ def main():
     if args.dry_run:
         for predicate, raw_triples in stats.items():
             triples = select_triples(normalize_triples(raw_triples), args.top_k, args.tail_k)
-            prompt = PROMPT_TEMPLATE.format(predicate=predicate, triples=format_triples(triples))
+            prompt = PROMPT_TEMPLATE.format(
+                predicate=predicate,
+                triples=format_triples(predicate, triples),
+            )
             print(prompt)
             break
         return
