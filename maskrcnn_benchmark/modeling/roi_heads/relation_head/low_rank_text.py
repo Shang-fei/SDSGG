@@ -1,5 +1,4 @@
 import json
-import math
 
 import torch
 from torch import nn
@@ -98,20 +97,20 @@ class FactorizedRelationTextAdapter(nn.Module):
         factor_text_features,
         rank,
         router_hidden_dim=256,
-        temperature=0.07,
+        gate_temperature=0.5,
         recon_loss_weight=0.1,
         sparsity_weight=0.1,
         basis_decorr_weight=0.001,
-        gate_entropy_weight=0.0,
+        gate_balance_weight=0.0,
         train_basis=False,
     ):
         super(FactorizedRelationTextAdapter, self).__init__()
         self.factors = FACTOR_NAMES
-        self.temperature = float(temperature)
+        self.gate_temperature = float(gate_temperature)
         self.recon_loss_weight = recon_loss_weight
         self.sparsity_weight = sparsity_weight
         self.basis_decorr_weight = basis_decorr_weight
-        self.gate_entropy_weight = gate_entropy_weight
+        self.gate_balance_weight = gate_balance_weight
 
         self.class_weights = nn.ParameterDict()
         self.query_proj = nn.ModuleDict()
@@ -159,16 +158,6 @@ class FactorizedRelationTextAdapter(nn.Module):
             text_features[0].zero_()
         return text_features
 
-    def forward(self, active_indices, evidences):
-        factor_texts = self.factor_classifiers(active_indices)
-        gates = self.factor_gates(active_indices, evidences)
-        texts = factor_texts.permute(1, 0, 2)
-        pair_texts = torch.einsum("ncf,cfd->ncd", gates.float(), texts.float())
-        if active_indices.numel() > 0 and active_indices[0].item() == 0:
-            pair_texts = pair_texts.clone()
-            pair_texts[:, 0].zero_()
-        return F.normalize(pair_texts, dim=-1), gates
-
     def factor_classifiers(self, active_indices):
         factor_texts = []
         for factor in self.factors:
@@ -192,7 +181,7 @@ class FactorizedRelationTextAdapter(nn.Module):
             scores = queries @ keys.t()
             factor_scores.append(scores)
 
-        scores = torch.stack(factor_scores, dim=-1) / self.temperature
+        scores = torch.stack(factor_scores, dim=-1) / self.gate_temperature
         return F.softmax(scores, dim=-1)
 
     def losses(self, last_gates=None):
@@ -226,9 +215,10 @@ class FactorizedRelationTextAdapter(nn.Module):
             losses["loss_factor_sparse"] = torch.stack(sparse_losses).mean() * self.sparsity_weight
         if decorr_losses and self.basis_decorr_weight > 0:
             losses["loss_factor_basis_decorr"] = torch.stack(decorr_losses).mean() * self.basis_decorr_weight
-        if last_gates is not None and self.gate_entropy_weight > 0:
-            entropy = -(last_gates * (last_gates + 1e-12).log()).sum(-1).mean()
-            losses["loss_factor_gate_entropy"] = entropy * self.gate_entropy_weight
+        if last_gates is not None and self.gate_balance_weight > 0:
+            mean_gate = last_gates.float().mean(dim=(0, 1))
+            target = mean_gate.new_full(mean_gate.shape, 1.0 / mean_gate.numel())
+            losses["loss_factor_gate_balance"] = F.mse_loss(mean_gate, target) * self.gate_balance_weight
         return losses
 
     def debug_stats(self):
@@ -254,13 +244,11 @@ class FactorizedRelationTextAdapter(nn.Module):
 class RelationRegionPrompt(nn.Module):
     def __init__(
         self,
-        union_dim,
         feature_dim=512,
         geometry_dim=32,
         grid_size=7,
         num_prompt_tokens=1,
         num_heads=8,
-        union_residual_init=0.0,
     ):
         super(RelationRegionPrompt, self).__init__()
         self.grid_size = grid_size
@@ -271,8 +259,6 @@ class RelationRegionPrompt(nn.Module):
 
         self.mask_proj = nn.Linear(3 * grid_size * grid_size, feature_dim)
         self.geometry_proj = nn.Linear(geometry_dim, feature_dim)
-        self.union_proj = nn.Linear(union_dim, feature_dim)
-        self.union_residual_scale = nn.Parameter(torch.tensor(float(union_residual_init)))
         self.attn = nn.MultiheadAttention(feature_dim, num_heads)
         self.out_norm = nn.LayerNorm(feature_dim)
 
@@ -309,14 +295,14 @@ class RelationRegionPrompt(nn.Module):
         )
         return masks.flatten(1)
 
-    def forward(self, full_image_tokens, union_features, geometry_features, region_masks):
+    def forward(self, full_image_tokens, geometry_features, region_masks):
         if full_image_tokens.dim() == 2:
             full_image_tokens = full_image_tokens.unsqueeze(0)
         patch_tokens = full_image_tokens[:, 1:, :].float()
         if patch_tokens.size(1) == 0:
             patch_tokens = full_image_tokens.float()
 
-        num_rel = union_features.size(0)
+        num_rel = region_masks.size(0)
         memory = patch_tokens.expand(num_rel, -1, -1).transpose(0, 1).contiguous()
 
         prompt = self.region_prompt.unsqueeze(0).expand(num_rel, -1, -1)
@@ -325,5 +311,4 @@ class RelationRegionPrompt(nn.Module):
 
         attended, _ = self.attn(prompt.transpose(0, 1), memory, memory)
         region_evidence = attended.transpose(0, 1).mean(1)
-        union_evidence = self.union_proj(union_features.float())
-        return self.out_norm(region_evidence + self.union_residual_scale * union_evidence)
+        return self.out_norm(region_evidence)

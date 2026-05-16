@@ -692,7 +692,6 @@ class LowRankClipPredictor(nn.Module):
         self.num_rel_cls = config.MODEL.ROI_RELATION_HEAD.NUM_CLASSES
         self.device = config.MODEL.DEVICE
         self.low_rank_cfg = config.MODEL.ROI_RELATION_HEAD.LOW_RANK_TEXT
-        self.union_dim = config.MODEL.ROI_RELATION_HEAD.CONTEXT_POOLING_DIM
         self.debug_step = 0
 
         statistics = get_dataset_statistics(config)
@@ -727,19 +726,17 @@ class LowRankClipPredictor(nn.Module):
             factor_text_features,
             rank=self.low_rank_cfg.RANK,
             router_hidden_dim=self.low_rank_cfg.ROUTER_HIDDEN_DIM,
-            temperature=self.low_rank_cfg.TEMPERATURE,
+            gate_temperature=self.low_rank_cfg.GATE_TEMPERATURE,
             recon_loss_weight=self.low_rank_cfg.RECON_LOSS_WEIGHT,
             sparsity_weight=self.low_rank_cfg.SPARSITY_WEIGHT,
             basis_decorr_weight=self.low_rank_cfg.BASIS_DECORR_WEIGHT,
-            gate_entropy_weight=self.low_rank_cfg.GATE_ENTROPY_WEIGHT,
+            gate_balance_weight=self.low_rank_cfg.GATE_BALANCE_WEIGHT,
             train_basis=self.low_rank_cfg.TRAIN_BASIS,
         ).to(self.device)
         self.spatial_region_prompt = RelationRegionPrompt(
-            union_dim=self.union_dim,
             feature_dim=512,
             grid_size=7,
             num_prompt_tokens=self.low_rank_cfg.REGION_PROMPT_TOKENS,
-            union_residual_init=self.low_rank_cfg.UNION_RESIDUAL_INIT,
         ).to(self.device)
 
     def _encode_factor_texts(self):
@@ -840,11 +837,6 @@ class LowRankClipPredictor(nn.Module):
                         stats["{}_recon_cos".format(factor)].item(),
                     )
                 )
-            parts.append(
-                "spatial_union_scale={:.4f}".format(
-                    self.spatial_region_prompt.union_residual_scale.detach().float().item()
-                )
-            )
 
         message = " | ".join(parts)
         if logger is not None:
@@ -853,8 +845,6 @@ class LowRankClipPredictor(nn.Module):
             print(message)
 
     def forward(self, proposals, rel_pair_idxs, rel_labels, rel_binarys, roi_features, union_features, logger=None, img=None):
-        if union_features is None:
-            raise ValueError("LowRankClipPredictor requires PREDICT_USE_VISION=True for union features.")
         if self.attribute_on:
             obj_dists, obj_preds, att_dists, edge_ctx = self.context_layer(roi_features, proposals, logger)
         else:
@@ -868,15 +858,12 @@ class LowRankClipPredictor(nn.Module):
         rel_dists = []
         gate_list = []
         factor_logit_list = []
-        rel_offset = 0
         for i in range(len(num_rels)):
             with torch.no_grad():
                 image_features = self._encode_object_crops(proposals[i], img[i])
                 full_image_tokens = self._encode_full_image_tokens(img[i])
 
             pair_idxs = rel_pair_idxs[i]
-            union_per_image = union_features[rel_offset:rel_offset + num_rels[i]]
-            rel_offset += num_rels[i]
             geometry = self._pair_geometry(proposals[i], pair_idxs)
             subject_boxes = proposals[i].bbox[pair_idxs[:, 0]]
             object_boxes = proposals[i].bbox[pair_idxs[:, 1]]
@@ -914,7 +901,6 @@ class LowRankClipPredictor(nn.Module):
             evidences = {
                 "spatial": self.spatial_region_prompt(
                     full_image_tokens,
-                    union_per_image,
                     geometry,
                     region_masks,
                 ),
