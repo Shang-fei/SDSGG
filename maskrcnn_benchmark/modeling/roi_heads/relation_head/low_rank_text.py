@@ -231,6 +231,25 @@ class FactorizedRelationTextAdapter(nn.Module):
             losses["loss_factor_gate_entropy"] = entropy * self.gate_entropy_weight
         return losses
 
+    def debug_stats(self):
+        stats = {}
+        with torch.no_grad():
+            for factor in self.factors:
+                weight = self.class_weights[factor].float()
+                reconstructed = self.reconstruct_factor(factor).float()
+                original = self.original_text_features(factor).float()
+                if reconstructed.size(0) > 1:
+                    recon_cos = F.cosine_similarity(
+                        F.normalize(reconstructed[1:], dim=-1),
+                        F.normalize(original[1:], dim=-1),
+                        dim=-1,
+                    ).mean()
+                else:
+                    recon_cos = reconstructed.sum() * 0
+                stats["{}_W_abs_mean".format(factor)] = weight.abs().mean()
+                stats["{}_recon_cos".format(factor)] = recon_cos
+        return stats
+
 
 class RelationRegionPrompt(nn.Module):
     def __init__(

@@ -24,6 +24,7 @@ from .low_rank_text import (
     load_factor_prompt_texts,
 )
 from maskrcnn_benchmark.data import get_dataset_statistics
+from maskrcnn_benchmark.utils.comm import is_main_process
 from CLIP import clip
 import time
 import numpy as np
@@ -692,6 +693,7 @@ class LowRankClipPredictor(nn.Module):
         self.device = config.MODEL.DEVICE
         self.low_rank_cfg = config.MODEL.ROI_RELATION_HEAD.LOW_RANK_TEXT
         self.union_dim = config.MODEL.ROI_RELATION_HEAD.CONTEXT_POOLING_DIM
+        self.debug_step = 0
 
         statistics = get_dataset_statistics(config)
         obj_classes = statistics["obj_classes"]
@@ -800,6 +802,56 @@ class LowRankClipPredictor(nn.Module):
         box_info = get_box_info(proposal.bbox, proposal=proposal)
         return get_box_pair_info(box_info[pair_idxs[:, 0]], box_info[pair_idxs[:, 1]])
 
+    def _log_low_rank_debug(self, gates, factor_logits, logger):
+        interval = int(self.low_rank_cfg.DEBUG_INTERVAL)
+        if interval <= 0 or self.debug_step % interval != 0 or not is_main_process():
+            return
+
+        factors = self.factor_text_adapter.factors
+        with torch.no_grad():
+            gate_mean = gates.float().mean(dim=(0, 1))
+            gate_std = gates.float().std(dim=(0, 1))
+            gate_entropy = -(gates.float() * (gates.float() + 1e-12).log()).sum(-1).mean()
+            logits_std = factor_logits.float().std(dim=(0, 1))
+            stats = self.factor_text_adapter.debug_stats()
+
+            parts = ["LowRankDebug step={}".format(self.debug_step)]
+            for idx, factor in enumerate(factors):
+                parts.append(
+                    "{}_gate={:.4f}/{:.4f}".format(
+                        factor,
+                        gate_mean[idx].item(),
+                        gate_std[idx].item(),
+                    )
+                )
+            parts.append("gate_entropy={:.4f}".format(gate_entropy.item()))
+            for idx, factor in enumerate(factors):
+                parts.append("{}_logit_std={:.4f}".format(factor, logits_std[idx].item()))
+            for factor in factors:
+                parts.append(
+                    "{}_W_abs={:.4f}".format(
+                        factor,
+                        stats["{}_W_abs_mean".format(factor)].item(),
+                    )
+                )
+                parts.append(
+                    "{}_recon_cos={:.4f}".format(
+                        factor,
+                        stats["{}_recon_cos".format(factor)].item(),
+                    )
+                )
+            parts.append(
+                "spatial_union_scale={:.4f}".format(
+                    self.spatial_region_prompt.union_residual_scale.detach().float().item()
+                )
+            )
+
+        message = " | ".join(parts)
+        if logger is not None:
+            logger.info(message)
+        else:
+            print(message)
+
     def forward(self, proposals, rel_pair_idxs, rel_labels, rel_binarys, roi_features, union_features, logger=None, img=None):
         if union_features is None:
             raise ValueError("LowRankClipPredictor requires PREDICT_USE_VISION=True for union features.")
@@ -815,6 +867,7 @@ class LowRankClipPredictor(nn.Module):
 
         rel_dists = []
         gate_list = []
+        factor_logit_list = []
         rel_offset = 0
         for i in range(len(num_rels)):
             with torch.no_grad():
@@ -882,11 +935,16 @@ class LowRankClipPredictor(nn.Module):
                 logits = logits - self.low_rank_cfg.LOGIT_ADJUSTMENT_TAU * log_prior.view(1, -1)
             rel_dists.append(logits)
             gate_list.append(gates)
+            factor_logit_list.append(factor_logits)
 
         obj_dists = obj_dists.split(num_objs, dim=0)
         add_losses = {}
         if self.training:
+            self.debug_step += 1
             gates = torch.cat(gate_list, dim=0) if gate_list else None
+            factor_logits = torch.cat(factor_logit_list, dim=0) if factor_logit_list else None
+            if gates is not None and factor_logits is not None:
+                self._log_low_rank_debug(gates, factor_logits, logger)
             add_losses.update(self.factor_text_adapter.losses(gates))
         return obj_dists, tuple(rel_dists), add_losses
 
