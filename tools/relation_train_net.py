@@ -179,7 +179,7 @@ def train(cfg, local_rank, distributed, logger):
         eta_seconds = meters.time.global_avg * (max_iter - iteration)
         eta_string = str(datetime.timedelta(seconds=int(eta_seconds)))
 
-        if iteration % 100 == 0 or iteration == max_iter:
+        if iteration % 20 == 0 or iteration == max_iter:
             logger.info(
                 meters.delimiter.join(
                     [
@@ -204,7 +204,7 @@ def train(cfg, local_rank, distributed, logger):
             checkpointer.save("model_final", **arguments)
 
         val_result = None # used for scheduler updating
-        if cfg.SOLVER.TO_VAL and iteration % cfg.SOLVER.VAL_PERIOD == 0 and iteration>=12000:
+        if cfg.SOLVER.TO_VAL and iteration % cfg.SOLVER.VAL_PERIOD == 0:
             logger.info("Start validating")
             #run_test(cfg, model, distributed, logger)
             val_result = run_val(cfg, model, val_data_loaders, distributed, logger)
