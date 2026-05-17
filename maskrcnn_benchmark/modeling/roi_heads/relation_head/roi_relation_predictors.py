@@ -713,6 +713,7 @@ class LowRankClipPredictor(nn.Module):
             self._build_predicate_log_prior(statistics),
         )
         self.updata(config.OV_SETTING.TRAIN_PART)
+        self._check_train_predicate_order()
 
         with torch.no_grad():
             relation_text_features = self._encode_relation_texts()
@@ -767,9 +768,20 @@ class LowRankClipPredictor(nn.Module):
         print("now is " + mode)
         if mode not in self.active_indices_by_mode:
             raise ValueError("Unsupported OV relation split: {}".format(mode))
+        self.mode = mode
         self.active_low_rank_indices = torch.as_tensor(
             self.active_indices_by_mode[mode], device=self.device, dtype=torch.long
         )
+
+    def _check_train_predicate_order(self):
+        active_names = [
+            self.predicate_names[idx] for idx in self.active_indices_by_mode[self.mode]
+        ]
+        if active_names != self.train_predicate_names:
+            raise ValueError(
+                "Low-rank active predicate order does not match dataset labels. "
+                "active={} dataset={}".format(active_names, self.train_predicate_names)
+            )
 
     def _encode_object_crops(self, proposal, image):
         image_tensor = []

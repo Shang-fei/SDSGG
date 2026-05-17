@@ -15,6 +15,7 @@ from maskrcnn_benchmark.modeling.box_coder import BoxCoder
 from maskrcnn_benchmark.modeling.matcher import Matcher
 from maskrcnn_benchmark.structures.boxlist_ops import boxlist_iou
 from maskrcnn_benchmark.modeling.utils import cat
+from .low_rank_text import build_full_predicate_names, build_split_indices
 import pandas as pd
 
 from  defaults import PRDCS_BASE ,PRDCS_NOVEL,SEMAN,TRAIN_PART,DATA_OPTION
@@ -80,12 +81,63 @@ class RelationLossComputation(object):
                 or cfg.MODEL.ROI_RELATION_HEAD.PREDICTOR == "LowRankClipPredictor"
             )
         )
+        self.low_rank_pred_weight = None
+        self.low_rank_focal_gamma = 2.0
+        self.low_rank_focal_alpha = 1.0
+        if self.use_low_rank_text:
+            self.low_rank_focal_gamma = cfg.MODEL.ROI_RELATION_HEAD.LOW_RANK_TEXT.FOCAL_GAMMA
+            self.low_rank_focal_alpha = cfg.MODEL.ROI_RELATION_HEAD.LOW_RANK_TEXT.FOCAL_ALPHA
+            self.low_rank_pred_weight = self._build_low_rank_pred_weight(cfg)
         if self.use_label_smoothing:
             self.criterion_loss = Label_Smoothing_Regression(e=0.01)
         else:
             self.criterion_loss = nn.CrossEntropyLoss()
         self.loss=Loss(gamma=0.0, alpha=1, size_average=True,device=device)
         #self.focal_loss=MultiCEFocalLoss(class_num=25,device=device)
+
+    def _build_low_rank_active_indices(self, cfg):
+        predicate_names = build_full_predicate_names(cfg)
+        active_indices_by_mode = build_split_indices(cfg, predicate_names)
+        if cfg.OV_SETTING.TRAIN_PART not in active_indices_by_mode:
+            raise ValueError("Unsupported OV relation split: {}".format(cfg.OV_SETTING.TRAIN_PART))
+
+        return torch.as_tensor(
+            active_indices_by_mode[cfg.OV_SETTING.TRAIN_PART],
+            dtype=torch.long,
+            device=self.pred_weight.device,
+        )
+
+    def _build_low_rank_pred_weight(self, cfg):
+        active_indices = self._build_low_rank_active_indices(cfg)
+        return self.pred_weight[active_indices]
+
+    def _get_low_rank_pred_weight(self, relation_logits):
+        pred_weight = self.low_rank_pred_weight.to(relation_logits.device)
+        if pred_weight.numel() != relation_logits.size(1):
+            raise ValueError(
+                "Low-rank loss weight size {} does not match relation logits size {}.".format(
+                    pred_weight.numel(), relation_logits.size(1)
+                )
+            )
+        return pred_weight
+
+    def _low_rank_focal_loss(self, relation_logits, rel_labels):
+        pred_weight = self._get_low_rank_pred_weight(relation_logits)
+        logits = relation_logits.float()
+        labels = rel_labels.long()
+
+        ce_loss = F.cross_entropy(
+            logits,
+            labels,
+            weight=pred_weight,
+            reduction="none",
+        )
+        log_probs = F.log_softmax(logits, dim=-1)
+        target_log_probs = log_probs.gather(1, labels.view(-1, 1)).squeeze(1)
+        target_probs = target_log_probs.exp()
+        focal_weight = torch.pow(1.0 - target_probs, self.low_rank_focal_gamma)
+        loss = self.low_rank_focal_alpha * focal_weight * ce_loss
+        return loss.mean()
 
     def __call__(self, proposals, rel_labels, relation_logits, refine_logits):
         """
@@ -117,12 +169,7 @@ class RelationLossComputation(object):
         rel_labels = cat(rel_labels, dim=0)
 
         if self.use_low_rank_text:
-            pred_weight = self.pred_weight[: relation_logits.size(1)].to(relation_logits.device)
-            loss_relation = F.cross_entropy(
-                relation_logits.float(),
-                rel_labels.long(),
-                weight=pred_weight,
-            )
+            loss_relation = self._low_rank_focal_loss(relation_logits, rel_labels)
         else:
             loss_relation = self.loss(relation_logits, rel_labels.long())
         #loss_relation = self.criterion_loss(relation_logits, rel_labels.long())
