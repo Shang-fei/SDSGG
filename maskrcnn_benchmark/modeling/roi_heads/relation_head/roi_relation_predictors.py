@@ -732,11 +732,6 @@ class LowRankClipPredictor(nn.Module):
             train_basis=self.low_rank_cfg.TRAIN_BASIS,
             train_mode=self.low_rank_cfg.TRAIN_MODE,
             logit_temperature=self.low_rank_cfg.CLASSIFIER_TEMPERATURE,
-            factor_comp_weight=self.low_rank_cfg.FACTOR_COMP_WEIGHT,
-            factor_comp_tau=self.low_rank_cfg.FACTOR_COMP_TAU,
-            diff_neg_weight=self.low_rank_cfg.DIFF_NEG_WEIGHT,
-            diff_neg_topk=self.low_rank_cfg.DIFF_NEG_TOPK,
-            diff_neg_margin=self.low_rank_cfg.DIFF_NEG_MARGIN,
         ).to(self.device)
 
     def _encode_relation_texts(self):
@@ -812,14 +807,6 @@ class LowRankClipPredictor(nn.Module):
             parts.append("W_active={:.2f}".format(weight_stats["W_active"].item()))
             parts.append("W_max_share={:.4f}".format(weight_stats["W_max_share"].item()))
             parts.append("recon_cos={:.4f}".format(stats["recon_cos"].item()))
-            for name in ("kl", "cos", "entropy"):
-                key = "factor_comp_{}".format(name)
-                if key in stats:
-                    parts.append("{}={:.4f}".format(key, stats[key].item()))
-            for name in ("reward", "semantic", "confusion", "score"):
-                key = "diff_neg_{}".format(name)
-                if key in stats:
-                    parts.append("{}={:.4f}".format(key, stats[key].item()))
 
         message = " | ".join(parts)
         if logger is not None:
@@ -882,23 +869,7 @@ class LowRankClipPredictor(nn.Module):
             self.debug_step += 1
             basis_logits = torch.cat(basis_logit_list, dim=0) if basis_logit_list else None
             relation_logits = torch.cat(rel_dists, dim=0) if rel_dists else None
-            labels = cat(rel_labels, dim=0) if rel_labels is not None else None
             if basis_logits is not None and relation_logits is not None:
-                add_losses.update(
-                    self.relation_text_adapter.factor_composition_loss(
-                        basis_logits,
-                        labels,
-                        self.active_low_rank_indices,
-                    )
-                )
-                add_losses.update(
-                    self.relation_text_adapter.factor_difference_loss(
-                        basis_logits,
-                        relation_logits,
-                        labels,
-                        self.active_low_rank_indices,
-                    )
-                )
                 self._log_low_rank_debug(basis_logits, relation_logits, logger)
             add_losses.update(self.relation_text_adapter.losses())
         return obj_dists, tuple(rel_dists), add_losses
