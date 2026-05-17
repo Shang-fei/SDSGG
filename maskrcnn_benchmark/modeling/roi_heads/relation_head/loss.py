@@ -84,9 +84,16 @@ class RelationLossComputation(object):
         self.low_rank_pred_weight = None
         self.low_rank_focal_gamma = 2.0
         self.low_rank_focal_alpha = 1.0
+        self.low_rank_class_weight_power = 0.5
+        self.low_rank_class_weight_min = 0.2
+        self.low_rank_class_weight_max = 2.0
         if self.use_low_rank_text:
-            self.low_rank_focal_gamma = cfg.MODEL.ROI_RELATION_HEAD.LOW_RANK_TEXT.FOCAL_GAMMA
-            self.low_rank_focal_alpha = cfg.MODEL.ROI_RELATION_HEAD.LOW_RANK_TEXT.FOCAL_ALPHA
+            low_rank_cfg = cfg.MODEL.ROI_RELATION_HEAD.LOW_RANK_TEXT
+            self.low_rank_focal_gamma = low_rank_cfg.FOCAL_GAMMA
+            self.low_rank_focal_alpha = low_rank_cfg.FOCAL_ALPHA
+            self.low_rank_class_weight_power = low_rank_cfg.CLASS_WEIGHT_POWER
+            self.low_rank_class_weight_min = low_rank_cfg.CLASS_WEIGHT_MIN
+            self.low_rank_class_weight_max = low_rank_cfg.CLASS_WEIGHT_MAX
             self.low_rank_pred_weight = self._build_low_rank_pred_weight(cfg)
         if self.use_label_smoothing:
             self.criterion_loss = Label_Smoothing_Regression(e=0.01)
@@ -109,7 +116,15 @@ class RelationLossComputation(object):
 
     def _build_low_rank_pred_weight(self, cfg):
         active_indices = self._build_low_rank_active_indices(cfg)
-        return self.pred_weight[active_indices]
+        pred_weight = self.pred_weight[active_indices].float()
+        pred_weight = pred_weight.clamp_min(1e-6).pow(self.low_rank_class_weight_power)
+        if pred_weight.numel() > 1:
+            fg_weight = pred_weight[1:]
+            pred_weight[1:] = fg_weight / fg_weight.mean().clamp_min(1e-6)
+        return pred_weight.clamp(
+            min=self.low_rank_class_weight_min,
+            max=self.low_rank_class_weight_max,
+        )
 
     def _get_low_rank_pred_weight(self, relation_logits):
         pred_weight = self.low_rank_pred_weight.to(relation_logits.device)
@@ -126,18 +141,14 @@ class RelationLossComputation(object):
         logits = relation_logits.float()
         labels = rel_labels.long()
 
-        ce_loss = F.cross_entropy(
-            logits,
-            labels,
-            weight=pred_weight,
-            reduction="none",
-        )
         log_probs = F.log_softmax(logits, dim=-1)
         target_log_probs = log_probs.gather(1, labels.view(-1, 1)).squeeze(1)
         target_probs = target_log_probs.exp()
+        target_weight = pred_weight.gather(0, labels)
+        ce_loss = -target_log_probs
         focal_weight = torch.pow(1.0 - target_probs, self.low_rank_focal_gamma)
-        loss = self.low_rank_focal_alpha * focal_weight * ce_loss
-        return loss.mean()
+        loss = self.low_rank_focal_alpha * target_weight * focal_weight * ce_loss
+        return loss.sum() / target_weight.sum().clamp_min(1e-6)
 
     def __call__(self, proposals, rel_labels, relation_logits, refine_logits):
         """
