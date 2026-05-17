@@ -140,6 +140,11 @@ class RelationLossComputation(object):
         pred_weight = self._get_low_rank_pred_weight(relation_logits)
         logits = relation_logits.float()
         labels = rel_labels.long()
+        valid = labels > 0
+        if valid.sum().item() == 0:
+            return logits.sum() * 0
+        logits = logits[valid]
+        labels = labels[valid]
 
         log_probs = F.log_softmax(logits, dim=-1)
         target_log_probs = log_probs.gather(1, labels.view(-1, 1)).squeeze(1)

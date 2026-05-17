@@ -830,23 +830,34 @@ class LowRankClipPredictor(nn.Module):
             if labels is not None and labels.numel() > 0:
                 pred_labels = relation_logits[:, 1:].argmax(dim=1) + 1
                 valid_gt = labels.long() > 0
-                pred_counts = torch.bincount(pred_labels, minlength=relation_logits.size(1))
-                pred_counts_no_bg = pred_counts[1:]
-                pred_top_counts, pred_top_idx = pred_counts_no_bg.sort(descending=True)
-                pred_top_idx = pred_top_idx + 1
-                pred_dist = pred_counts.float() / pred_counts.sum().clamp_min(1).float()
-                pred_entropy = -(pred_dist[pred_dist > 0] * pred_dist[pred_dist > 0].log()).sum()
-
-                parts.append("pred_unique={}".format(int((pred_counts_no_bg > 0).sum().item())))
-                parts.append("pred_entropy={:.4f}".format(pred_entropy.item()))
-                parts.append(
-                    "top_pred={}".format(
-                        self._format_predicate_hist(pred_top_idx, pred_top_counts)
-                    )
-                )
+                bg_gt = ~valid_gt
+                parts.append("fg_count={}".format(int(valid_gt.sum().item())))
+                parts.append("bg_count={}".format(int(bg_gt.sum().item())))
 
                 if valid_gt.any():
                     gt_labels = labels.long()[valid_gt]
+                    fg_pred_labels = pred_labels[valid_gt]
+                    fg_pred_counts = torch.bincount(
+                        fg_pred_labels,
+                        minlength=relation_logits.size(1),
+                    )
+                    fg_pred_counts_no_bg = fg_pred_counts[1:]
+                    fg_pred_top_counts, fg_pred_top_idx = fg_pred_counts_no_bg.sort(descending=True)
+                    fg_pred_top_idx = fg_pred_top_idx + 1
+                    fg_pred_dist = fg_pred_counts.float() / fg_pred_counts.sum().clamp_min(1).float()
+                    fg_pred_entropy = -(
+                        fg_pred_dist[fg_pred_dist > 0] * fg_pred_dist[fg_pred_dist > 0].log()
+                    ).sum()
+                    parts.append(
+                        "fg_pred_unique={}".format(int((fg_pred_counts_no_bg > 0).sum().item()))
+                    )
+                    parts.append("fg_pred_entropy={:.4f}".format(fg_pred_entropy.item()))
+                    parts.append(
+                        "fg_top_pred={}".format(
+                            self._format_predicate_hist(fg_pred_top_idx, fg_pred_top_counts)
+                        )
+                    )
+
                     gt_counts = torch.bincount(gt_labels, minlength=relation_logits.size(1))
                     gt_counts_no_bg = gt_counts[1:]
                     gt_top_counts, gt_top_idx = gt_counts_no_bg.sort(descending=True)
@@ -855,6 +866,20 @@ class LowRankClipPredictor(nn.Module):
                     parts.append(
                         "top_gt={}".format(
                             self._format_predicate_hist(gt_top_idx, gt_top_counts)
+                        )
+                    )
+                if bg_gt.any():
+                    bg_pred_labels = pred_labels[bg_gt]
+                    bg_pred_counts = torch.bincount(
+                        bg_pred_labels,
+                        minlength=relation_logits.size(1),
+                    )
+                    bg_pred_counts_no_bg = bg_pred_counts[1:]
+                    bg_pred_top_counts, bg_pred_top_idx = bg_pred_counts_no_bg.sort(descending=True)
+                    bg_pred_top_idx = bg_pred_top_idx + 1
+                    parts.append(
+                        "bg_forced_top_pred={}".format(
+                            self._format_predicate_hist(bg_pred_top_idx, bg_pred_top_counts)
                         )
                     )
 
