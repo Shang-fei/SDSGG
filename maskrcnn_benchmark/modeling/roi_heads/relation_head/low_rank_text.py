@@ -198,3 +198,17 @@ class CoreRelationTextAdapter(nn.Module):
             for name, value in self._last_diff_neg_stats.items():
                 stats["diff_neg_{}".format(name)] = value
         return stats
+
+    def weight_usage_stats(self, active_indices, threshold=0.05):
+        with torch.no_grad():
+            weights = self.active_class_weights(active_indices).float()
+            if weights.size(0) > 1:
+                weights = weights[1:]
+            abs_weights = weights.abs()
+            active = (abs_weights > threshold).float().sum(dim=1)
+            total = abs_weights.sum(dim=1).clamp_min(1e-6)
+            max_share = abs_weights.max(dim=1)[0] / total
+            return {
+                "W_active": active.mean(),
+                "W_max_share": max_share.mean(),
+            }

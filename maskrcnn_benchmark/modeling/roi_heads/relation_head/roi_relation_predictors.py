@@ -792,6 +792,9 @@ class LowRankClipPredictor(nn.Module):
 
         with torch.no_grad():
             stats = self.relation_text_adapter.debug_stats()
+            weight_stats = self.relation_text_adapter.weight_usage_stats(
+                self.active_low_rank_indices,
+            )
             basis_std = basis_logits.float().std()
             basis_abs = basis_logits.float().abs().mean()
             logit_std = relation_logits.float().std()
@@ -804,6 +807,8 @@ class LowRankClipPredictor(nn.Module):
             parts.append("logit_std={:.4f}".format(logit_std.item()))
             parts.append("W_abs={:.4f}".format(stats["W_abs_mean"].item()))
             parts.append("B_abs={:.4f}".format(stats["B_abs_mean"].item()))
+            parts.append("W_active={:.2f}".format(weight_stats["W_active"].item()))
+            parts.append("W_max_share={:.4f}".format(weight_stats["W_max_share"].item()))
             parts.append("recon_cos={:.4f}".format(stats["recon_cos"].item()))
             for name in ("reward", "semantic", "confusion", "score"):
                 key = "diff_neg_{}".format(name)
