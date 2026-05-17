@@ -17,11 +17,10 @@ from .model_motifs_with_attribute import AttributeLSTMContext
 from .model_transformer import TransformerContext
 from .utils_relation import layer_init, get_box_info, get_box_pair_info
 from .low_rank_text import (
-    FactorizedRelationTextAdapter,
-    RelationRegionPrompt,
+    CoreRelationTextAdapter,
     build_full_predicate_names,
     build_split_indices,
-    load_factor_prompt_texts,
+    load_relation_prompt_texts,
 )
 from maskrcnn_benchmark.data import get_dataset_statistics
 from maskrcnn_benchmark.utils.comm import is_main_process
@@ -716,42 +715,39 @@ class LowRankClipPredictor(nn.Module):
         self.updata(config.OV_SETTING.TRAIN_PART)
 
         with torch.no_grad():
-            factor_text_features = self._encode_factor_texts()
+            relation_text_features = self._encode_relation_texts()
             text3 = clip.tokenize(["a photo of subject " for _ in self.obj_names]).to(self.device)
             self.text_features3 = self.clip_model.encode_text(text3)
             text4 = clip.tokenize(["a photo of object " for _ in self.obj_names]).to(self.device)
             self.text_features4 = self.clip_model.encode_text(text4)
 
-        self.factor_text_adapter = FactorizedRelationTextAdapter(
-            factor_text_features,
+        self.relation_text_adapter = CoreRelationTextAdapter(
+            relation_text_features,
             rank=self.low_rank_cfg.RANK,
-            router_hidden_dim=self.low_rank_cfg.ROUTER_HIDDEN_DIM,
-            gate_temperature=self.low_rank_cfg.GATE_TEMPERATURE,
+            init_method=self.low_rank_cfg.INIT_METHOD,
             recon_loss_weight=self.low_rank_cfg.RECON_LOSS_WEIGHT,
             sparsity_weight=self.low_rank_cfg.SPARSITY_WEIGHT,
             basis_decorr_weight=self.low_rank_cfg.BASIS_DECORR_WEIGHT,
-            gate_balance_weight=self.low_rank_cfg.GATE_BALANCE_WEIGHT,
+            weight_decorr_weight=self.low_rank_cfg.WEIGHT_DECORR_WEIGHT,
             train_basis=self.low_rank_cfg.TRAIN_BASIS,
-        ).to(self.device)
-        self.spatial_region_prompt = RelationRegionPrompt(
-            feature_dim=512,
-            grid_size=7,
-            num_prompt_tokens=self.low_rank_cfg.REGION_PROMPT_TOKENS,
+            train_mode=self.low_rank_cfg.TRAIN_MODE,
+            logit_temperature=self.low_rank_cfg.CLASSIFIER_TEMPERATURE,
+            diff_neg_weight=self.low_rank_cfg.DIFF_NEG_WEIGHT,
+            diff_neg_topk=self.low_rank_cfg.DIFF_NEG_TOPK,
+            diff_neg_margin=self.low_rank_cfg.DIFF_NEG_MARGIN,
         ).to(self.device)
 
-    def _encode_factor_texts(self):
-        factor_texts = load_factor_prompt_texts(
+    def _encode_relation_texts(self):
+        relation_texts = load_relation_prompt_texts(
             self.low_rank_cfg.PROMPT_JSON,
             self.predicate_names,
+            self.low_rank_cfg.PROMPT_FIELD,
         )
-        factor_features = {}
-        for factor, texts in factor_texts.items():
-            text_tokens = clip.tokenize(texts).to(self.device)
-            text_features = self.clip_model.encode_text(text_tokens)
-            text_features = F.normalize(text_features, dim=-1)
-            text_features[0].zero_()
-            factor_features[factor] = text_features
-        return factor_features
+        text_tokens = clip.tokenize(relation_texts).to(self.device)
+        text_features = self.clip_model.encode_text(text_tokens)
+        text_features = F.normalize(text_features, dim=-1)
+        text_features[0].zero_()
+        return text_features
 
     def _build_predicate_log_prior(self, statistics):
         counts = torch.ones(len(self.predicate_names), dtype=torch.float32)
@@ -789,54 +785,26 @@ class LowRankClipPredictor(nn.Module):
         image_tensor = torch.cat(image_tensor)
         return self.clip_model.encode_image(image_tensor)
 
-    def _encode_full_image_tokens(self, image):
-        image = image.permute(1, 2, 0).detach().cpu().numpy() * 255
-        image = Image.fromarray(np.uint8(image))
-        image = self.clip_preprocess(image).unsqueeze(0).to(self.device)
-        return self.clip_model.encode_image(image)
-
-    def _pair_geometry(self, proposal, pair_idxs):
-        box_info = get_box_info(proposal.bbox, proposal=proposal)
-        return get_box_pair_info(box_info[pair_idxs[:, 0]], box_info[pair_idxs[:, 1]])
-
-    def _log_low_rank_debug(self, gates, factor_logits, logger):
+    def _log_low_rank_debug(self, basis_logits, relation_logits, logger):
         interval = int(self.low_rank_cfg.DEBUG_INTERVAL)
         if interval <= 0 or self.debug_step % interval != 0 or not is_main_process():
             return
 
-        factors = self.factor_text_adapter.factors
         with torch.no_grad():
-            gate_mean = gates.float().mean(dim=(0, 1))
-            gate_std = gates.float().std(dim=(0, 1))
-            gate_entropy = -(gates.float() * (gates.float() + 1e-12).log()).sum(-1).mean()
-            logits_std = factor_logits.float().std(dim=(0, 1))
-            stats = self.factor_text_adapter.debug_stats()
+            stats = self.relation_text_adapter.debug_stats()
+            basis_std = basis_logits.float().std()
+            basis_abs = basis_logits.float().abs().mean()
+            logit_std = relation_logits.float().std()
+            logit_abs = relation_logits.float().abs().mean()
 
             parts = ["LowRankDebug step={}".format(self.debug_step)]
-            for idx, factor in enumerate(factors):
-                parts.append(
-                    "{}_gate={:.4f}/{:.4f}".format(
-                        factor,
-                        gate_mean[idx].item(),
-                        gate_std[idx].item(),
-                    )
-                )
-            parts.append("gate_entropy={:.4f}".format(gate_entropy.item()))
-            for idx, factor in enumerate(factors):
-                parts.append("{}_logit_std={:.4f}".format(factor, logits_std[idx].item()))
-            for factor in factors:
-                parts.append(
-                    "{}_W_abs={:.4f}".format(
-                        factor,
-                        stats["{}_W_abs_mean".format(factor)].item(),
-                    )
-                )
-                parts.append(
-                    "{}_recon_cos={:.4f}".format(
-                        factor,
-                        stats["{}_recon_cos".format(factor)].item(),
-                    )
-                )
+            parts.append("basis_abs={:.4f}".format(basis_abs.item()))
+            parts.append("basis_std={:.4f}".format(basis_std.item()))
+            parts.append("logit_abs={:.4f}".format(logit_abs.item()))
+            parts.append("logit_std={:.4f}".format(logit_std.item()))
+            parts.append("W_abs={:.4f}".format(stats["W_abs_mean"].item()))
+            parts.append("B_abs={:.4f}".format(stats["B_abs_mean"].item()))
+            parts.append("recon_cos={:.4f}".format(stats["recon_cos"].item()))
 
         message = " | ".join(parts)
         if logger is not None:
@@ -856,25 +824,13 @@ class LowRankClipPredictor(nn.Module):
         obj_preds = obj_preds.split(num_objs, dim=0)
 
         rel_dists = []
-        gate_list = []
-        factor_logit_list = []
+        basis_logit_list = []
         for i in range(len(num_rels)):
             with torch.no_grad():
                 image_features = self._encode_object_crops(proposals[i], img[i])
-                full_image_tokens = self._encode_full_image_tokens(img[i])
 
             pair_idxs = rel_pair_idxs[i]
-            geometry = self._pair_geometry(proposals[i], pair_idxs)
-            subject_boxes = proposals[i].bbox[pair_idxs[:, 0]]
-            object_boxes = proposals[i].bbox[pair_idxs[:, 1]]
-            region_masks = self.spatial_region_prompt.build_region_masks(
-                subject_boxes,
-                object_boxes,
-                proposals[i].size,
-            )
-
             pair_features = []
-            attribute_features = []
             for rel_index in pair_idxs:
                 obj_n1 = obj_preds[i][rel_index[0]]
                 obj_n2 = obj_preds[i][rel_index[1]]
@@ -893,45 +849,36 @@ class LowRankClipPredictor(nn.Module):
                 )
                 pair_feature = F.normalize((cross_output1 + cross_output2) / 2, dim=-1)
                 pair_features.append(pair_feature)
-                attribute_feature = (image_features[rel_index[0], 0] + image_features[rel_index[1], 0]) / 2
-                attribute_features.append(F.normalize(attribute_feature, dim=-1).unsqueeze(0))
 
             pair_features = torch.cat(pair_features, dim=0)
-            attribute_features = torch.cat(attribute_features, dim=0)
-            evidences = {
-                "spatial": self.spatial_region_prompt(
-                    full_image_tokens,
-                    geometry,
-                    region_masks,
-                ),
-                "interaction": pair_features,
-                "attribute": attribute_features,
-            }
-            factor_texts = self.factor_text_adapter.factor_classifiers(self.active_low_rank_indices)
-            gates = self.factor_text_adapter.factor_gates(self.active_low_rank_indices, evidences)
-            factor_logits = []
-            for factor_idx, factor in enumerate(self.factor_text_adapter.factors):
-                evidence = F.normalize(evidences[factor].float(), dim=-1)
-                text = factor_texts[factor_idx].float()
-                factor_logits.append(evidence @ text.t())
-            factor_logits = torch.stack(factor_logits, dim=-1) / 0.05
-            logits = (factor_logits * gates.float()).sum(dim=-1)
+            logits, basis_logits = self.relation_text_adapter.logits(
+                pair_features,
+                self.active_low_rank_indices,
+            )
             if self.low_rank_cfg.LOGIT_ADJUSTMENT_TAU > 0:
                 log_prior = self.predicate_log_prior[self.active_low_rank_indices].to(logits.device)
                 logits = logits - self.low_rank_cfg.LOGIT_ADJUSTMENT_TAU * log_prior.view(1, -1)
             rel_dists.append(logits)
-            gate_list.append(gates)
-            factor_logit_list.append(factor_logits)
+            basis_logit_list.append(basis_logits)
 
         obj_dists = obj_dists.split(num_objs, dim=0)
         add_losses = {}
         if self.training:
             self.debug_step += 1
-            gates = torch.cat(gate_list, dim=0) if gate_list else None
-            factor_logits = torch.cat(factor_logit_list, dim=0) if factor_logit_list else None
-            if gates is not None and factor_logits is not None:
-                self._log_low_rank_debug(gates, factor_logits, logger)
-            add_losses.update(self.factor_text_adapter.losses(gates))
+            basis_logits = torch.cat(basis_logit_list, dim=0) if basis_logit_list else None
+            relation_logits = torch.cat(rel_dists, dim=0) if rel_dists else None
+            labels = cat(rel_labels, dim=0) if rel_labels is not None else None
+            if basis_logits is not None and relation_logits is not None:
+                self._log_low_rank_debug(basis_logits, relation_logits, logger)
+                add_losses.update(
+                    self.relation_text_adapter.factor_difference_loss(
+                        basis_logits,
+                        relation_logits,
+                        labels,
+                        self.active_low_rank_indices,
+                    )
+                )
+            add_losses.update(self.relation_text_adapter.losses())
         return obj_dists, tuple(rel_dists), add_losses
 
 

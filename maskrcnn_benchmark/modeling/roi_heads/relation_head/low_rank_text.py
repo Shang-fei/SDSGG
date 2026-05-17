@@ -4,6 +4,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from .hola_low_rank import HOLaLowRankDecomposer
+
 
 VG_PREDICATES = [
     "__background__", "above", "across", "against", "along", "and", "at", "attached to",
@@ -15,12 +17,7 @@ VG_PREDICATES = [
     "walking in", "walking on", "watching", "wearing", "wears", "with",
 ]
 
-FACTOR_NAMES = ("spatial", "interaction", "attribute")
-PROMPT_FIELDS = {
-    "spatial": "spatial_prompt",
-    "interaction": "interaction_prompt",
-    "attribute": "attribute_prompt",
-}
+CORE_PROMPT_FIELD = "core_prompt"
 
 
 def build_full_predicate_names(cfg):
@@ -48,267 +45,143 @@ def build_split_indices(cfg, predicate_names):
     }
 
 
-def load_factor_prompt_texts(prompt_json, predicate_names):
+def load_relation_prompt_texts(prompt_json, predicate_names, field=CORE_PROMPT_FIELD):
     if not prompt_json:
-        raise ValueError("LOW_RANK_TEXT.PROMPT_JSON must point to an LLM factor prompt JSON.")
+        raise ValueError("LOW_RANK_TEXT.PROMPT_JSON must point to an LLM prompt JSON.")
     with open(prompt_json, "r") as f:
         prompt_data = json.load(f)
 
-    texts = {factor: [] for factor in FACTOR_NAMES}
+    texts = []
     for name in predicate_names:
         if name == "__background__":
-            for factor in FACTOR_NAMES:
-                texts[factor].append("")
+            texts.append("")
             continue
         if name not in prompt_data:
             raise KeyError("Missing predicate '{}' in {}".format(name, prompt_json))
         item = prompt_data[name]
-        for factor, field in PROMPT_FIELDS.items():
-            if field not in item:
-                raise KeyError("Missing field '{}.{}' in {}".format(name, field, prompt_json))
-            texts[factor].append(item[field])
+        if field not in item:
+            raise KeyError("Missing field '{}.{}' in {}".format(name, field, prompt_json))
+        texts.append(item[field])
     return texts
 
 
-def init_low_rank_with_pca(text_features, rank):
-    try:
-        from sklearn.decomposition import PCA
-    except ImportError:
-        raise ImportError(
-            "LOW_RANK_TEXT uses sklearn.decomposition.PCA to match HOLa. "
-            "Please install scikit-learn in the training environment."
-        )
-
-    temp_text = text_features.t().cpu().numpy()
-    max_rank = min(temp_text.shape[0], temp_text.shape[1])
-    rank = max(1, min(int(rank), max_rank))
-
-    pca = PCA(n_components=rank)
-    pca.fit(temp_text)
-    basis = torch.tensor(pca.transform(temp_text).T).type_as(text_features)
-    basis = F.normalize(basis, dim=-1)
-    weights = torch.tensor(pca.components_.T).type_as(text_features)
-    return basis, weights
-
-
-class FactorizedRelationTextAdapter(nn.Module):
+class CoreRelationTextAdapter(nn.Module):
     def __init__(
         self,
-        factor_text_features,
+        text_features,
         rank,
-        router_hidden_dim=256,
-        gate_temperature=0.5,
+        init_method="pca",
         recon_loss_weight=0.1,
         sparsity_weight=0.1,
         basis_decorr_weight=0.001,
-        gate_balance_weight=0.0,
-        train_basis=False,
+        weight_decorr_weight=0.001,
+        train_basis=True,
+        train_mode="w",
+        logit_temperature=0.05,
+        diff_neg_weight=0.1,
+        diff_neg_topk=5,
+        diff_neg_margin=0.2,
     ):
-        super(FactorizedRelationTextAdapter, self).__init__()
-        self.factors = FACTOR_NAMES
-        self.gate_temperature = float(gate_temperature)
-        self.recon_loss_weight = recon_loss_weight
-        self.sparsity_weight = sparsity_weight
-        self.basis_decorr_weight = basis_decorr_weight
-        self.gate_balance_weight = gate_balance_weight
+        super(CoreRelationTextAdapter, self).__init__()
+        self.decomposer = HOLaLowRankDecomposer(
+            text_features,
+            rank=rank,
+            init_method=init_method,
+            train_basis=train_basis,
+            train_mode=train_mode,
+            recon_loss_weight=recon_loss_weight,
+            sparsity_weight=sparsity_weight,
+            basis_decorr_weight=basis_decorr_weight,
+            weight_decorr_weight=weight_decorr_weight,
+        )
+        self.logit_temperature = logit_temperature
+        self.diff_neg_weight = diff_neg_weight
+        self.diff_neg_topk = diff_neg_topk
+        self.diff_neg_margin = diff_neg_margin
 
-        self.class_weights = nn.ParameterDict()
-        self.query_proj = nn.ModuleDict()
-        self.key_proj = nn.ModuleDict()
-        self.factor_to_idx = {factor: idx for idx, factor in enumerate(self.factors)}
-
-        feature_dim = None
-        for factor in self.factors:
-            text_features = factor_text_features[factor].detach().float()
-            text_features = F.normalize(text_features, dim=-1)
-            if text_features.size(0) > 0:
-                text_features = text_features.clone()
-                text_features[0].zero_()
-            if feature_dim is None:
-                feature_dim = text_features.size(-1)
-
-            basis, weights = init_low_rank_with_pca(text_features, rank)
-            self.class_weights[factor] = nn.Parameter(weights)
-            if train_basis:
-                setattr(self, "{}_basis".format(factor), nn.Parameter(basis))
-            else:
-                self.register_buffer("{}_basis".format(factor), basis)
-            self.register_buffer("{}_original_text_features".format(factor), text_features)
-
-            self.query_proj[factor] = nn.Sequential(
-                nn.Linear(feature_dim, router_hidden_dim),
-                nn.ReLU(inplace=True),
-                nn.Linear(router_hidden_dim, feature_dim),
-            )
-            self.key_proj[factor] = nn.Linear(feature_dim, feature_dim)
-
-        self.factor_tokens = nn.Parameter(torch.zeros(len(self.factors), feature_dim))
-        nn.init.normal_(self.factor_tokens, std=0.02)
-
-    def basis(self, factor):
-        return getattr(self, "{}_basis".format(factor))
-
-    def original_text_features(self, factor):
-        return getattr(self, "{}_original_text_features".format(factor))
-
-    def reconstruct_factor(self, factor):
-        text_features = self.class_weights[factor] @ self.basis(factor)
-        if text_features.size(0) > 0:
-            text_features = text_features.clone()
-            text_features[0].zero_()
-        return text_features
-
-    def factor_classifiers(self, active_indices):
-        factor_texts = []
-        for factor in self.factors:
-            reconstructed = F.normalize(self.reconstruct_factor(factor)[active_indices], dim=-1)
-            factor_texts.append(reconstructed)
-        factor_texts = torch.stack(factor_texts, dim=0)
+    def active_class_weights(self, active_indices, normalize=False):
+        weights = self.decomposer.class_weights
+        if self.decomposer.train_mode in ("b", "none"):
+            weights = weights.detach()
+        weights = weights[active_indices].float()
         if active_indices.numel() > 0 and active_indices[0].item() == 0:
-            factor_texts = factor_texts.clone()
-            factor_texts[:, 0].zero_()
-        return factor_texts
+            weights = weights.clone()
+            weights[0].zero_()
+        if normalize:
+            weights = F.normalize(weights, dim=-1)
+        return weights
 
-    def factor_gates(self, active_indices, evidences):
-        factor_scores = []
-        for factor in self.factors:
-            anchors = self.original_text_features(factor)[active_indices]
-            keys = self.key_proj[factor](anchors.float())
-            keys = keys + self.factor_tokens[self.factor_to_idx[factor]].view(1, -1)
-            keys = F.normalize(keys, dim=-1)
+    def basis_logits(self, visual_features):
+        basis = self.decomposer.basis_feat
+        if self.decomposer.train_mode in ("w", "none"):
+            basis = basis.detach()
+        basis = F.normalize(basis.float(), dim=-1)
+        visual_features = F.normalize(visual_features.float(), dim=-1)
+        return visual_features @ basis.t()
 
-            queries = F.normalize(self.query_proj[factor](evidences[factor].float()), dim=-1)
-            scores = queries @ keys.t()
-            factor_scores.append(scores)
+    def logits(self, visual_features, active_indices):
+        basis_logits = self.basis_logits(visual_features)
+        weights = self.active_class_weights(active_indices)
+        logits = basis_logits @ weights.t()
+        return logits / self.logit_temperature, basis_logits
 
-        scores = torch.stack(factor_scores, dim=-1) / self.gate_temperature
-        return F.softmax(scores, dim=-1)
+    def factor_difference_loss(self, basis_logits, relation_logits, labels, active_indices):
+        if self.diff_neg_weight <= 0 or labels is None:
+            return {}
 
-    def losses(self, last_gates=None):
+        labels = labels.long()
+        valid = (labels > 0) & (labels < relation_logits.size(1))
+        if valid.sum().item() == 0:
+            return {}
+
+        basis_logits = basis_logits[valid].float()
+        relation_logits = relation_logits[valid].float()
+        labels = labels[valid]
+        weights = self.active_class_weights(active_indices).detach()
+        norm_weights = F.normalize(weights, dim=-1)
+
+        target_weights = weights[labels]
+        target_norm_weights = norm_weights[labels]
+        semantic_reward = (target_norm_weights @ norm_weights.t()).clamp_min(0)
+
+        target_logits = relation_logits.gather(1, labels.view(-1, 1))
+        confusion_reward = torch.sigmoid(
+            relation_logits.detach() - target_logits.detach() + self.diff_neg_margin
+        )
+        reward = semantic_reward * confusion_reward
+        reward.scatter_(1, labels.view(-1, 1), 0)
+        if reward.size(1) > 0:
+            reward[:, 0] = 0
+
+        topk = min(int(self.diff_neg_topk), max(reward.size(1) - 1, 1))
+        neg_reward, neg_idx = reward.topk(topk, dim=1)
+        if neg_reward.sum().item() <= 0:
+            return {}
+
+        neg_weights = weights[neg_idx]
+        diff = F.normalize(target_weights.unsqueeze(1) - neg_weights, dim=-1)
+        diff_score = (basis_logits.unsqueeze(1) * diff).sum(-1)
+        loss = F.softplus(self.diff_neg_margin - diff_score)
+        loss = (loss * neg_reward.detach()).sum() / neg_reward.detach().sum().clamp_min(1e-6)
+        return {"loss_factor_diff_neg": loss * self.diff_neg_weight}
+
+    def losses(self):
         losses = {}
-        recon_losses = []
-        sparse_losses = []
-        decorr_losses = []
-
-        for factor in self.factors:
-            reconstructed = self.reconstruct_factor(factor)
-            original = self.original_text_features(factor)
-            if reconstructed.size(0) > 1:
-                recon = 1 - F.cosine_similarity(
-                    F.normalize(reconstructed[1:].float(), dim=-1),
-                    F.normalize(original[1:].float(), dim=-1),
-                    dim=-1,
-                )
-                recon_losses.append(recon.mean())
-
-            sparse_losses.append(self.class_weights[factor].abs().mean())
-
-            basis = F.normalize(self.basis(factor).float(), dim=-1)
-            if basis.size(0) > 1:
-                corr = basis @ basis.t()
-                off_diag = corr - torch.eye(corr.size(0), device=corr.device).type_as(corr)
-                decorr_losses.append(off_diag.abs().mean())
-
-        if recon_losses and self.recon_loss_weight > 0:
-            losses["loss_factor_recon"] = torch.stack(recon_losses).mean() * self.recon_loss_weight
-        if sparse_losses and self.sparsity_weight > 0:
-            losses["loss_factor_sparse"] = torch.stack(sparse_losses).mean() * self.sparsity_weight
-        if decorr_losses and self.basis_decorr_weight > 0:
-            losses["loss_factor_basis_decorr"] = torch.stack(decorr_losses).mean() * self.basis_decorr_weight
-        if last_gates is not None and self.gate_balance_weight > 0:
-            mean_gate = last_gates.float().mean(dim=(0, 1))
-            target = mean_gate.new_full(mean_gate.shape, 1.0 / mean_gate.numel())
-            losses["loss_factor_gate_balance"] = F.mse_loss(mean_gate, target) * self.gate_balance_weight
+        factor_losses = self.decomposer.losses()
+        if "recon" in factor_losses:
+            losses["recon_loss2"] = factor_losses["recon"]
+        if "sparse" in factor_losses:
+            losses["loss_w_sparse"] = factor_losses["sparse"]
+        if "weight_decorr" in factor_losses:
+            losses["loss_w_unique"] = factor_losses["weight_decorr"]
+        if "basis_decorr" in factor_losses:
+            losses["disentangle_basis"] = factor_losses["basis_decorr"]
         return losses
 
     def debug_stats(self):
-        stats = {}
-        with torch.no_grad():
-            for factor in self.factors:
-                weight = self.class_weights[factor].float()
-                reconstructed = self.reconstruct_factor(factor).float()
-                original = self.original_text_features(factor).float()
-                if reconstructed.size(0) > 1:
-                    recon_cos = F.cosine_similarity(
-                        F.normalize(reconstructed[1:], dim=-1),
-                        F.normalize(original[1:], dim=-1),
-                        dim=-1,
-                    ).mean()
-                else:
-                    recon_cos = reconstructed.sum() * 0
-                stats["{}_W_abs_mean".format(factor)] = weight.abs().mean()
-                stats["{}_recon_cos".format(factor)] = recon_cos
+        stats = self.decomposer.debug_stats()
+        stats["diff_neg_weight"] = torch.as_tensor(
+            self.diff_neg_weight,
+            device=self.decomposer.basis_feat.device,
+        )
         return stats
-
-
-class RelationRegionPrompt(nn.Module):
-    def __init__(
-        self,
-        feature_dim=512,
-        geometry_dim=32,
-        grid_size=7,
-        num_prompt_tokens=1,
-        num_heads=8,
-    ):
-        super(RelationRegionPrompt, self).__init__()
-        self.grid_size = grid_size
-        self.feature_dim = feature_dim
-        self.num_prompt_tokens = num_prompt_tokens
-        self.region_prompt = nn.Parameter(torch.zeros(num_prompt_tokens, feature_dim))
-        nn.init.normal_(self.region_prompt, std=0.02)
-
-        self.mask_proj = nn.Linear(3 * grid_size * grid_size, feature_dim)
-        self.geometry_proj = nn.Linear(geometry_dim, feature_dim)
-        self.attn = nn.MultiheadAttention(feature_dim, num_heads)
-        self.out_norm = nn.LayerNorm(feature_dim)
-
-    def _boxes_to_mask(self, boxes, image_size):
-        width, height = image_size
-        device = boxes.device
-        masks = boxes.new_zeros((boxes.size(0), self.grid_size, self.grid_size))
-        scale_x = float(self.grid_size) / max(float(width), 1.0)
-        scale_y = float(self.grid_size) / max(float(height), 1.0)
-
-        for idx, box in enumerate(boxes):
-            x1 = int(torch.floor(box[0] * scale_x).clamp(0, self.grid_size - 1).item())
-            y1 = int(torch.floor(box[1] * scale_y).clamp(0, self.grid_size - 1).item())
-            x2 = int(torch.ceil(box[2] * scale_x).clamp(0, self.grid_size).item())
-            y2 = int(torch.ceil(box[3] * scale_y).clamp(0, self.grid_size).item())
-            masks[idx, y1:max(y1 + 1, y2), x1:max(x1 + 1, x2)] = 1.0
-        return masks.to(device=device)
-
-    def build_region_masks(self, subject_boxes, object_boxes, image_size):
-        union_boxes = torch.cat(
-            (
-                torch.min(subject_boxes[:, :2], object_boxes[:, :2]),
-                torch.max(subject_boxes[:, 2:], object_boxes[:, 2:]),
-            ),
-            dim=-1,
-        )
-        masks = torch.stack(
-            (
-                self._boxes_to_mask(union_boxes, image_size),
-                self._boxes_to_mask(subject_boxes, image_size),
-                self._boxes_to_mask(object_boxes, image_size),
-            ),
-            dim=1,
-        )
-        return masks.flatten(1)
-
-    def forward(self, full_image_tokens, geometry_features, region_masks):
-        if full_image_tokens.dim() == 2:
-            full_image_tokens = full_image_tokens.unsqueeze(0)
-        patch_tokens = full_image_tokens[:, 1:, :].float()
-        if patch_tokens.size(1) == 0:
-            patch_tokens = full_image_tokens.float()
-
-        num_rel = region_masks.size(0)
-        memory = patch_tokens.expand(num_rel, -1, -1).transpose(0, 1).contiguous()
-
-        prompt = self.region_prompt.unsqueeze(0).expand(num_rel, -1, -1)
-        prompt = prompt + self.mask_proj(region_masks.float()).unsqueeze(1)
-        prompt = prompt + self.geometry_proj(geometry_features.float()).unsqueeze(1)
-
-        attended, _ = self.attn(prompt.transpose(0, 1), memory, memory)
-        region_evidence = attended.transpose(0, 1).mean(1)
-        return self.out_norm(region_evidence)
