@@ -732,6 +732,8 @@ class LowRankClipPredictor(nn.Module):
             train_basis=self.low_rank_cfg.TRAIN_BASIS,
             train_mode=self.low_rank_cfg.TRAIN_MODE,
             logit_temperature=self.low_rank_cfg.CLASSIFIER_TEMPERATURE,
+            factor_comp_weight=self.low_rank_cfg.FACTOR_COMP_WEIGHT,
+            factor_comp_tau=self.low_rank_cfg.FACTOR_COMP_TAU,
             diff_neg_weight=self.low_rank_cfg.DIFF_NEG_WEIGHT,
             diff_neg_topk=self.low_rank_cfg.DIFF_NEG_TOPK,
             diff_neg_margin=self.low_rank_cfg.DIFF_NEG_MARGIN,
@@ -810,6 +812,10 @@ class LowRankClipPredictor(nn.Module):
             parts.append("W_active={:.2f}".format(weight_stats["W_active"].item()))
             parts.append("W_max_share={:.4f}".format(weight_stats["W_max_share"].item()))
             parts.append("recon_cos={:.4f}".format(stats["recon_cos"].item()))
+            for name in ("kl", "cos", "entropy"):
+                key = "factor_comp_{}".format(name)
+                if key in stats:
+                    parts.append("{}={:.4f}".format(key, stats[key].item()))
             for name in ("reward", "semantic", "confusion", "score"):
                 key = "diff_neg_{}".format(name)
                 if key in stats:
@@ -878,6 +884,13 @@ class LowRankClipPredictor(nn.Module):
             relation_logits = torch.cat(rel_dists, dim=0) if rel_dists else None
             labels = cat(rel_labels, dim=0) if rel_labels is not None else None
             if basis_logits is not None and relation_logits is not None:
+                add_losses.update(
+                    self.relation_text_adapter.factor_composition_loss(
+                        basis_logits,
+                        labels,
+                        self.active_low_rank_indices,
+                    )
+                )
                 add_losses.update(
                     self.relation_text_adapter.factor_difference_loss(
                         basis_logits,

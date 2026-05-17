@@ -78,6 +78,8 @@ class CoreRelationTextAdapter(nn.Module):
         train_basis=True,
         train_mode="w",
         logit_temperature=0.05,
+        factor_comp_weight=0.1,
+        factor_comp_tau=0.2,
         diff_neg_weight=0.1,
         diff_neg_topk=5,
         diff_neg_margin=0.2,
@@ -95,9 +97,12 @@ class CoreRelationTextAdapter(nn.Module):
             weight_decorr_weight=weight_decorr_weight,
         )
         self.logit_temperature = logit_temperature
+        self.factor_comp_weight = factor_comp_weight
+        self.factor_comp_tau = factor_comp_tau
         self.diff_neg_weight = diff_neg_weight
         self.diff_neg_topk = diff_neg_topk
         self.diff_neg_margin = diff_neg_margin
+        self._last_factor_comp_stats = None
         self._last_diff_neg_stats = None
 
     def active_class_weights(self, active_indices, normalize=False):
@@ -125,6 +130,39 @@ class CoreRelationTextAdapter(nn.Module):
         weights = self.active_class_weights(active_indices)
         logits = basis_logits @ weights.t()
         return logits / self.logit_temperature, basis_logits
+
+    def factor_composition_loss(self, basis_logits, labels, active_indices):
+        self._last_factor_comp_stats = None
+        if self.factor_comp_weight <= 0 or labels is None:
+            return {}
+
+        labels = labels.long()
+        valid = (labels > 0) & (labels < len(active_indices))
+        if valid.sum().item() == 0:
+            return {}
+
+        basis_logits = basis_logits[valid].float()
+        labels = labels[valid]
+        weights = self.active_class_weights(active_indices).detach().float()
+        target_weights = weights[labels]
+
+        tau = max(float(self.factor_comp_tau), 1e-6)
+        target_dist = F.softmax(target_weights / tau, dim=-1)
+        pred_log_dist = F.log_softmax(basis_logits / tau, dim=-1)
+        loss = F.kl_div(pred_log_dist, target_dist, reduction="batchmean")
+
+        self._last_factor_comp_stats = {
+            "kl": loss.detach(),
+            "cos": F.cosine_similarity(
+                F.normalize(basis_logits, dim=-1),
+                F.normalize(target_weights, dim=-1),
+                dim=-1,
+            ).detach().mean(),
+            "entropy": (-(target_dist * target_dist.clamp_min(1e-12).log()).sum(dim=-1))
+            .detach()
+            .mean(),
+        }
+        return {"loss_factor_comp": loss * self.factor_comp_weight}
 
     def factor_difference_loss(self, basis_logits, relation_logits, labels, active_indices):
         self._last_diff_neg_stats = None
@@ -194,6 +232,13 @@ class CoreRelationTextAdapter(nn.Module):
             self.diff_neg_weight,
             device=self.decomposer.basis_feat.device,
         )
+        stats["factor_comp_weight"] = torch.as_tensor(
+            self.factor_comp_weight,
+            device=self.decomposer.basis_feat.device,
+        )
+        if self._last_factor_comp_stats is not None:
+            for name, value in self._last_factor_comp_stats.items():
+                stats["factor_comp_{}".format(name)] = value
         if self._last_diff_neg_stats is not None:
             for name, value in self._last_diff_neg_stats.items():
                 stats["diff_neg_{}".format(name)] = value
