@@ -805,6 +805,10 @@ class LowRankClipPredictor(nn.Module):
             parts.append("W_abs={:.4f}".format(stats["W_abs_mean"].item()))
             parts.append("B_abs={:.4f}".format(stats["B_abs_mean"].item()))
             parts.append("recon_cos={:.4f}".format(stats["recon_cos"].item()))
+            for name in ("reward", "semantic", "confusion", "score"):
+                key = "diff_neg_{}".format(name)
+                if key in stats:
+                    parts.append("{}={:.4f}".format(key, stats[key].item()))
 
         message = " | ".join(parts)
         if logger is not None:
@@ -869,7 +873,6 @@ class LowRankClipPredictor(nn.Module):
             relation_logits = torch.cat(rel_dists, dim=0) if rel_dists else None
             labels = cat(rel_labels, dim=0) if rel_labels is not None else None
             if basis_logits is not None and relation_logits is not None:
-                self._log_low_rank_debug(basis_logits, relation_logits, logger)
                 add_losses.update(
                     self.relation_text_adapter.factor_difference_loss(
                         basis_logits,
@@ -878,6 +881,7 @@ class LowRankClipPredictor(nn.Module):
                         self.active_low_rank_indices,
                     )
                 )
+                self._log_low_rank_debug(basis_logits, relation_logits, logger)
             add_losses.update(self.relation_text_adapter.losses())
         return obj_dists, tuple(rel_dists), add_losses
 

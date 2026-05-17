@@ -98,6 +98,7 @@ class CoreRelationTextAdapter(nn.Module):
         self.diff_neg_weight = diff_neg_weight
         self.diff_neg_topk = diff_neg_topk
         self.diff_neg_margin = diff_neg_margin
+        self._last_diff_neg_stats = None
 
     def active_class_weights(self, active_indices, normalize=False):
         weights = self.decomposer.class_weights
@@ -126,6 +127,7 @@ class CoreRelationTextAdapter(nn.Module):
         return logits / self.logit_temperature, basis_logits
 
     def factor_difference_loss(self, basis_logits, relation_logits, labels, active_indices):
+        self._last_diff_neg_stats = None
         if self.diff_neg_weight <= 0 or labels is None:
             return {}
 
@@ -163,6 +165,14 @@ class CoreRelationTextAdapter(nn.Module):
         diff_score = (basis_logits.unsqueeze(1) * diff).sum(-1)
         loss = F.softplus(self.diff_neg_margin - diff_score)
         loss = (loss * neg_reward.detach()).sum() / neg_reward.detach().sum().clamp_min(1e-6)
+        selected_sem = semantic_reward.gather(1, neg_idx)
+        selected_conf = confusion_reward.gather(1, neg_idx)
+        self._last_diff_neg_stats = {
+            "reward": neg_reward.detach().mean(),
+            "semantic": selected_sem.detach().mean(),
+            "confusion": selected_conf.detach().mean(),
+            "score": diff_score.detach().mean(),
+        }
         return {"loss_factor_diff_neg": loss * self.diff_neg_weight}
 
     def losses(self):
@@ -184,4 +194,7 @@ class CoreRelationTextAdapter(nn.Module):
             self.diff_neg_weight,
             device=self.decomposer.basis_feat.device,
         )
+        if self._last_diff_neg_stats is not None:
+            for name, value in self._last_diff_neg_stats.items():
+                stats["diff_neg_{}".format(name)] = value
         return stats
