@@ -782,7 +782,15 @@ class LowRankClipPredictor(nn.Module):
         image_tensor = torch.cat(image_tensor)
         return self.clip_model.encode_image(image_tensor)
 
-    def _log_low_rank_debug(self, basis_logits, relation_logits, logger):
+    def _format_predicate_hist(self, indices, counts, max_items=5):
+        items = []
+        for idx, count in zip(indices[:max_items].tolist(), counts[:max_items].tolist()):
+            global_idx = self.active_low_rank_indices[idx].item()
+            name = self.predicate_names[global_idx]
+            items.append("{}:{}".format(name, int(count)))
+        return ",".join(items)
+
+    def _log_low_rank_debug(self, basis_logits, relation_logits, labels, logger):
         interval = int(self.low_rank_cfg.DEBUG_INTERVAL)
         if interval <= 0 or self.debug_step % interval != 0 or not is_main_process():
             return
@@ -807,6 +815,36 @@ class LowRankClipPredictor(nn.Module):
             parts.append("W_active={:.2f}".format(weight_stats["W_active"].item()))
             parts.append("W_max_share={:.4f}".format(weight_stats["W_max_share"].item()))
             parts.append("recon_cos={:.4f}".format(stats["recon_cos"].item()))
+            if labels is not None and labels.numel() > 0:
+                pred_labels = relation_logits[:, 1:].argmax(dim=1) + 1
+                valid_gt = labels.long() > 0
+                pred_counts = torch.bincount(pred_labels, minlength=relation_logits.size(1))
+                pred_counts_no_bg = pred_counts[1:]
+                pred_top_counts, pred_top_idx = pred_counts_no_bg.sort(descending=True)
+                pred_top_idx = pred_top_idx + 1
+                pred_dist = pred_counts.float() / pred_counts.sum().clamp_min(1).float()
+                pred_entropy = -(pred_dist[pred_dist > 0] * pred_dist[pred_dist > 0].log()).sum()
+
+                parts.append("pred_unique={}".format(int((pred_counts_no_bg > 0).sum().item())))
+                parts.append("pred_entropy={:.4f}".format(pred_entropy.item()))
+                parts.append(
+                    "top_pred={}".format(
+                        self._format_predicate_hist(pred_top_idx, pred_top_counts)
+                    )
+                )
+
+                if valid_gt.any():
+                    gt_labels = labels.long()[valid_gt]
+                    gt_counts = torch.bincount(gt_labels, minlength=relation_logits.size(1))
+                    gt_counts_no_bg = gt_counts[1:]
+                    gt_top_counts, gt_top_idx = gt_counts_no_bg.sort(descending=True)
+                    gt_top_idx = gt_top_idx + 1
+                    parts.append("gt_unique={}".format(int((gt_counts_no_bg > 0).sum().item())))
+                    parts.append(
+                        "top_gt={}".format(
+                            self._format_predicate_hist(gt_top_idx, gt_top_counts)
+                        )
+                    )
 
         message = " | ".join(parts)
         if logger is not None:
@@ -869,8 +907,9 @@ class LowRankClipPredictor(nn.Module):
             self.debug_step += 1
             basis_logits = torch.cat(basis_logit_list, dim=0) if basis_logit_list else None
             relation_logits = torch.cat(rel_dists, dim=0) if rel_dists else None
+            labels = cat(rel_labels, dim=0) if rel_labels is not None else None
             if basis_logits is not None and relation_logits is not None:
-                self._log_low_rank_debug(basis_logits, relation_logits, logger)
+                self._log_low_rank_debug(basis_logits, relation_logits, labels, logger)
             add_losses.update(self.relation_text_adapter.losses())
         return obj_dists, tuple(rel_dists), add_losses
 

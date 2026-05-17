@@ -80,13 +80,6 @@ class RelationLossComputation(object):
                 or cfg.MODEL.ROI_RELATION_HEAD.PREDICTOR == "LowRankClipPredictor"
             )
         )
-        if self.use_low_rank_text:
-            self.low_rank_criterion = MultiClassFocalLoss(
-                gamma=cfg.MODEL.ROI_RELATION_HEAD.LOW_RANK_TEXT.FOCAL_GAMMA,
-                alpha=cfg.MODEL.ROI_RELATION_HEAD.LOW_RANK_TEXT.FOCAL_ALPHA,
-                ignore_index=-1,
-            )
-
         if self.use_label_smoothing:
             self.criterion_loss = Label_Smoothing_Regression(e=0.01)
         else:
@@ -124,7 +117,12 @@ class RelationLossComputation(object):
         rel_labels = cat(rel_labels, dim=0)
 
         if self.use_low_rank_text:
-            loss_relation = self.low_rank_criterion(relation_logits.float(), rel_labels.long())
+            pred_weight = self.pred_weight[: relation_logits.size(1)].to(relation_logits.device)
+            loss_relation = F.cross_entropy(
+                relation_logits.float(),
+                rel_labels.long(),
+                weight=pred_weight,
+            )
         else:
             loss_relation = self.loss(relation_logits, rel_labels.long())
         #loss_relation = self.criterion_loss(relation_logits, rel_labels.long())
