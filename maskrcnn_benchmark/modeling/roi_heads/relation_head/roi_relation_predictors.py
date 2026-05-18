@@ -777,8 +777,9 @@ class LowRankClipPredictor(nn.Module):
         )
 
     def _check_train_predicate_order(self):
+        active_indices = self.active_predicate_indices.detach().cpu().tolist()
         active_names = [
-            self.predicate_names[idx] for idx in self.active_predicate_indices.tolist()
+            self.predicate_names[idx] for idx in active_indices
         ]
         if active_names != self.train_predicate_names:
             raise ValueError(
@@ -1019,8 +1020,9 @@ class CorePromptClipPredictor(nn.Module):
         )
 
     def _check_train_predicate_order(self):
+        active_indices = self.active_predicate_indices.detach().cpu().tolist()
         active_names = [
-            self.predicate_names[idx] for idx in self.active_predicate_indices.tolist()
+            self.predicate_names[idx] for idx in active_indices
         ]
         if active_names != self.train_predicate_names:
             raise ValueError(

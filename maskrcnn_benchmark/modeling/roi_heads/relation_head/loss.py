@@ -15,7 +15,7 @@ from maskrcnn_benchmark.modeling.box_coder import BoxCoder
 from maskrcnn_benchmark.modeling.matcher import Matcher
 from maskrcnn_benchmark.structures.boxlist_ops import boxlist_iou
 from maskrcnn_benchmark.modeling.utils import cat
-from .low_rank_text import build_full_predicate_names, build_split_indices
+from .low_rank_text import build_predicate_splits
 import pandas as pd
 
 from  defaults import PRDCS_BASE ,PRDCS_NOVEL,SEMAN,TRAIN_PART,DATA_OPTION
@@ -103,13 +103,13 @@ class RelationLossComputation(object):
         #self.focal_loss=MultiCEFocalLoss(class_num=25,device=device)
 
     def _build_low_rank_active_indices(self, cfg):
-        predicate_names = build_full_predicate_names(cfg)
-        active_indices_by_mode = build_split_indices(cfg, predicate_names)
-        if cfg.OV_SETTING.TRAIN_PART not in active_indices_by_mode:
+        train_part = cfg.OV_SETTING.TRAIN_PART
+        splits = build_predicate_splits(cfg)
+        if train_part not in splits:
             raise ValueError("Unsupported OV relation split: {}".format(cfg.OV_SETTING.TRAIN_PART))
 
         return torch.as_tensor(
-            active_indices_by_mode[cfg.OV_SETTING.TRAIN_PART],
+            splits[train_part],
             dtype=torch.long,
             device=self.pred_weight.device,
         )

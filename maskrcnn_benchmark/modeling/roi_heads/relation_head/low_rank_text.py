@@ -44,12 +44,6 @@ def build_full_predicate_names(cfg):
     return list(VG_PREDICATES)
 
 
-def build_split_indices(cfg, predicate_names):
-    if list(predicate_names) != VG_PREDICATES:
-        raise ValueError("Predicate names must follow the original VG predicate order.")
-    return build_predicate_splits(cfg)
-
-
 def load_relation_prompt_texts(prompt_json, predicate_names, field=CORE_PROMPT_FIELD):
     if not prompt_json:
         raise ValueError("LOW_RANK_TEXT.PROMPT_JSON must point to an LLM prompt JSON.")
