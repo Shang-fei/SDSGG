@@ -18,6 +18,8 @@ from .model_transformer import TransformerContext
 from .utils_relation import layer_init, get_box_info, get_box_pair_info
 from .low_rank_text import (
     CoreRelationTextAdapter,
+    VG_PREDICATE_ID,
+    build_predicate_splits,
     build_full_predicate_names,
     build_split_indices,
     load_relation_prompt_texts,
@@ -703,7 +705,13 @@ class LowRankClipPredictor(nn.Module):
         self.adaper_clip2 = MVA()
         self.obj_names = obj_classes
         self.train_predicate_names = rel_classes
-        self.predicate_names = statistics.get("global_rel_classes", build_full_predicate_names(config))
+        self.id_dict = VG_PREDICATE_ID
+        self.predicate_split_ids = build_predicate_splits(config)
+        self.base = self.predicate_split_ids["base"]
+        self.novel = self.predicate_split_ids["novel"]
+        self.semantic = self.predicate_split_ids["semantic"]
+        self.total = self.predicate_split_ids["total"]
+        self.predicate_names = build_full_predicate_names(config)
         self.predicate_to_low_rank_idx = {
             name: idx for idx, name in enumerate(self.predicate_names)
         }
@@ -974,7 +982,13 @@ class CorePromptClipPredictor(nn.Module):
         self.adaper_clip2 = MVA()
         self.obj_names = obj_classes
         self.train_predicate_names = rel_classes
-        self.predicate_names = statistics.get("global_rel_classes", build_full_predicate_names(config))
+        self.id_dict = VG_PREDICATE_ID
+        self.predicate_split_ids = build_predicate_splits(config)
+        self.base = self.predicate_split_ids["base"]
+        self.novel = self.predicate_split_ids["novel"]
+        self.semantic = self.predicate_split_ids["semantic"]
+        self.total = self.predicate_split_ids["total"]
+        self.predicate_names = build_full_predicate_names(config)
         self.active_indices_by_mode = build_split_indices(config, self.predicate_names)
         self.updata(config.OV_SETTING.TRAIN_PART)
         self._check_train_predicate_order()

@@ -16,33 +16,44 @@ VG_PREDICATES = [
     "playing", "riding", "says", "sitting on", "standing on", "to", "under", "using",
     "walking in", "walking on", "watching", "wearing", "wears", "with",
 ]
+VG_PREDICATE_ID = {name: idx for idx, name in enumerate(VG_PREDICATES)}
 
 CORE_PROMPT_FIELD = "core_prompt"
 
 
+def _predicate_ids(names):
+    missing = [name for name in names if name not in VG_PREDICATE_ID]
+    if missing:
+        raise KeyError("Unknown VG predicates: {}".format(missing))
+    return sorted(VG_PREDICATE_ID[name] for name in set(names))
+
+
+def build_predicate_splits(cfg):
+    base = [0] + _predicate_ids(cfg.OV_SETTING.PRDCS_BASE)
+    novel = [0] + _predicate_ids(cfg.OV_SETTING.PRDCS_NOVEL)
+    semantic = [0] + _predicate_ids(cfg.OV_SETTING.SEMAN)
+    total = [0] + sorted(set(base[1:] + novel[1:]))
+    return {
+        "base": base,
+        "novel": novel,
+        "semantic": semantic,
+        "total": total,
+    }
+
+
 def build_full_predicate_names(cfg):
-    predicate_names = ["__background__"]
-    allowed = set(cfg.OV_SETTING.PRDCS_BASE + cfg.OV_SETTING.PRDCS_NOVEL)
-    for name in VG_PREDICATES:
-        if name in allowed and name not in predicate_names:
-            predicate_names.append(name)
-    for name in cfg.OV_SETTING.PRDCS_BASE + cfg.OV_SETTING.PRDCS_NOVEL:
-        if name not in predicate_names:
-            predicate_names.append(name)
-    return predicate_names
+    return [VG_PREDICATES[idx] for idx in build_predicate_splits(cfg)["total"]]
 
 
 def build_split_indices(cfg, predicate_names):
-    def ids_for(names):
-        selected = set(names)
-        return [idx for idx, name in enumerate(predicate_names) if idx == 0 or name in selected]
-
-    return {
-        "base": ids_for(cfg.OV_SETTING.PRDCS_BASE),
-        "novel": ids_for(cfg.OV_SETTING.PRDCS_NOVEL),
-        "semantic": ids_for(cfg.OV_SETTING.SEMAN),
-        "total": list(range(len(predicate_names))),
+    name_to_idx = {name: idx for idx, name in enumerate(predicate_names)}
+    split_indices = {
+        mode: [name_to_idx[VG_PREDICATES[predicate_id]] for predicate_id in predicate_ids]
+        for mode, predicate_ids in build_predicate_splits(cfg).items()
+        if mode != "total"
     }
+    split_indices["total"] = list(range(len(predicate_names)))
+    return split_indices
 
 
 def load_relation_prompt_texts(prompt_json, predicate_names, field=CORE_PROMPT_FIELD):
