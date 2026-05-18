@@ -32,28 +32,22 @@ def build_predicate_splits(cfg):
     base = [0] + _predicate_ids(cfg.OV_SETTING.PRDCS_BASE)
     novel = [0] + _predicate_ids(cfg.OV_SETTING.PRDCS_NOVEL)
     semantic = [0] + _predicate_ids(cfg.OV_SETTING.SEMAN)
-    total = [0] + sorted(set(base[1:] + novel[1:]))
     return {
         "base": base,
         "novel": novel,
         "semantic": semantic,
-        "total": total,
+        "total": list(range(len(VG_PREDICATES))),
     }
 
 
 def build_full_predicate_names(cfg):
-    return [VG_PREDICATES[idx] for idx in build_predicate_splits(cfg)["total"]]
+    return list(VG_PREDICATES)
 
 
 def build_split_indices(cfg, predicate_names):
-    name_to_idx = {name: idx for idx, name in enumerate(predicate_names)}
-    split_indices = {
-        mode: [name_to_idx[VG_PREDICATES[predicate_id]] for predicate_id in predicate_ids]
-        for mode, predicate_ids in build_predicate_splits(cfg).items()
-        if mode != "total"
-    }
-    split_indices["total"] = list(range(len(predicate_names)))
-    return split_indices
+    if list(predicate_names) != VG_PREDICATES:
+        raise ValueError("Predicate names must follow the original VG predicate order.")
+    return build_predicate_splits(cfg)
 
 
 def load_relation_prompt_texts(prompt_json, predicate_names, field=CORE_PROMPT_FIELD):

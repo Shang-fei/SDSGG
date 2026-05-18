@@ -21,7 +21,6 @@ from .low_rank_text import (
     VG_PREDICATE_ID,
     build_predicate_splits,
     build_full_predicate_names,
-    build_split_indices,
     load_relation_prompt_texts,
 )
 from maskrcnn_benchmark.data import get_dataset_statistics
@@ -712,10 +711,6 @@ class LowRankClipPredictor(nn.Module):
         self.semantic = self.predicate_split_ids["semantic"]
         self.total = self.predicate_split_ids["total"]
         self.predicate_names = build_full_predicate_names(config)
-        self.predicate_to_low_rank_idx = {
-            name: idx for idx, name in enumerate(self.predicate_names)
-        }
-        self.active_indices_by_mode = build_split_indices(config, self.predicate_names)
         self.register_buffer(
             "predicate_log_prior",
             self._build_predicate_log_prior(statistics),
@@ -762,7 +757,7 @@ class LowRankClipPredictor(nn.Module):
         if fg_matrix is not None and len(rel_classes) == fg_matrix.size(-1):
             rel_counts = fg_matrix.float().sum(dim=(0, 1))
             for src_idx, name in enumerate(rel_classes):
-                dst_idx = self.predicate_to_low_rank_idx.get(name)
+                dst_idx = self.id_dict.get(name)
                 if dst_idx is not None and dst_idx > 0:
                     counts[dst_idx] = rel_counts[src_idx].clamp_min(1.0)
 
@@ -774,16 +769,16 @@ class LowRankClipPredictor(nn.Module):
 
     def updata(self, mode):
         print("now is " + mode)
-        if mode not in self.active_indices_by_mode:
+        if mode not in ("base", "novel", "semantic", "total"):
             raise ValueError("Unsupported OV relation split: {}".format(mode))
         self.mode = mode
         self.active_predicate_indices = torch.as_tensor(
-            self.active_indices_by_mode[mode], device=self.device, dtype=torch.long
+            getattr(self, mode), device=self.device, dtype=torch.long
         )
 
     def _check_train_predicate_order(self):
         active_names = [
-            self.predicate_names[idx] for idx in self.active_indices_by_mode[self.mode]
+            self.predicate_names[idx] for idx in self.active_predicate_indices.tolist()
         ]
         if active_names != self.train_predicate_names:
             raise ValueError(
@@ -989,7 +984,6 @@ class CorePromptClipPredictor(nn.Module):
         self.semantic = self.predicate_split_ids["semantic"]
         self.total = self.predicate_split_ids["total"]
         self.predicate_names = build_full_predicate_names(config)
-        self.active_indices_by_mode = build_split_indices(config, self.predicate_names)
         self.updata(config.OV_SETTING.TRAIN_PART)
         self._check_train_predicate_order()
 
@@ -1017,16 +1011,16 @@ class CorePromptClipPredictor(nn.Module):
 
     def updata(self, mode):
         print("now is " + mode)
-        if mode not in self.active_indices_by_mode:
+        if mode not in ("base", "novel", "semantic", "total"):
             raise ValueError("Unsupported OV relation split: {}".format(mode))
         self.mode = mode
         self.active_predicate_indices = torch.as_tensor(
-            self.active_indices_by_mode[mode], device=self.device, dtype=torch.long
+            getattr(self, mode), device=self.device, dtype=torch.long
         )
 
     def _check_train_predicate_order(self):
         active_names = [
-            self.predicate_names[idx] for idx in self.active_indices_by_mode[self.mode]
+            self.predicate_names[idx] for idx in self.active_predicate_indices.tolist()
         ]
         if active_names != self.train_predicate_names:
             raise ValueError(
