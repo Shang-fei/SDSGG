@@ -769,7 +769,7 @@ class LowRankClipPredictor(nn.Module):
         if mode not in self.active_indices_by_mode:
             raise ValueError("Unsupported OV relation split: {}".format(mode))
         self.mode = mode
-        self.active_low_rank_indices = torch.as_tensor(
+        self.active_predicate_indices = torch.as_tensor(
             self.active_indices_by_mode[mode], device=self.device, dtype=torch.long
         )
 
@@ -797,7 +797,7 @@ class LowRankClipPredictor(nn.Module):
     def _format_predicate_hist(self, indices, counts, max_items=5):
         items = []
         for idx, count in zip(indices[:max_items].tolist(), counts[:max_items].tolist()):
-            global_idx = self.active_low_rank_indices[idx].item()
+            global_idx = self.active_predicate_indices[idx].item()
             name = self.predicate_names[global_idx]
             items.append("{}:{}".format(name, int(count)))
         return ",".join(items)
@@ -810,7 +810,7 @@ class LowRankClipPredictor(nn.Module):
         with torch.no_grad():
             stats = self.relation_text_adapter.debug_stats()
             weight_stats = self.relation_text_adapter.weight_usage_stats(
-                self.active_low_rank_indices,
+                self.active_predicate_indices,
             )
             basis_std = basis_logits.float().std()
             basis_abs = basis_logits.float().abs().mean()
@@ -930,10 +930,10 @@ class LowRankClipPredictor(nn.Module):
             pair_features = torch.cat(pair_features, dim=0)
             logits, basis_logits = self.relation_text_adapter.logits(
                 pair_features,
-                self.active_low_rank_indices,
+                self.active_predicate_indices,
             )
             if self.low_rank_cfg.LOGIT_ADJUSTMENT_TAU > 0:
-                log_prior = self.predicate_log_prior[self.active_low_rank_indices].to(logits.device)
+                log_prior = self.predicate_log_prior[self.active_predicate_indices].to(logits.device)
                 logits = logits - self.low_rank_cfg.LOGIT_ADJUSTMENT_TAU * log_prior.view(1, -1)
             rel_dists.append(logits)
             basis_logit_list.append(basis_logits)
@@ -950,6 +950,205 @@ class LowRankClipPredictor(nn.Module):
             add_losses.update(self.relation_text_adapter.losses())
         return obj_dists, tuple(rel_dists), add_losses
 
+
+
+@registry.ROI_RELATION_PREDICTOR.register("CorePromptClipPredictor")
+class CorePromptClipPredictor(nn.Module):
+    def __init__(self, config, in_channels):
+        super(CorePromptClipPredictor, self).__init__()
+        self.attribute_on = config.MODEL.ATTRIBUTE_ON
+        self.num_obj_cls = config.MODEL.ROI_BOX_HEAD.NUM_CLASSES
+        self.num_att_cls = config.MODEL.ROI_ATTRIBUTE_HEAD.NUM_ATTRIBUTES
+        self.num_rel_cls = config.MODEL.ROI_RELATION_HEAD.NUM_CLASSES
+        self.device = config.MODEL.DEVICE
+        self.prompt_cfg = config.MODEL.ROI_RELATION_HEAD.LOW_RANK_TEXT
+        self.debug_step = 0
+
+        statistics = get_dataset_statistics(config)
+        obj_classes = statistics["obj_classes"]
+        rel_classes = statistics["rel_classes"]
+
+        self.clip_model, self.clip_preprocess = clip.load("ViT-B/32", device=self.device)
+        self.context_layer = TransformerContext(config, obj_classes, rel_classes, in_channels)
+        self.adaper_clip1 = MVA()
+        self.adaper_clip2 = MVA()
+        self.obj_names = obj_classes
+        self.train_predicate_names = rel_classes
+        self.predicate_names = statistics.get("global_rel_classes", build_full_predicate_names(config))
+        self.active_indices_by_mode = build_split_indices(config, self.predicate_names)
+        self.updata(config.OV_SETTING.TRAIN_PART)
+        self._check_train_predicate_order()
+
+        with torch.no_grad():
+            relation_text_features = self._encode_relation_texts()
+            text3 = clip.tokenize(["a photo of subject " for _ in self.obj_names]).to(self.device)
+            self.text_features3 = self.clip_model.encode_text(text3)
+            text4 = clip.tokenize(["a photo of object " for _ in self.obj_names]).to(self.device)
+            self.text_features4 = self.clip_model.encode_text(text4)
+
+        self.register_buffer("relation_text_features", relation_text_features)
+        self.logit_temperature = self.prompt_cfg.CLASSIFIER_TEMPERATURE
+
+    def _encode_relation_texts(self):
+        relation_texts = load_relation_prompt_texts(
+            self.prompt_cfg.PROMPT_JSON,
+            self.predicate_names,
+            self.prompt_cfg.PROMPT_FIELD,
+        )
+        text_tokens = clip.tokenize(relation_texts).to(self.device)
+        text_features = self.clip_model.encode_text(text_tokens)
+        text_features = F.normalize(text_features.float(), dim=-1)
+        text_features[0].zero_()
+        return text_features
+
+    def updata(self, mode):
+        print("now is " + mode)
+        if mode not in self.active_indices_by_mode:
+            raise ValueError("Unsupported OV relation split: {}".format(mode))
+        self.mode = mode
+        self.active_predicate_indices = torch.as_tensor(
+            self.active_indices_by_mode[mode], device=self.device, dtype=torch.long
+        )
+
+    def _check_train_predicate_order(self):
+        active_names = [
+            self.predicate_names[idx] for idx in self.active_indices_by_mode[self.mode]
+        ]
+        if active_names != self.train_predicate_names:
+            raise ValueError(
+                "Core-prompt active predicate order does not match dataset labels. "
+                "active={} dataset={}".format(active_names, self.train_predicate_names)
+            )
+
+    def _encode_object_crops(self, proposal, image):
+        image_tensor = []
+        for box in proposal.bbox:
+            crop = crop_and_resize(image.unsqueeze(0), box, box)
+            crop = crop[0].permute(1, 2, 0).detach().cpu().numpy() * 255
+            crop = Image.fromarray(np.uint8(crop))
+            crop = self.clip_preprocess(crop).unsqueeze(0).to(self.device)
+            image_tensor.append(crop)
+        image_tensor = torch.cat(image_tensor)
+        return self.clip_model.encode_image(image_tensor)
+
+    def _format_predicate_hist(self, indices, counts, max_items=5):
+        items = []
+        for idx, count in zip(indices[:max_items].tolist(), counts[:max_items].tolist()):
+            global_idx = self.active_predicate_indices[idx].item()
+            name = self.predicate_names[global_idx]
+            items.append("{}:{}".format(name, int(count)))
+        return ",".join(items)
+
+    def _log_core_prompt_debug(self, relation_logits, labels, logger):
+        interval = int(self.prompt_cfg.DEBUG_INTERVAL)
+        if interval <= 0 or self.debug_step % interval != 0 or not is_main_process():
+            return
+
+        with torch.no_grad():
+            logit_std = relation_logits.float().std()
+            logit_abs = relation_logits.float().abs().mean()
+            text_features = self.relation_text_features[self.active_predicate_indices].float()
+            text_sim = F.normalize(text_features[1:], dim=-1) @ F.normalize(text_features[1:], dim=-1).t()
+            if text_sim.numel() > 0:
+                text_sim = text_sim - torch.eye(text_sim.size(0), device=text_sim.device).type_as(text_sim)
+                text_offdiag = text_sim.abs().sum() / text_sim.numel()
+            else:
+                text_offdiag = relation_logits.sum() * 0
+
+            parts = ["CorePromptDebug step={}".format(self.debug_step)]
+            parts.append("logit_abs={:.4f}".format(logit_abs.item()))
+            parts.append("logit_std={:.4f}".format(logit_std.item()))
+            parts.append("text_offdiag_abs={:.4f}".format(text_offdiag.item()))
+
+            if labels is not None and labels.numel() > 0:
+                pred_labels = relation_logits[:, 1:].argmax(dim=1) + 1
+                valid_gt = labels.long() > 0
+                parts.append("fg_count={}".format(int(valid_gt.sum().item())))
+                parts.append("bg_count={}".format(int((~valid_gt).sum().item())))
+                if valid_gt.any():
+                    gt_labels = labels.long()[valid_gt]
+                    fg_pred_labels = pred_labels[valid_gt]
+                    fg_pred_counts = torch.bincount(
+                        fg_pred_labels,
+                        minlength=relation_logits.size(1),
+                    )
+                    fg_pred_counts_no_bg = fg_pred_counts[1:]
+                    fg_pred_top_counts, fg_pred_top_idx = fg_pred_counts_no_bg.sort(descending=True)
+                    fg_pred_top_idx = fg_pred_top_idx + 1
+                    fg_pred_dist = fg_pred_counts.float() / fg_pred_counts.sum().clamp_min(1).float()
+                    fg_pred_entropy = -(
+                        fg_pred_dist[fg_pred_dist > 0] * fg_pred_dist[fg_pred_dist > 0].log()
+                    ).sum()
+                    parts.append("fg_pred_unique={}".format(int((fg_pred_counts_no_bg > 0).sum().item())))
+                    parts.append("fg_pred_entropy={:.4f}".format(fg_pred_entropy.item()))
+                    parts.append("fg_top_pred={}".format(self._format_predicate_hist(fg_pred_top_idx, fg_pred_top_counts)))
+
+                    gt_counts = torch.bincount(gt_labels, minlength=relation_logits.size(1))
+                    gt_counts_no_bg = gt_counts[1:]
+                    gt_top_counts, gt_top_idx = gt_counts_no_bg.sort(descending=True)
+                    gt_top_idx = gt_top_idx + 1
+                    parts.append("gt_unique={}".format(int((gt_counts_no_bg > 0).sum().item())))
+                    parts.append("top_gt={}".format(self._format_predicate_hist(gt_top_idx, gt_top_counts)))
+
+        message = " | ".join(parts)
+        if logger is not None:
+            logger.info(message)
+        else:
+            print(message)
+
+    def forward(self, proposals, rel_pair_idxs, rel_labels, rel_binarys, roi_features, union_features, logger=None, img=None):
+        if self.attribute_on:
+            obj_dists, obj_preds, att_dists, edge_ctx = self.context_layer(roi_features, proposals, logger)
+        else:
+            obj_dists, obj_preds, edge_ctx = self.context_layer(roi_features, proposals, logger)
+
+        num_rels = [r.shape[0] for r in rel_pair_idxs]
+        num_objs = [len(b) for b in proposals]
+        assert len(num_rels) == len(num_objs)
+        obj_preds = obj_preds.split(num_objs, dim=0)
+
+        rel_dists = []
+        active_text_features = self.relation_text_features[self.active_predicate_indices].float()
+        active_text_features = F.normalize(active_text_features, dim=-1)
+        for i in range(len(num_rels)):
+            with torch.no_grad():
+                image_features = self._encode_object_crops(proposals[i], img[i])
+
+            pair_idxs = rel_pair_idxs[i]
+            pair_features = []
+            for rel_index in pair_idxs:
+                obj_n1 = obj_preds[i][rel_index[0]]
+                obj_n2 = obj_preds[i][rel_index[1]]
+
+                text_sub = self.text_features3[obj_n1]
+                text_obj = self.text_features4[obj_n2]
+                cross_output1 = self.adaper_clip1(
+                    image_features[rel_index[0]].unsqueeze(0),
+                    image_features[rel_index[1]].unsqueeze(0),
+                    text_sub,
+                )
+                cross_output2 = self.adaper_clip2(
+                    image_features[rel_index[1]].unsqueeze(0),
+                    image_features[rel_index[0]].unsqueeze(0),
+                    text_obj,
+                )
+                pair_feature = F.normalize((cross_output1 + cross_output2) / 2, dim=-1)
+                pair_features.append(pair_feature)
+
+            pair_features = torch.cat(pair_features, dim=0)
+            logits = pair_features.float() @ active_text_features.t()
+            logits = logits / self.logit_temperature
+            rel_dists.append(logits)
+
+        obj_dists = obj_dists.split(num_objs, dim=0)
+        add_losses = {}
+        if self.training:
+            self.debug_step += 1
+            relation_logits = torch.cat(rel_dists, dim=0) if rel_dists else None
+            labels = cat(rel_labels, dim=0) if rel_labels is not None else None
+            if relation_logits is not None:
+                self._log_core_prompt_debug(relation_logits, labels, logger)
+        return obj_dists, tuple(rel_dists), add_losses
 
 
 def make_roi_relation_predictor(cfg, in_channels):

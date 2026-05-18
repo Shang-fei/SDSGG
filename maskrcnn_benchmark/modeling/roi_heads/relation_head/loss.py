@@ -77,8 +77,8 @@ class RelationLossComputation(object):
         self.use_low_rank_text = (
             cfg is not None
             and (
-                cfg.MODEL.ROI_RELATION_HEAD.LOW_RANK_TEXT.ENABLED
-                or cfg.MODEL.ROI_RELATION_HEAD.PREDICTOR == "LowRankClipPredictor"
+                cfg.MODEL.ROI_RELATION_HEAD.PREDICTOR == "LowRankClipPredictor"
+                or cfg.MODEL.ROI_RELATION_HEAD.PREDICTOR == "CorePromptClipPredictor"
             )
         )
         self.low_rank_pred_weight = None

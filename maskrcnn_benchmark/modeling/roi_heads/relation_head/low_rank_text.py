@@ -113,10 +113,18 @@ class CoreRelationTextAdapter(nn.Module):
         visual_features = F.normalize(visual_features.float(), dim=-1)
         return visual_features @ basis.t()
 
+    def active_classifier(self, active_indices):
+        classifier = self.decomposer.classifier_features()[active_indices].float()
+        if active_indices.numel() > 0 and active_indices[0].item() == 0:
+            classifier = classifier.clone()
+            classifier[0].zero_()
+        return F.normalize(classifier, dim=-1)
+
     def logits(self, visual_features, active_indices):
         basis_logits = self.basis_logits(visual_features)
-        weights = self.active_class_weights(active_indices)
-        logits = basis_logits @ weights.t()
+        visual_features = F.normalize(visual_features.float(), dim=-1)
+        classifier = self.active_classifier(active_indices)
+        logits = visual_features @ classifier.t()
         return logits / self.logit_temperature, basis_logits
 
     def losses(self):
