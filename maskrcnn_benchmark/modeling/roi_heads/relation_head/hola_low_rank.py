@@ -4,27 +4,30 @@ from torch.nn import functional as F
 
 
 def init_hola_low_rank_with_pca(text_features, rank):
-    try:
-        from sklearn.decomposition import PCA
-    except ImportError:
-        raise ImportError(
-            "HOLa low-rank decomposition uses sklearn.decomposition.PCA. "
-            "Please install scikit-learn in the training environment."
-        )
+    from sklearn.decomposition import PCA
 
-    temp_text = text_features.t().cpu().numpy()
+    # F: [N, d]
+    F_np = text_features.detach().cpu().float().numpy()
+
     if isinstance(rank, float) and rank <= 1:
         n_components = rank
     else:
-        n_components = min(int(rank), min(temp_text.shape[0], temp_text.shape[1]))
+        n_components = min(int(rank), min(F_np.shape[0], F_np.shape[1]))
         n_components = max(1, n_components)
 
     pca = PCA(n_components=n_components)
-    pca.fit(temp_text)
-    basis = torch.tensor(pca.transform(temp_text).T).type_as(text_features)
-    basis = F.normalize(basis, dim=-1)
-    weights = torch.tensor(pca.components_.T).type_as(text_features)
-    return basis, weights
+
+    # W: [N, m]
+    W = pca.fit_transform(F_np) # (N, m)
+    B = pca.components_         # (m, d)
+
+    W = torch.tensor(W, device=text_features.device, dtype=text_features.dtype)
+    B = torch.tensor(B, device=text_features.device, dtype=text_features.dtype)
+
+    # normalize each basis vector b_i
+    B = F.normalize(B, dim=-1)
+
+    return B, W
 
 
 class HOLaLowRankDecomposer(nn.Module):
