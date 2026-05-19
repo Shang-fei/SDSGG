@@ -118,10 +118,10 @@ class HOLaLowRankDecomposer(nn.Module):
         with torch.no_grad():
             reconstructed = self.reconstruct().float()
             original = self.original_text_features.float().to(reconstructed.device)
-            if reconstructed.size(0) > 1:
+            if reconstructed.size(0) > 0:
                 recon_cos = F.cosine_similarity(
-                    F.normalize(reconstructed[1:], dim=-1),
-                    F.normalize(original[1:], dim=-1),
+                    F.normalize(reconstructed, dim=-1),
+                    F.normalize(original, dim=-1),
                     dim=-1,
                 ).mean()
             else:

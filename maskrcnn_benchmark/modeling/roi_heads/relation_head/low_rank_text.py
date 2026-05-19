@@ -92,14 +92,11 @@ class CoreRelationTextAdapter(nn.Module):
         )
         self.logit_temperature = logit_temperature
 
-    def active_class_weights(self, active_indices, normalize=False):
+    def active_class_weights(self, active_fg_indices, normalize=False):
         weights = self.decomposer.class_weights
         if self.decomposer.train_mode in ("b", "none"):
             weights = weights.detach()
-        weights = weights[active_indices].float()
-        if active_indices.numel() > 0 and active_indices[0].item() == 0:
-            weights = weights.clone()
-            weights[0].zero_()
+        weights = weights[active_fg_indices].float()
         if normalize:
             weights = F.normalize(weights, dim=-1)
         return weights
@@ -111,14 +108,14 @@ class CoreRelationTextAdapter(nn.Module):
         basis = F.normalize(basis.float(), dim=-1)
         return visual_features @ basis.t()
 
-    def active_classifier(self, active_indices):
-        classifier = self.decomposer.classifier_features()[active_indices].float()
+    def active_classifier(self, active_fg_indices):
+        classifier = self.decomposer.classifier_features()[active_fg_indices].float()
         return F.normalize(classifier, dim=-1)
 
-    def logits(self, visual_features, active_indices):
+    def logits(self, visual_features, active_fg_indices):
         visual_features = F.normalize(visual_features.float(), dim=-1)
         basis_logits = self.basis_logits(visual_features)
-        classifier = self.active_classifier(active_indices)
+        classifier = self.active_classifier(active_fg_indices)
         logits = visual_features @ classifier.t()
         return logits / self.logit_temperature, basis_logits
 
@@ -138,11 +135,9 @@ class CoreRelationTextAdapter(nn.Module):
     def debug_stats(self):
         return self.decomposer.debug_stats()
 
-    def weight_usage_stats(self, active_indices, threshold=0.05):
+    def weight_usage_stats(self, active_fg_indices, threshold=0.05):
         with torch.no_grad():
-            weights = self.active_class_weights(active_indices).float()
-            if weights.size(0) > 1:
-                weights = weights[1:]
+            weights = self.active_class_weights(active_fg_indices).float()
             abs_weights = weights.abs()
             active = (abs_weights > threshold).float().sum(dim=1)
             total = abs_weights.sum(dim=1).clamp_min(1e-6)

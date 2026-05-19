@@ -702,6 +702,8 @@ class LowRankClipPredictor(nn.Module):
         self.context_layer = TransformerContext(config, obj_classes, rel_classes, in_channels)
         self.adaper_clip1 = MVA()
         self.adaper_clip2 = MVA()
+        self.obj_names = obj_classes
+        self.train_predicate_names = rel_classes
 
         self.id_dict = VG_PREDICATE_ID
         self.predicate_split_ids = build_predicate_splits(config)
@@ -715,7 +717,7 @@ class LowRankClipPredictor(nn.Module):
             self._build_predicate_log_prior(statistics),
         )
         self.updata(config.OV_SETTING.TRAIN_PART)
-        assert rel_classes == self.predicate_names[self.active_predicate_indices]
+        self._check_train_predicate_order()
 
         with torch.no_grad():
             relation_text_features = self._encode_relation_texts()
@@ -773,6 +775,18 @@ class LowRankClipPredictor(nn.Module):
         self.active_predicate_indices = torch.as_tensor(
             getattr(self, mode), device=self.device, dtype=torch.long
         )
+        self.active_fg_predicate_indices = self.active_predicate_indices[1:] - 1
+
+    def _check_train_predicate_order(self):
+        active_indices = self.active_predicate_indices.detach().cpu().tolist()
+        active_names = [
+            self.predicate_names[idx] for idx in active_indices
+        ]
+        if active_names != self.train_predicate_names:
+            raise ValueError(
+                "Low-rank active predicate order does not match dataset labels. "
+                "active={} dataset={}".format(active_names, self.train_predicate_names)
+            )
 
     def _encode_object_crops(self, proposal, image):
         image_tensor = []
@@ -801,7 +815,7 @@ class LowRankClipPredictor(nn.Module):
         with torch.no_grad():
             stats = self.relation_text_adapter.debug_stats()
             weight_stats = self.relation_text_adapter.weight_usage_stats(
-                self.active_predicate_indices,
+                self.active_fg_predicate_indices,
             )
             basis_std = basis_logits.float().std()
             basis_abs = basis_logits.float().abs().mean()
@@ -921,8 +935,10 @@ class LowRankClipPredictor(nn.Module):
             pair_features = torch.cat(pair_features, dim=0)
             logits, basis_logits = self.relation_text_adapter.logits(
                 pair_features,
-                self.active_predicate_indices,
+                self.active_fg_predicate_indices,
             )
+            bg_logits = logits.new_zeros((logits.size(0), 1))
+            logits = torch.cat((bg_logits, logits), dim=1)
             if self.low_rank_cfg.LOGIT_ADJUSTMENT_TAU > 0:
                 log_prior = self.predicate_log_prior[self.active_predicate_indices].to(logits.device)
                 logits = logits - self.low_rank_cfg.LOGIT_ADJUSTMENT_TAU * log_prior.view(1, -1)
@@ -994,7 +1010,6 @@ class CorePromptClipPredictor(nn.Module):
         text_tokens = clip.tokenize(relation_texts).to(self.device)
         text_features = self.clip_model.encode_text(text_tokens)
         text_features = F.normalize(text_features.float(), dim=-1)
-        text_features[0].zero_()
         return text_features
 
     def updata(self, mode):
@@ -1005,6 +1020,7 @@ class CorePromptClipPredictor(nn.Module):
         self.active_predicate_indices = torch.as_tensor(
             getattr(self, mode), device=self.device, dtype=torch.long
         )
+        self.active_fg_predicate_indices = self.active_predicate_indices[1:] - 1
 
     def _check_train_predicate_order(self):
         active_indices = self.active_predicate_indices.detach().cpu().tolist()
@@ -1044,8 +1060,8 @@ class CorePromptClipPredictor(nn.Module):
         with torch.no_grad():
             logit_std = relation_logits.float().std()
             logit_abs = relation_logits.float().abs().mean()
-            text_features = self.relation_text_features[self.active_predicate_indices].float()
-            text_sim = F.normalize(text_features[1:], dim=-1) @ F.normalize(text_features[1:], dim=-1).t()
+            text_features = self.relation_text_features[self.active_fg_predicate_indices].float()
+            text_sim = F.normalize(text_features, dim=-1) @ F.normalize(text_features, dim=-1).t()
             if text_sim.numel() > 0:
                 text_sim = text_sim - torch.eye(text_sim.size(0), device=text_sim.device).type_as(text_sim)
                 text_offdiag = text_sim.abs().sum() / text_sim.numel()
@@ -1105,7 +1121,7 @@ class CorePromptClipPredictor(nn.Module):
         obj_preds = obj_preds.split(num_objs, dim=0)
 
         rel_dists = []
-        active_text_features = self.relation_text_features[self.active_predicate_indices].float()
+        active_text_features = self.relation_text_features[self.active_fg_predicate_indices].float()
         active_text_features = F.normalize(active_text_features, dim=-1)
         for i in range(len(num_rels)):
             with torch.no_grad():
@@ -1135,6 +1151,8 @@ class CorePromptClipPredictor(nn.Module):
             pair_features = torch.cat(pair_features, dim=0)
             logits = pair_features.float() @ active_text_features.t()
             logits = logits / self.logit_temperature
+            bg_logits = logits.new_zeros((logits.size(0), 1))
+            logits = torch.cat((bg_logits, logits), dim=1)
             rel_dists.append(logits)
 
         obj_dists = obj_dists.split(num_objs, dim=0)
