@@ -143,8 +143,19 @@ class RelationLossComputation(object):
         valid = labels > 0
         if valid.sum().item() == 0:
             return logits.sum() * 0
-        logits = logits[valid]
-        labels = labels[valid]
+        # SDSGG's original relation loss only supervises foreground relation pairs.
+        # Keep the background column for inference output, but exclude it from
+        # the low-rank predicate classification loss.
+        logits = logits[valid, 1:]
+        labels = labels[valid] - 1
+        pred_weight = pred_weight[1:]
+
+        if labels.numel() > 0 and labels.max().item() >= logits.size(1):
+            raise ValueError(
+                "Relation label {} is out of range for {} foreground logits.".format(
+                    labels.max().item() + 1, logits.size(1)
+                )
+            )
 
         log_probs = F.log_softmax(logits, dim=-1)
         target_log_probs = log_probs.gather(1, labels.view(-1, 1)).squeeze(1)
