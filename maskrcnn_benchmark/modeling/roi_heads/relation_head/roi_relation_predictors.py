@@ -702,8 +702,7 @@ class LowRankClipPredictor(nn.Module):
         self.context_layer = TransformerContext(config, obj_classes, rel_classes, in_channels)
         self.adaper_clip1 = MVA()
         self.adaper_clip2 = MVA()
-        self.obj_names = obj_classes
-        self.train_predicate_names = rel_classes
+
         self.id_dict = VG_PREDICATE_ID
         self.predicate_split_ids = build_predicate_splits(config)
         self.base = self.predicate_split_ids["base"]
@@ -716,7 +715,7 @@ class LowRankClipPredictor(nn.Module):
             self._build_predicate_log_prior(statistics),
         )
         self.updata(config.OV_SETTING.TRAIN_PART)
-        self._check_train_predicate_order()
+        assert rel_classes == self.predicate_names[self.active_predicate_indices]
 
         with torch.no_grad():
             relation_text_features = self._encode_relation_texts()
@@ -747,7 +746,6 @@ class LowRankClipPredictor(nn.Module):
         text_tokens = clip.tokenize(relation_texts).to(self.device)
         text_features = self.clip_model.encode_text(text_tokens)
         text_features = F.normalize(text_features, dim=-1)
-        text_features[0].zero_()
         return text_features
 
     def _build_predicate_log_prior(self, statistics):
@@ -775,17 +773,6 @@ class LowRankClipPredictor(nn.Module):
         self.active_predicate_indices = torch.as_tensor(
             getattr(self, mode), device=self.device, dtype=torch.long
         )
-
-    def _check_train_predicate_order(self):
-        active_indices = self.active_predicate_indices.detach().cpu().tolist()
-        active_names = [
-            self.predicate_names[idx] for idx in active_indices
-        ]
-        if active_names != self.train_predicate_names:
-            raise ValueError(
-                "Low-rank active predicate order does not match dataset labels. "
-                "active={} dataset={}".format(active_names, self.train_predicate_names)
-            )
 
     def _encode_object_crops(self, proposal, image):
         image_tensor = []

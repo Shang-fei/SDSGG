@@ -49,16 +49,10 @@ class HOLaLowRankDecomposer(nn.Module):
         sparsity_weight=0.1,
         basis_decorr_weight=0.001,
         weight_decorr_weight=0.001,
-        zero_background=True,
     ):
         super(HOLaLowRankDecomposer, self).__init__()
         if train_mode not in ("w", "b", "both", "none"):
             raise ValueError("Unsupported HOLa train_mode: {}".format(train_mode))
-
-        text_features = F.normalize(text_features.detach().float(), dim=-1)
-        if zero_background and text_features.size(0) > 0:
-            text_features = text_features.clone()
-            text_features[0].zero_()
 
         if init_method == "pca":
             basis, weights = init_hola_low_rank_with_pca(text_features, rank)
@@ -77,21 +71,14 @@ class HOLaLowRankDecomposer(nn.Module):
         self.register_buffer("original_text_features", text_features)
 
         self.train_mode = train_mode
-        self.zero_background = zero_background
         self.recon_loss_weight = recon_loss_weight
         self.sparsity_weight = sparsity_weight
         self.basis_decorr_weight = basis_decorr_weight
         self.weight_decorr_weight = weight_decorr_weight
         self.recon_loss = nn.MSELoss(reduction="sum")
 
-    def _maybe_zero_background(self, features):
-        if self.zero_background and features.size(0) > 0:
-            features = features.clone()
-            features[0].zero_()
-        return features
-
     def reconstruct(self):
-        return self._maybe_zero_background(self.class_weights @ self.basis_feat)
+        return self.class_weights @ self.basis_feat
 
     def classifier_features(self):
         weights = self.class_weights
@@ -103,13 +90,7 @@ class HOLaLowRankDecomposer(nn.Module):
         elif self.train_mode == "none":
             weights = weights.detach()
             basis = basis.detach()
-        return self._maybe_zero_background(weights @ basis)
-
-    def active_classifier(self, active_indices, normalize=True):
-        features = self.classifier_features()[active_indices]
-        if normalize:
-            features = F.normalize(features, dim=-1)
-        return features
+        return weights @ basis
 
     def losses(self):
         losses = {}
