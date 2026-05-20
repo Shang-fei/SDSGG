@@ -74,8 +74,6 @@ class CoreRelationTextAdapter(nn.Module):
         sparsity_weight=0.1,
         basis_decorr_weight=0.001,
         weight_decorr_weight=0.001,
-        basis_anchor_weight=0.0,
-        basis_semantic_weight=0.0,
         train_basis=True,
         train_mode="w",
         logit_temperature=0.05,
@@ -91,8 +89,6 @@ class CoreRelationTextAdapter(nn.Module):
             sparsity_weight=sparsity_weight,
             basis_decorr_weight=basis_decorr_weight,
             weight_decorr_weight=weight_decorr_weight,
-            basis_anchor_weight=basis_anchor_weight,
-            basis_semantic_weight=basis_semantic_weight,
         )
         self.logit_temperature = logit_temperature
 
@@ -134,10 +130,6 @@ class CoreRelationTextAdapter(nn.Module):
             losses["loss_w_unique"] = factor_losses["weight_decorr"]
         if "basis_decorr" in factor_losses:
             losses["disentangle_basis"] = factor_losses["basis_decorr"]
-        if "basis_anchor" in factor_losses:
-            losses["loss_basis_anchor"] = factor_losses["basis_anchor"]
-        if "basis_semantic" in factor_losses:
-            losses["loss_basis_semantic"] = factor_losses["basis_semantic"]
         return losses
 
     def debug_stats(self):

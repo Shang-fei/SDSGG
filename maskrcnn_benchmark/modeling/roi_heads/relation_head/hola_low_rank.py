@@ -32,38 +32,6 @@ def init_hola_low_rank_with_pca(text_features, rank):
     return B, W, mean
 
 
-def init_hola_low_rank_with_semantic_bases(text_features, rank):
-    # Select actual predicate text features as basis prototypes, so each basis
-    # stays in the same semantic space as the CLIP predicate classifier.
-    num_classes = text_features.size(0)
-    if isinstance(rank, float) and rank <= 1:
-        num_basis = int(torch.ceil(torch.as_tensor(rank * num_classes)).item())
-    else:
-        num_basis = int(rank)
-    num_basis = min(max(1, num_basis), num_classes)
-    normalized = F.normalize(text_features.float(), dim=-1)
-
-    if num_basis >= num_classes:
-        selected = torch.arange(num_classes, device=text_features.device)
-    else:
-        center = F.normalize(normalized.mean(0, keepdim=True), dim=-1)
-        selected = [torch.argmax((normalized @ center.t()).squeeze(-1)).item()]
-        min_distance = 1 - (normalized @ normalized[selected[-1]].unsqueeze(-1)).squeeze(-1)
-        for _ in range(1, num_basis):
-            next_index = torch.argmax(min_distance).item()
-            selected.append(next_index)
-            distance = 1 - (normalized @ normalized[next_index].unsqueeze(-1)).squeeze(-1)
-            min_distance = torch.minimum(min_distance, distance)
-        selected = torch.as_tensor(selected, device=text_features.device, dtype=torch.long)
-
-    B = F.normalize(text_features[selected], dim=-1)
-    mean = text_features.mean(0)
-    residual = text_features - mean.unsqueeze(0)
-    W = residual.float() @ torch.pinverse(B.float())
-
-    return B.type_as(text_features), W.type_as(text_features), mean.type_as(text_features)
-
-
 class HOLaLowRankDecomposer(nn.Module):
     """HOLa-style low-rank text feature decomposition.
 
@@ -83,8 +51,6 @@ class HOLaLowRankDecomposer(nn.Module):
         sparsity_weight=0.1,
         basis_decorr_weight=0.001,
         weight_decorr_weight=0.001,
-        basis_anchor_weight=0.0,
-        basis_semantic_weight=0.0,
     ):
         super(HOLaLowRankDecomposer, self).__init__()
         if train_mode not in ("w", "b", "both", "none"):
@@ -92,8 +58,6 @@ class HOLaLowRankDecomposer(nn.Module):
 
         if init_method == "pca":
             basis, weights, text_mean = init_hola_low_rank_with_pca(text_features, rank)
-        elif init_method == "semantic":
-            basis, weights, text_mean = init_hola_low_rank_with_semantic_bases(text_features, rank)
         elif init_method == "random":
             basis = torch.randn(int(rank), text_features.size(-1)).type_as(text_features)
             basis = F.normalize(basis, dim=-1)
@@ -110,15 +74,12 @@ class HOLaLowRankDecomposer(nn.Module):
             self.register_buffer("basis_feat", basis)
         self.register_buffer("original_text_features", text_features)
         self.register_buffer("text_mean", text_mean)
-        self.register_buffer("initial_basis_feat", basis.detach().clone())
 
         self.train_mode = train_mode
         self.recon_loss_weight = recon_loss_weight
         self.sparsity_weight = sparsity_weight
         self.basis_decorr_weight = basis_decorr_weight
         self.weight_decorr_weight = weight_decorr_weight
-        self.basis_anchor_weight = basis_anchor_weight
-        self.basis_semantic_weight = basis_semantic_weight
         self.recon_loss = nn.MSELoss(reduction="sum")
 
     def reconstruct(self):
@@ -156,17 +117,6 @@ class HOLaLowRankDecomposer(nn.Module):
             mask = torch.ones_like(corr) - torch.eye(corr.size(0), device=corr.device).type_as(corr)
             disentangle = (corr * mask) @ (corr * mask).t()
             losses["basis_decorr"] = disentangle.abs().sum() * self.basis_decorr_weight
-        if self.basis_anchor_weight > 0:
-            basis = F.normalize(self.basis_feat.float(), dim=-1)
-            anchor = F.normalize(self.initial_basis_feat.float().to(basis.device), dim=-1)
-            losses["basis_anchor"] = (
-                1 - F.cosine_similarity(basis, anchor, dim=-1).mean()
-            ) * self.basis_anchor_weight
-        if self.basis_semantic_weight > 0:
-            basis = F.normalize(self.basis_feat.float(), dim=-1)
-            text = F.normalize(original.float(), dim=-1)
-            max_semantic_cos = (basis @ text.t()).max(dim=-1)[0]
-            losses["basis_semantic"] = (1 - max_semantic_cos.mean()) * self.basis_semantic_weight
         return losses
 
     def debug_stats(self):
@@ -185,9 +135,5 @@ class HOLaLowRankDecomposer(nn.Module):
                 "W_abs_mean": self.class_weights.float().abs().mean(),
                 "B_abs_mean": self.basis_feat.float().abs().mean(),
                 "recon_cos": recon_cos,
-                "basis_semantic_cos": (
-                    F.normalize(self.basis_feat.float(), dim=-1)
-                    @ F.normalize(original.float(), dim=-1).t()
-                ).max(dim=-1)[0].mean(),
                 "rank": torch.as_tensor(self.basis_feat.size(0), device=reconstructed.device),
             }
