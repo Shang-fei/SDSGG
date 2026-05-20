@@ -734,6 +734,8 @@ class LowRankClipPredictor(nn.Module):
             sparsity_weight=self.low_rank_cfg.SPARSITY_WEIGHT,
             basis_decorr_weight=self.low_rank_cfg.BASIS_DECORR_WEIGHT,
             weight_decorr_weight=self.low_rank_cfg.WEIGHT_DECORR_WEIGHT,
+            basis_anchor_weight=self.low_rank_cfg.BASIS_ANCHOR_WEIGHT,
+            basis_semantic_weight=self.low_rank_cfg.BASIS_SEMANTIC_WEIGHT,
             train_basis=self.low_rank_cfg.TRAIN_BASIS,
             train_mode=self.low_rank_cfg.TRAIN_MODE,
             logit_temperature=self.low_rank_cfg.CLASSIFIER_TEMPERATURE,
