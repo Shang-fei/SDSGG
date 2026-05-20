@@ -179,7 +179,7 @@ def train(cfg, local_rank, distributed, logger):
         eta_seconds = meters.time.global_avg * (max_iter - iteration)
         eta_string = str(datetime.timedelta(seconds=int(eta_seconds)))
 
-        if iteration % 20 == 0 or iteration == max_iter:
+        if iteration % 100 == 0 or iteration == max_iter:
             logger.info(
                 meters.delimiter.join(
                     [
@@ -206,8 +206,9 @@ def train(cfg, local_rank, distributed, logger):
         val_result = None # used for scheduler updating
         if cfg.SOLVER.TO_VAL and iteration % cfg.SOLVER.VAL_PERIOD == 0:
             logger.info("Start validating")
-            #run_test(cfg, model, distributed, logger)
+            test_result = run_test(cfg, model, distributed, logger)
             val_result = run_val(cfg, model, val_data_loaders, distributed, logger)
+            logger.info("Test Result: %.4f" % test_result)
             logger.info("Validation Result: %.4f" % val_result)
 
              
@@ -302,7 +303,7 @@ def run_test(cfg, model, distributed, logger):
     dataset_names = cfg.DATASETS.TEST
     if cfg.OUTPUT_DIR:
         for idx, dataset_name in enumerate(dataset_names):
-            output_folder = os.path.join(cfg.OUTPUT_DIR, "inference", dataset_name)
+            output_folder = os.path.join(cfg.OUTPUT_DIR, "inference", dataset_name, cfg.OV_SETTING.TEST_PART)
             mkdir(output_folder)
             output_folders[idx] = output_folder
     data_loaders_val = make_data_loader(cfg, mode='test', is_distributed=distributed)
