@@ -307,9 +307,10 @@ def run_test(cfg, model, distributed, logger):
             mkdir(output_folder)
             output_folders[idx] = output_folder
     data_loaders_val = make_data_loader(cfg, mode='test', is_distributed=distributed)
+    test_result = []
     for output_folder, dataset_name, data_loader_val in zip(output_folders, dataset_names, data_loaders_val):
         model.updata(cfg.OV_SETTING.TEST_PART)
-        inference(
+        dataset_result = inference(
             cfg,
             model,
             data_loader_val,
@@ -323,7 +324,16 @@ def run_test(cfg, model, distributed, logger):
             logger=logger,
         )
         synchronize()
+        test_result.append(dataset_result)
     model.updata(cfg.OV_SETTING.TRAIN_PART)
+    gathered_result = all_gather(torch.tensor(dataset_result).cpu())
+    gathered_result = [t.view(-1) for t in gathered_result]
+    gathered_result = torch.cat(gathered_result, dim=-1).view(-1)
+    valid_result = gathered_result[gathered_result >= 0]
+    test_result = float(valid_result.mean())
+    del gathered_result, valid_result
+    torch.cuda.empty_cache()
+    return test_result
 
 
 def main():
