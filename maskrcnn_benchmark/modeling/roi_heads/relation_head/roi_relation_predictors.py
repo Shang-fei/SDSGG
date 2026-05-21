@@ -754,6 +754,15 @@ class LowRankClipPredictor(nn.Module):
         text_obj = clip.tokenize(["a photo of object " for _ in self.obj_names]).to(self.device)
         self.text_features3 = self.clip_model.encode_text(text_sub)
         self.text_features4 = self.clip_model.encode_text(text_obj)
+        sub_filter = pd.read_csv(curpath + "/filter_total.csv").iloc[
+            self.active_predicate_indices.detach().cpu().tolist(),
+            1:,
+        ]
+        self.texts5 = []
+        for obj in self.obj_names:
+            text5 = clip.tokenize(["a photo of " + tex for tex in list(sub_filter[obj])]).to(self.device)
+            text_features5 = self.clip_model.encode_text(text5)
+            self.texts5.append(text_features5.detach().cpu().numpy())
 
     def _build_predicate_log_prior(self, statistics):
         counts = torch.ones(len(self.predicate_names), dtype=torch.float32)
@@ -812,6 +821,20 @@ class LowRankClipPredictor(nn.Module):
 
         scale = self.relation_text_adapter.logit_temperature
         return torch.stack((basis_logits / scale, clip_basis_logits / scale, target_weights), dim=1)
+
+    def _original_clip_similarity_logits(self, image_features, rel_index, subj_label, dtype):
+        subj_label = int(subj_label.detach().cpu().item())
+        text_features5 = torch.as_tensor(
+            self.texts5[subj_label],
+            device=self.device,
+            dtype=dtype,
+        )
+        subj_feature = image_features[rel_index[0]][0].unsqueeze(0)
+        obj_feature = image_features[rel_index[1]][0].unsqueeze(0)
+        text_features5 = F.normalize(text_features5.float(), dim=-1)
+        similarity31 = F.normalize(subj_feature.float(), dim=-1) @ text_features5.t() / 0.05
+        similarity32 = F.normalize(obj_feature.float(), dim=-1) @ text_features5.t() / 0.05
+        return ((similarity31 + similarity32) / 2).to(dtype)
 
     def _format_predicate_hist(self, indices, counts, max_items=5):
         items = []
@@ -957,6 +980,20 @@ class LowRankClipPredictor(nn.Module):
             if self.low_rank_cfg.LOGIT_ADJUSTMENT_TAU > 0:
                 log_prior = self.predicate_log_prior[self.active_predicate_indices].to(logits.device)
                 logits = logits - self.low_rank_cfg.LOGIT_ADJUSTMENT_TAU * log_prior.view(1, -1)
+            if not self.training:
+                original_clip_logits = []
+                for rel_index in rel_pair_idxs[i]:
+                    subj_label = obj_preds[i][rel_index[0]]
+                    original_clip_logits.append(
+                        self._original_clip_similarity_logits(
+                            image_features,
+                            rel_index,
+                            subj_label,
+                            logits.dtype,
+                        )
+                    )
+                original_clip_logits = torch.cat(original_clip_logits, dim=0)
+                logits = logits * 0.2 + original_clip_logits * 0.8
 
             class_logit_list.append(logits)
             basis_logit_list.append(basis_logits)
@@ -1019,6 +1056,15 @@ class CorePromptClipPredictor(nn.Module):
             self.text_features3 = self.clip_model.encode_text(text3)
             text4 = clip.tokenize(["a photo of object " for _ in self.obj_names]).to(self.device)
             self.text_features4 = self.clip_model.encode_text(text4)
+            sub_filter = pd.read_csv(curpath + "/filter_total.csv").iloc[
+                self.active_predicate_indices.detach().cpu().tolist(),
+                1:,
+            ]
+            self.texts5 = []
+            for obj in self.obj_names:
+                text5 = clip.tokenize(["a photo of " + tex for tex in list(sub_filter[obj])]).to(self.device)
+                text_features5 = self.clip_model.encode_text(text5)
+                self.texts5.append(text_features5.detach().cpu().numpy())
 
         self.register_buffer("relation_text_features", relation_text_features)
         self.logit_temperature = self.prompt_cfg.CLASSIFIER_TEMPERATURE
@@ -1065,6 +1111,20 @@ class CorePromptClipPredictor(nn.Module):
             image_tensor.append(crop)
         image_tensor = torch.cat(image_tensor)
         return self.clip_model.encode_image(image_tensor)
+
+    def _original_clip_similarity_logits(self, image_features, rel_index, subj_label, dtype):
+        subj_label = int(subj_label.detach().cpu().item())
+        text_features5 = torch.as_tensor(
+            self.texts5[subj_label],
+            device=self.device,
+            dtype=dtype,
+        )
+        subj_feature = image_features[rel_index[0]][0].unsqueeze(0)
+        obj_feature = image_features[rel_index[1]][0].unsqueeze(0)
+        text_features5 = F.normalize(text_features5.float(), dim=-1)
+        similarity31 = F.normalize(subj_feature.float(), dim=-1) @ text_features5.t() / 0.05
+        similarity32 = F.normalize(obj_feature.float(), dim=-1) @ text_features5.t() / 0.05
+        return ((similarity31 + similarity32) / 2).to(dtype)
 
     def _format_predicate_hist(self, indices, counts, max_items=5):
         items = []
@@ -1175,6 +1235,20 @@ class CorePromptClipPredictor(nn.Module):
             logits = logits / self.logit_temperature
             bg_logits = logits.new_zeros((logits.size(0), 1))
             logits = torch.cat((bg_logits, logits), dim=1)
+            if not self.training:
+                original_clip_logits = []
+                for rel_index in pair_idxs:
+                    subj_label = obj_preds[i][rel_index[0]]
+                    original_clip_logits.append(
+                        self._original_clip_similarity_logits(
+                            image_features,
+                            rel_index,
+                            subj_label,
+                            logits.dtype,
+                        )
+                    )
+                original_clip_logits = torch.cat(original_clip_logits, dim=0)
+                logits = logits * 0.2 + original_clip_logits * 0.8
             rel_dists.append(logits)
 
         obj_dists = obj_dists.split(num_objs, dim=0)
