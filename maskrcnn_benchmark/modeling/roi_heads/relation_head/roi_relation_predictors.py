@@ -733,9 +733,15 @@ class LowRankClipPredictor(nn.Module):
             sparsity_weight=self.low_rank_cfg.SPARSITY_WEIGHT,
             basis_decorr_weight=self.low_rank_cfg.BASIS_DECORR_WEIGHT,
             weight_decorr_weight=self.low_rank_cfg.WEIGHT_DECORR_WEIGHT,
+            address_anchor_weight=self.low_rank_cfg.ADDRESS_ANCHOR_WEIGHT,
+            address_graph_weight=self.low_rank_cfg.ADDRESS_GRAPH_WEIGHT,
+            address_graph_topk=self.low_rank_cfg.ADDRESS_GRAPH_TOPK,
             train_basis=self.low_rank_cfg.TRAIN_BASIS,
             train_mode=self.low_rank_cfg.TRAIN_MODE,
             logit_temperature=self.low_rank_cfg.CLASSIFIER_TEMPERATURE,
+            address_logit_weight=self.low_rank_cfg.ADDRESS_LOGIT_WEIGHT,
+            address_logit_temperature=self.low_rank_cfg.ADDRESS_LOGIT_TEMPERATURE,
+            visual_gate_scale=self.low_rank_cfg.VISUAL_GATE_SCALE,
         ).to(self.device)
 
     def _encode_relation_texts(self):
@@ -745,7 +751,7 @@ class LowRankClipPredictor(nn.Module):
             self.low_rank_cfg.PROMPT_FIELD,
         )
         text_tokens = clip.tokenize(relation_texts).to(self.device)
-        text_features = self.clip_model.encode_text(text_tokens)
+        text_features = self.clip_model.encode_text(text_tokens).float()
         text_features = F.normalize(text_features, dim=-1)
         return text_features
 
@@ -865,6 +871,7 @@ class LowRankClipPredictor(nn.Module):
             parts.append("logit_abs={:.4f}".format(logit_abs.item()))
             parts.append("logit_std={:.4f}".format(logit_std.item()))
             parts.append("W_abs={:.4f}".format(stats["W_abs_mean"].item()))
+            parts.append("W_delta={:.4f}".format(stats["W_delta_mean"].item()))
             parts.append("B_abs={:.4f}".format(stats["B_abs_mean"].item()))
             parts.append("W_active={:.2f}".format(weight_stats["W_active"].item()))
             parts.append("W_max_share={:.4f}".format(weight_stats["W_max_share"].item()))

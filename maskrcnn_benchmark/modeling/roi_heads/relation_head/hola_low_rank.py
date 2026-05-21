@@ -51,6 +51,9 @@ class HOLaLowRankDecomposer(nn.Module):
         sparsity_weight=0.1,
         basis_decorr_weight=0.001,
         weight_decorr_weight=0.001,
+        address_anchor_weight=0.0,
+        address_graph_weight=0.0,
+        address_graph_topk=5,
     ):
         super(HOLaLowRankDecomposer, self).__init__()
         if train_mode not in ("w", "b", "both", "none"):
@@ -74,13 +77,35 @@ class HOLaLowRankDecomposer(nn.Module):
             self.register_buffer("basis_feat", basis)
         self.register_buffer("original_text_features", text_features)
         self.register_buffer("text_mean", text_mean)
+        self.register_buffer("initial_class_weights", weights.detach().clone())
+        self.register_buffer(
+            "address_graph",
+            self._build_address_graph(weights.detach().float(), int(address_graph_topk)),
+        )
 
         self.train_mode = train_mode
         self.recon_loss_weight = recon_loss_weight
         self.sparsity_weight = sparsity_weight
         self.basis_decorr_weight = basis_decorr_weight
         self.weight_decorr_weight = weight_decorr_weight
+        self.address_anchor_weight = address_anchor_weight
+        self.address_graph_weight = address_graph_weight
         self.recon_loss = nn.MSELoss(reduction="sum")
+
+    @staticmethod
+    def _build_address_graph(weights, topk):
+        if weights.size(0) <= 1 or topk <= 0:
+            return weights.new_zeros((weights.size(0), weights.size(0)))
+
+        normalized = F.normalize(weights, dim=-1)
+        sim = (normalized @ normalized.t()).clamp_min(0)
+        sim.fill_diagonal_(0)
+        k = min(topk, weights.size(0) - 1)
+        values, indices = sim.topk(k=k, dim=1)
+        graph = torch.zeros_like(sim)
+        graph.scatter_(1, indices, values)
+        graph = torch.maximum(graph, graph.t())
+        return graph
 
     def reconstruct(self):
         return self.text_mean.unsqueeze(0) + self.class_weights @ self.basis_feat
@@ -117,6 +142,15 @@ class HOLaLowRankDecomposer(nn.Module):
             mask = torch.ones_like(corr) - torch.eye(corr.size(0), device=corr.device).type_as(corr)
             disentangle = (corr * mask) @ (corr * mask).t()
             losses["basis_decorr"] = disentangle.abs().sum() * self.basis_decorr_weight
+        if self.address_anchor_weight > 0:
+            delta = self.class_weights.float() - self.initial_class_weights.float()
+            losses["address_anchor"] = delta.pow(2).mean() * self.address_anchor_weight
+        if self.address_graph_weight > 0 and self.address_graph.sum() > 0:
+            graph = self.address_graph.float().to(self.class_weights.device)
+            delta = self.class_weights.float() - self.initial_class_weights.float()
+            dist = torch.cdist(delta, delta, p=2).pow(2)
+            losses["address_graph"] = (graph * dist).sum() / graph.sum().clamp_min(1e-6)
+            losses["address_graph"] = losses["address_graph"] * self.address_graph_weight
         return losses
 
     def debug_stats(self):
@@ -133,6 +167,7 @@ class HOLaLowRankDecomposer(nn.Module):
                 recon_cos = reconstructed.sum() * 0
             return {
                 "W_abs_mean": self.class_weights.float().abs().mean(),
+                "W_delta_mean": (self.class_weights.float() - self.initial_class_weights.float()).abs().mean(),
                 "B_abs_mean": self.basis_feat.float().abs().mean(),
                 "recon_cos": recon_cos,
                 "rank": torch.as_tensor(self.basis_feat.size(0), device=reconstructed.device),
