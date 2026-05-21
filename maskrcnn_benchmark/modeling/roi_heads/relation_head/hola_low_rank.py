@@ -54,6 +54,8 @@ class HOLaLowRankDecomposer(nn.Module):
         address_anchor_weight=0.0,
         address_graph_weight=0.0,
         address_graph_topk=5,
+        weight_delta_scale=1.0,
+        weight_anchor_weight=None,
     ):
         super(HOLaLowRankDecomposer, self).__init__()
         if train_mode not in ("w", "b", "both", "none"):
@@ -88,7 +90,10 @@ class HOLaLowRankDecomposer(nn.Module):
         self.sparsity_weight = sparsity_weight
         self.basis_decorr_weight = basis_decorr_weight
         self.weight_decorr_weight = weight_decorr_weight
-        self.address_anchor_weight = address_anchor_weight
+        self.weight_delta_scale = float(weight_delta_scale)
+        self.weight_anchor_weight = (
+            address_anchor_weight if weight_anchor_weight is None else weight_anchor_weight
+        )
         self.address_graph_weight = address_graph_weight
         self.recon_loss = nn.MSELoss(reduction="sum")
 
@@ -107,20 +112,31 @@ class HOLaLowRankDecomposer(nn.Module):
         graph = torch.maximum(graph, graph.t())
         return graph
 
+    def effective_class_weights(self):
+        weights = self.class_weights
+        if self.train_mode in ("b", "none"):
+            weights = weights.detach()
+        initial = self.initial_class_weights.to(weights.device).type_as(weights)
+        return initial + self.weight_delta_scale * (weights - initial)
+
+    def classifier_basis(self):
+        basis = self.basis_feat
+        if self.train_mode in ("w", "none"):
+            basis = basis.detach()
+        return basis
+
+    def residual_features(self, weights=None, basis=None):
+        if weights is None:
+            weights = self.effective_class_weights()
+        if basis is None:
+            basis = self.classifier_basis()
+        return weights @ basis
+
     def reconstruct(self):
-        return self.text_mean.unsqueeze(0) + self.class_weights @ self.basis_feat
+        return self.text_mean.unsqueeze(0) + self.residual_features()
 
     def classifier_features(self):
-        weights = self.class_weights
-        basis = self.basis_feat
-        if self.train_mode == "w":
-            basis = basis.detach()
-        elif self.train_mode == "b":
-            weights = weights.detach()
-        elif self.train_mode == "none":
-            weights = weights.detach()
-            basis = basis.detach()
-        return self.text_mean.unsqueeze(0) + weights @ basis
+        return self.text_mean.unsqueeze(0) + self.residual_features()
 
     def losses(self):
         losses = {}
@@ -129,10 +145,12 @@ class HOLaLowRankDecomposer(nn.Module):
 
         if self.recon_loss_weight > 0:
             losses["recon"] = self.recon_loss(reconstructed, original) * self.recon_loss_weight
+        effective_weights = self.effective_class_weights()
+
         if self.sparsity_weight > 0:
-            losses["sparse"] = self.class_weights.abs().sum(-1).mean(0) * self.sparsity_weight
-        if self.weight_decorr_weight > 0 and self.class_weights.size(1) > 1:
-            weight_basis = F.normalize(self.class_weights.t().float(), dim=-1)
+            losses["sparse"] = effective_weights.abs().sum(-1).mean(0) * self.sparsity_weight
+        if self.weight_decorr_weight > 0 and effective_weights.size(1) > 1:
+            weight_basis = F.normalize(effective_weights.t().float(), dim=-1)
             corr = weight_basis @ weight_basis.t()
             mask = torch.ones_like(corr) - torch.eye(corr.size(0), device=corr.device).type_as(corr)
             losses["weight_decorr"] = (corr * mask).abs().sum() * self.weight_decorr_weight
@@ -142,9 +160,9 @@ class HOLaLowRankDecomposer(nn.Module):
             mask = torch.ones_like(corr) - torch.eye(corr.size(0), device=corr.device).type_as(corr)
             disentangle = (corr * mask) @ (corr * mask).t()
             losses["basis_decorr"] = disentangle.abs().sum() * self.basis_decorr_weight
-        if self.address_anchor_weight > 0:
+        if self.weight_anchor_weight > 0:
             delta = self.class_weights.float() - self.initial_class_weights.float()
-            losses["address_anchor"] = delta.pow(2).mean() * self.address_anchor_weight
+            losses["lowrank_anchor"] = delta.pow(2).mean() * self.weight_anchor_weight
         if self.address_graph_weight > 0 and self.address_graph.sum() > 0:
             graph = self.address_graph.float().to(self.class_weights.device)
             delta = self.class_weights.float() - self.initial_class_weights.float()
@@ -157,6 +175,7 @@ class HOLaLowRankDecomposer(nn.Module):
         with torch.no_grad():
             reconstructed = self.reconstruct().float()
             original = self.original_text_features.float().to(reconstructed.device)
+            effective_weights = self.effective_class_weights().float()
             if reconstructed.size(0) > 0:
                 recon_cos = F.cosine_similarity(
                     F.normalize(reconstructed, dim=-1),
@@ -166,7 +185,7 @@ class HOLaLowRankDecomposer(nn.Module):
             else:
                 recon_cos = reconstructed.sum() * 0
             return {
-                "W_abs_mean": self.class_weights.float().abs().mean(),
+                "W_abs_mean": effective_weights.abs().mean(),
                 "W_delta_mean": (self.class_weights.float() - self.initial_class_weights.float()).abs().mean(),
                 "B_abs_mean": self.basis_feat.float().abs().mean(),
                 "recon_cos": recon_cos,
