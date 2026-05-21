@@ -102,6 +102,7 @@ class CoreRelationTextAdapter(nn.Module):
         return weights
 
     def basis_logits(self, visual_features):
+        visual_features = F.normalize(visual_features.float(), dim=-1)
         basis = self.decomposer.basis_feat
         if self.decomposer.train_mode in ("w", "none"):
             basis = basis.detach()
