@@ -140,6 +140,7 @@ class CoreRelationTextAdapter(nn.Module):
         weight_delta_scale=0.1,
         weight_anchor_weight=0.005,
         w_active_threshold=0.05,
+        visual_lowrank_residual_scale=0.2,
     ):
         super(CoreRelationTextAdapter, self).__init__()
         self.decomposer = HOLaLowRankDecomposer(
@@ -172,6 +173,7 @@ class CoreRelationTextAdapter(nn.Module):
         self.delta_dir_weight = float(delta_dir_weight)
         self.visual_gate_scale = float(visual_gate_scale)
         self.w_active_threshold = float(w_active_threshold)
+        self.visual_lowrank_residual_scale = float(visual_lowrank_residual_scale)
         rank_dim = self.decomposer.basis_feat.size(0)
         feature_dim = text_features.size(-1)
 
@@ -188,6 +190,7 @@ class CoreRelationTextAdapter(nn.Module):
             nn.ReLU(inplace=True),
             nn.Linear(feature_dim, rank_dim),
         )
+        self.visual_lowrank_norm = nn.LayerNorm(rank_dim)
         self.visual_lowrank_gate = nn.Sequential(
             nn.LayerNorm(rank_dim),
             nn.Linear(rank_dim, rank_dim),
@@ -350,7 +353,10 @@ class CoreRelationTextAdapter(nn.Module):
 
         base_lowrank = self.basis_logits(pair)
         visual_context = torch.cat((common_feature, pair, raw, subject, obj, geometry), dim=-1)
-        visual_lowrank = base_lowrank + self.visual_lowrank_encoder(visual_context.float())
+        visual_delta = self.visual_lowrank_encoder(visual_context.float())
+        visual_lowrank = self.visual_lowrank_norm(
+            base_lowrank + self.visual_lowrank_residual_scale * visual_delta
+        )
 
         visual_gate = self._visual_gate(visual_lowrank, active_fg_indices)
         classifier = self.active_classifier(active_fg_indices, common_prompt, visual_gate)

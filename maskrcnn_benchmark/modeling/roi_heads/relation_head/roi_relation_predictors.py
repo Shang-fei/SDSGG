@@ -761,6 +761,7 @@ class LowRankClipPredictor(nn.Module):
             weight_delta_scale=self.low_rank_cfg.WEIGHT_DELTA_SCALE,
             weight_anchor_weight=self.low_rank_cfg.WEIGHT_ANCHOR_WEIGHT,
             w_active_threshold=self.low_rank_cfg.W_ACTIVE_THRESHOLD,
+            visual_lowrank_residual_scale=self.low_rank_cfg.VISUAL_LOWRANK_RESIDUAL_SCALE,
         ).to(self.device)
 
     def _encode_relation_texts(self):
