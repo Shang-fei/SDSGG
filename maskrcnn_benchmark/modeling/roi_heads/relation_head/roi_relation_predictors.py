@@ -696,9 +696,7 @@ class LowRankClipPredictor(nn.Module):
         self.low_rank_cfg = config.MODEL.ROI_RELATION_HEAD.LOW_RANK_TEXT
         self.low_rank_loss_type = self.low_rank_cfg.LOSS_TYPE
         if self.low_rank_loss_type not in self.VALID_LOSS_TYPES:
-            raise ValueError(
-                "Unsupported LOW_RANK_TEXT.LOSS_TYPE: {}".format(self.low_rank_loss_type)
-            )
+            raise ValueError("Unsupported LOW_RANK_TEXT.LOSS_TYPE: {}".format(self.low_rank_loss_type))
         self.debug_step = 0
 
         statistics = get_dataset_statistics(config)
@@ -719,10 +717,7 @@ class LowRankClipPredictor(nn.Module):
         self.context_layer = TransformerContext(config, obj_classes, rel_classes, in_channels)
         self.adaper_clip1 = MVA()
         self.adaper_clip2 = MVA()
-        self.register_buffer(
-            "predicate_log_prior",
-            self._build_predicate_log_prior(statistics),
-        )
+        self.register_buffer("predicate_log_prior", self._build_predicate_log_prior(statistics))
         self.updata(config.OV_SETTING.TRAIN_PART)
         self._check_train_predicate_order()
 
@@ -782,17 +777,13 @@ class LowRankClipPredictor(nn.Module):
         if mode not in ("base", "novel", "semantic", "total"):
             raise ValueError("Unsupported OV relation split: {}".format(mode))
         self.mode = mode
-        self.active_predicate_indices = torch.as_tensor(
-            getattr(self, mode), device=self.device, dtype=torch.long
-        )
+        self.active_predicate_indices = torch.as_tensor(getattr(self, mode), device=self.device, dtype=torch.long)
         # Relation text features are foreground-only, so VG predicate ids shift by -1.
         self.active_fg_predicate_indices = self.active_predicate_indices[1:] - 1
 
     def _check_train_predicate_order(self):
         active_indices = self.active_predicate_indices.detach().cpu().tolist()
-        active_names = [
-            self.predicate_names[idx] for idx in active_indices
-        ]
+        active_names = [self.predicate_names[idx] for idx in active_indices]
         if active_names != self.train_predicate_names:
             raise ValueError(
                 "Low-rank active predicate order does not match dataset labels. "
@@ -810,53 +801,9 @@ class LowRankClipPredictor(nn.Module):
         image_tensor = torch.cat(image_tensor)
         return self.clip_model.encode_image(image_tensor)
 
-    def _build_pair_features(self, image_features, pair_idxs, obj_preds):
-        pair_features = []
-        raw_pair_features = []
-        for rel_index in pair_idxs:
-            subj_idx, obj_idx = rel_index[0], rel_index[1]
-            subj_label = obj_preds[subj_idx]
-            obj_label = obj_preds[obj_idx]
-
-            cross_output1 = self.adaper_clip1(
-                image_features[subj_idx].unsqueeze(0),
-                image_features[obj_idx].unsqueeze(0),
-                self.text_features3[subj_label],
-            )
-            cross_output2 = self.adaper_clip2(
-                image_features[obj_idx].unsqueeze(0),
-                image_features[subj_idx].unsqueeze(0),
-                self.text_features4[obj_label],
-            )
-            pair_features.append(F.normalize((cross_output1 + cross_output2) / 2, dim=-1))
-
-            # Frozen CLIP pair response used as the SDSGG-style teacher term
-            # when LOW_RANK_TEXT.LOSS_TYPE == "basis_align".
-            raw_pair_feature = (
-                image_features[subj_idx][0].unsqueeze(0)
-                + image_features[obj_idx][0].unsqueeze(0)
-            ) / 2
-            raw_pair_features.append(F.normalize(raw_pair_feature, dim=-1))
-
-        return torch.cat(pair_features, dim=0), torch.cat(raw_pair_features, dim=0)
-
-    def _compute_relation_logits(self, pair_features):
-        logits, basis_logits = self.relation_text_adapter.logits(
-            pair_features,
-            self.active_fg_predicate_indices,
-        )
-        bg_logits = logits.new_zeros((logits.size(0), 1))
-        logits = torch.cat((bg_logits, logits), dim=1)
-        if self.low_rank_cfg.LOGIT_ADJUSTMENT_TAU > 0:
-            log_prior = self.predicate_log_prior[self.active_predicate_indices].to(logits.device)
-            logits = logits - self.low_rank_cfg.LOGIT_ADJUSTMENT_TAU * log_prior.view(1, -1)
-        return logits, basis_logits
-
     def _build_basis_alignment_logits(self, basis_logits, raw_pair_features, labels):
         clip_basis_logits = self.relation_text_adapter.basis_logits(raw_pair_features)
-        active_weights = self.relation_text_adapter.active_class_weights(
-            self.active_fg_predicate_indices,
-        )
+        active_weights = self.relation_text_adapter.active_class_weights(self.active_fg_predicate_indices)
         target_weights = basis_logits.new_zeros(basis_logits.shape)
         labels = labels.to(basis_logits.device).long()
         valid = labels > 0
@@ -864,14 +811,7 @@ class LowRankClipPredictor(nn.Module):
             target_weights[valid] = active_weights[labels[valid] - 1].detach()
 
         scale = self.relation_text_adapter.logit_temperature
-        return torch.stack(
-            (
-                basis_logits / scale,
-                clip_basis_logits / scale,
-                target_weights,
-            ),
-            dim=1,
-        )
+        return torch.stack((basis_logits / scale, clip_basis_logits / scale, target_weights), dim=1)
 
     def _format_predicate_hist(self, indices, counts, max_items=5):
         items = []
@@ -968,17 +908,7 @@ class LowRankClipPredictor(nn.Module):
         else:
             print(message)
 
-    def forward(
-        self,
-        proposals,
-        rel_pair_idxs,
-        rel_labels,
-        rel_binarys,
-        roi_features,
-        union_features,
-        logger=None,
-        img=None,
-    ):
+    def forward(self, proposals, rel_pair_idxs, rel_labels, rel_binarys, roi_features, union_features, logger=None, img=None):
         if self.attribute_on:
             obj_dists, obj_preds, att_dists, edge_ctx = self.context_layer(roi_features, proposals, logger)
         else:
@@ -996,28 +926,44 @@ class LowRankClipPredictor(nn.Module):
             with torch.no_grad():
                 image_features = self._encode_object_crops(proposals[i], img[i])
 
-            pair_features, raw_pair_features = self._build_pair_features(
-                image_features,
-                rel_pair_idxs[i],
-                obj_preds[i],
-            )
-            logits, basis_logits = self._compute_relation_logits(pair_features)
+            pair_features = []
+            raw_pair_features = []
+            for rel_index in rel_pair_idxs[i]:
+                subj_idx, obj_idx = rel_index[0], rel_index[1]
+                subj_label = obj_preds[i][subj_idx]
+                obj_label = obj_preds[i][obj_idx]
+
+                cross_output1 = self.adaper_clip1(
+                    image_features[subj_idx].unsqueeze(0),
+                    image_features[obj_idx].unsqueeze(0),
+                    self.text_features3[subj_label],
+                )
+                cross_output2 = self.adaper_clip2(
+                    image_features[obj_idx].unsqueeze(0),
+                    image_features[subj_idx].unsqueeze(0),
+                    self.text_features4[obj_label],
+                )
+                pair_features.append(F.normalize((cross_output1 + cross_output2) / 2, dim=-1))
+
+                # CLIP pair feature is only used as the teacher term for basis_align.
+                raw_pair_feature = (image_features[subj_idx][0].unsqueeze(0) + image_features[obj_idx][0].unsqueeze(0)) / 2
+                raw_pair_features.append(F.normalize(raw_pair_feature, dim=-1))
+
+            pair_features = torch.cat(pair_features, dim=0)
+            raw_pair_features = torch.cat(raw_pair_features, dim=0)
+            logits, basis_logits = self.relation_text_adapter.logits(pair_features, self.active_fg_predicate_indices)
+            bg_logits = logits.new_zeros((logits.size(0), 1))
+            logits = torch.cat((bg_logits, logits), dim=1)
+            if self.low_rank_cfg.LOGIT_ADJUSTMENT_TAU > 0:
+                log_prior = self.predicate_log_prior[self.active_predicate_indices].to(logits.device)
+                logits = logits - self.low_rank_cfg.LOGIT_ADJUSTMENT_TAU * log_prior.view(1, -1)
+
             class_logit_list.append(logits)
             basis_logit_list.append(basis_logits)
             # The basis-align loss consumes [MVA·B, CLIP·B, W_y]; the normal
             # predicate loss consumes class logits with an explicit background column.
-            if (
-                self.training
-                and rel_labels is not None
-                and self.low_rank_loss_type == "basis_align"
-            ):
-                rel_dists.append(
-                    self._build_basis_alignment_logits(
-                        basis_logits,
-                        raw_pair_features,
-                        rel_labels[i],
-                    )
-                )
+            if self.training and rel_labels is not None and self.low_rank_loss_type == "basis_align":
+                rel_dists.append(self._build_basis_alignment_logits(basis_logits, raw_pair_features, rel_labels[i]))
             else:
                 rel_dists.append(logits)
 
