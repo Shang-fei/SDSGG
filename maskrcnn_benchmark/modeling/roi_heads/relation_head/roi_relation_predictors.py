@@ -692,6 +692,9 @@ class LowRankClipPredictor(nn.Module):
         self.num_rel_cls = config.MODEL.ROI_RELATION_HEAD.NUM_CLASSES
         self.device = config.MODEL.DEVICE
         self.low_rank_cfg = config.MODEL.ROI_RELATION_HEAD.LOW_RANK_TEXT
+        self.low_rank_loss_type = self.low_rank_cfg.LOSS_TYPE
+        if self.low_rank_loss_type not in ("predicate_focal", "basis_align"):
+            raise ValueError("Unsupported LOW_RANK_TEXT.LOSS_TYPE: {}".format(self.low_rank_loss_type))
         self.debug_step = 0
 
         statistics = get_dataset_statistics(config)
@@ -907,12 +910,14 @@ class LowRankClipPredictor(nn.Module):
 
         rel_dists = []
         basis_logit_list = []
+        class_logit_list = []
         for i in range(len(num_rels)):
             with torch.no_grad():
                 image_features = self._encode_object_crops(proposals[i], img[i])
 
             pair_idxs = rel_pair_idxs[i]
             pair_features = []
+            raw_pair_features = []
             for rel_index in pair_idxs:
                 obj_n1 = obj_preds[i][rel_index[0]]
                 obj_n2 = obj_preds[i][rel_index[1]]
@@ -931,8 +936,14 @@ class LowRankClipPredictor(nn.Module):
                 )
                 pair_feature = F.normalize((cross_output1 + cross_output2) / 2, dim=-1)
                 pair_features.append(pair_feature)
+                raw_pair_feature = (
+                    image_features[rel_index[0]][0].unsqueeze(0)
+                    + image_features[rel_index[1]][0].unsqueeze(0)
+                ) / 2
+                raw_pair_features.append(F.normalize(raw_pair_feature, dim=-1))
 
             pair_features = torch.cat(pair_features, dim=0)
+            raw_pair_features = torch.cat(raw_pair_features, dim=0)
             logits, basis_logits = self.relation_text_adapter.logits(
                 pair_features,
                 self.active_fg_predicate_indices,
@@ -942,15 +953,42 @@ class LowRankClipPredictor(nn.Module):
             if self.low_rank_cfg.LOGIT_ADJUSTMENT_TAU > 0:
                 log_prior = self.predicate_log_prior[self.active_predicate_indices].to(logits.device)
                 logits = logits - self.low_rank_cfg.LOGIT_ADJUSTMENT_TAU * log_prior.view(1, -1)
-            rel_dists.append(logits)
+            class_logit_list.append(logits)
             basis_logit_list.append(basis_logits)
+            if (
+                self.training
+                and rel_labels is not None
+                and self.low_rank_loss_type == "basis_align"
+            ):
+                clip_basis_logits = self.relation_text_adapter.basis_logits(raw_pair_features)
+                active_weights = self.relation_text_adapter.active_class_weights(
+                    self.active_fg_predicate_indices,
+                )
+                target_weights = basis_logits.new_zeros(basis_logits.shape)
+                labels = rel_labels[i].to(basis_logits.device).long()
+                valid = labels > 0
+                if valid.any():
+                    target_weights[valid] = active_weights[labels[valid] - 1].detach()
+                scale = self.relation_text_adapter.logit_temperature
+                rel_dists.append(
+                    torch.stack(
+                        (
+                            basis_logits / scale,
+                            clip_basis_logits / scale,
+                            target_weights,
+                        ),
+                        dim=1,
+                    )
+                )
+            else:
+                rel_dists.append(logits)
 
         obj_dists = obj_dists.split(num_objs, dim=0)
         add_losses = {}
         if self.training:
             self.debug_step += 1
             basis_logits = torch.cat(basis_logit_list, dim=0) if basis_logit_list else None
-            relation_logits = torch.cat(rel_dists, dim=0) if rel_dists else None
+            relation_logits = torch.cat(class_logit_list, dim=0) if class_logit_list else None
             labels = cat(rel_labels, dim=0) if rel_labels is not None else None
             if basis_logits is not None and relation_logits is not None:
                 self._log_low_rank_debug(basis_logits, relation_logits, labels, logger)

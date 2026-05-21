@@ -127,3 +127,32 @@ class ForegroundPredicateAlignmentLoss(nn.Module):
         focal_weight = torch.pow(1.0 - target_probs, self.focal_gamma)
         loss = self.focal_alpha * target_weight * focal_weight * ce_loss
         return loss.sum() / target_weight.sum().clamp_min(1e-6)
+
+
+class LowRankBasisAlignmentLoss(nn.Module):
+    def __init__(self, cfg):
+        super(LowRankBasisAlignmentLoss, self).__init__()
+        low_rank_cfg = cfg.MODEL.ROI_RELATION_HEAD.LOW_RANK_TEXT
+        self.alpha = low_rank_cfg.BASIS_ALIGN_ALPHA
+        self.beta = low_rank_cfg.BASIS_ALIGN_BETA
+        self.margin = low_rank_cfg.BASIS_ALIGN_MARGIN
+
+    def forward(self, relation_logits, rel_labels):
+        if relation_logits.dim() != 3 or relation_logits.size(1) != 3:
+            raise ValueError(
+                "Low-rank basis alignment expects relation logits with shape "
+                "[num_rel, 3, rank], got {}.".format(tuple(relation_logits.shape))
+            )
+
+        rel_labels = rel_labels.view(-1).long()
+        valid = rel_labels > 0
+        if valid.sum().item() == 0:
+            return relation_logits.sum() * 0
+
+        relation_logits = relation_logits[valid].float()
+        mva_basis_response = relation_logits[:, 0]
+        clip_basis_response = relation_logits[:, 1]
+        target_weight = relation_logits[:, 2].detach()
+
+        target = self.alpha * target_weight + self.beta * clip_basis_response - self.margin
+        return F.mse_loss(mva_basis_response, target, reduction="mean")

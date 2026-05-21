@@ -14,7 +14,11 @@ from maskrcnn_benchmark.modeling.box_coder import BoxCoder
 from maskrcnn_benchmark.modeling.matcher import Matcher
 from maskrcnn_benchmark.structures.boxlist_ops import boxlist_iou
 from maskrcnn_benchmark.modeling.utils import cat
-from .relation_losses import ClipDescriptionRegressionLoss, ForegroundPredicateAlignmentLoss
+from .relation_losses import (
+    ClipDescriptionRegressionLoss,
+    ForegroundPredicateAlignmentLoss,
+    LowRankBasisAlignmentLoss,
+)
 
 curpath=os.path.dirname(__file__)
 
@@ -70,14 +74,20 @@ class RelationLossComputation(object):
         self.attribute_sampling = attribute_sampling
         self.attribute_bgfg_ratio = attribute_bgfg_ratio
         self.use_label_smoothing = use_label_smoothing
-        self.use_low_rank_text = (
-            cfg is not None
-            and (
-                cfg.MODEL.ROI_RELATION_HEAD.PREDICTOR == "LowRankClipPredictor"
-                or cfg.MODEL.ROI_RELATION_HEAD.PREDICTOR == "CorePromptClipPredictor"
-            )
-        )
-        if self.use_low_rank_text:
+        predictor = cfg.MODEL.ROI_RELATION_HEAD.PREDICTOR if cfg is not None else ""
+        if predictor == "LowRankClipPredictor":
+            low_rank_loss_type = cfg.MODEL.ROI_RELATION_HEAD.LOW_RANK_TEXT.LOSS_TYPE
+            if low_rank_loss_type == "basis_align":
+                self.relation_criterion = LowRankBasisAlignmentLoss(cfg)
+            elif low_rank_loss_type == "predicate_focal":
+                self.relation_criterion = ForegroundPredicateAlignmentLoss(
+                    cfg,
+                    predicate_proportion,
+                    device,
+                )
+            else:
+                raise ValueError("Unsupported LOW_RANK_TEXT.LOSS_TYPE: {}".format(low_rank_loss_type))
+        elif predictor == "CorePromptClipPredictor":
             self.relation_criterion = ForegroundPredicateAlignmentLoss(
                 cfg,
                 predicate_proportion,
