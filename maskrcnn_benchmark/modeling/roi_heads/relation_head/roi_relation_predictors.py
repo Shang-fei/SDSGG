@@ -780,10 +780,7 @@ class LowRankClipPredictor(nn.Module):
         text_obj = clip.tokenize(["a photo of object " for _ in self.obj_names]).to(self.device)
         self.text_features3 = self.clip_model.encode_text(text_sub)
         self.text_features4 = self.clip_model.encode_text(text_obj)
-        sub_filter = pd.read_csv(curpath + "/filter_total.csv").iloc[
-            self.active_predicate_indices.detach().cpu().tolist(),
-            1:,
-        ]
+        sub_filter = pd.read_csv(curpath + "/filter_total.csv").iloc[:, 1:]
         self.texts5 = []
         for obj in self.obj_names:
             text5 = clip.tokenize(["a photo of " + tex for tex in list(sub_filter[obj])]).to(self.device)
@@ -860,7 +857,9 @@ class LowRankClipPredictor(nn.Module):
         text_features5 = F.normalize(text_features5.float(), dim=-1)
         similarity31 = F.normalize(subj_feature.float(), dim=-1) @ text_features5.t() / 0.05
         similarity32 = F.normalize(obj_feature.float(), dim=-1) @ text_features5.t() / 0.05
-        return ((similarity31 + similarity32) / 2).to(dtype)
+        similarity = (similarity31 + similarity32) / 2
+        active_indices = self.active_predicate_indices.to(similarity.device)
+        return similarity[:, active_indices].to(dtype)
 
     def _format_predicate_hist(self, indices, counts, max_items=5):
         items = []
@@ -1106,10 +1105,7 @@ class CorePromptClipPredictor(nn.Module):
             self.text_features3 = self.clip_model.encode_text(text3)
             text4 = clip.tokenize(["a photo of object " for _ in self.obj_names]).to(self.device)
             self.text_features4 = self.clip_model.encode_text(text4)
-            sub_filter = pd.read_csv(curpath + "/filter_total.csv").iloc[
-                self.active_predicate_indices.detach().cpu().tolist(),
-                1:,
-            ]
+            sub_filter = pd.read_csv(curpath + "/filter_total.csv").iloc[:, 1:]
             self.texts5 = []
             for obj in self.obj_names:
                 text5 = clip.tokenize(["a photo of " + tex for tex in list(sub_filter[obj])]).to(self.device)
@@ -1174,7 +1170,9 @@ class CorePromptClipPredictor(nn.Module):
         text_features5 = F.normalize(text_features5.float(), dim=-1)
         similarity31 = F.normalize(subj_feature.float(), dim=-1) @ text_features5.t() / 0.05
         similarity32 = F.normalize(obj_feature.float(), dim=-1) @ text_features5.t() / 0.05
-        return ((similarity31 + similarity32) / 2).to(dtype)
+        similarity = (similarity31 + similarity32) / 2
+        active_indices = self.active_predicate_indices.to(similarity.device)
+        return similarity[:, active_indices].to(dtype)
 
     def _format_predicate_hist(self, indices, counts, max_items=5):
         items = []
