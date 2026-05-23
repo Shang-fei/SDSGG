@@ -852,6 +852,27 @@ class LowRankClipPredictor(nn.Module):
         image_tensor = torch.cat(image_tensor)
         return self.clip_model.encode_image(image_tensor)
 
+    def _compress_visual_tokens(self, image_features):
+        token_limit = int(self.low_rank_cfg.VISUAL_TOKEN_LIMIT)
+        if image_features.dim() != 3 or token_limit <= 0 or image_features.size(1) <= token_limit:
+            return image_features
+        if token_limit == 1:
+            return image_features[:, :1]
+
+        patch_budget = token_limit - 1
+        patch_tokens = image_features[:, 1:]
+        if patch_tokens.size(1) <= patch_budget:
+            return image_features
+
+        sample_idx = torch.linspace(
+            0,
+            patch_tokens.size(1) - 1,
+            steps=patch_budget,
+            device=image_features.device,
+        ).round().long()
+        sampled_patches = patch_tokens.index_select(1, sample_idx)
+        return torch.cat((image_features[:, :1], sampled_patches), dim=1)
+
     def _build_basis_alignment_logits(self, basis_logits, raw_pair_features, labels):
         clip_basis_logits = self.relation_text_adapter.basis_logits(raw_pair_features)
         active_weights = self.relation_text_adapter.active_class_weights(self.active_fg_predicate_indices)
@@ -999,6 +1020,7 @@ class LowRankClipPredictor(nn.Module):
         for i in range(len(num_rels)):
             with torch.no_grad():
                 image_features = self._encode_object_crops(proposals[i], img[i])
+            relation_image_features = self._compress_visual_tokens(image_features)
 
             pair_idxs = rel_pair_idxs[i]
             box_info = get_box_info(proposals[i].bbox, proposal=proposals[i])
@@ -1015,18 +1037,18 @@ class LowRankClipPredictor(nn.Module):
                 subj_idx, obj_idx = rel_index[0], rel_index[1]
                 subj_label = obj_preds[i][subj_idx]
                 obj_label = obj_preds[i][obj_idx]
-                subj_feature = image_features[subj_idx][0].unsqueeze(0)
-                obj_feature = image_features[obj_idx][0].unsqueeze(0)
+                subj_feature = relation_image_features[subj_idx][0].unsqueeze(0)
+                obj_feature = relation_image_features[obj_idx][0].unsqueeze(0)
 
                 cross_output1, s2o_tokens = self.adaper_clip1(
-                    image_features[subj_idx].unsqueeze(0),
-                    image_features[obj_idx].unsqueeze(0),
+                    relation_image_features[subj_idx].unsqueeze(0),
+                    relation_image_features[obj_idx].unsqueeze(0),
                     self.text_features3[subj_label],
                     return_tokens=True,
                 )
                 cross_output2, o2s_tokens = self.adaper_clip2(
-                    image_features[obj_idx].unsqueeze(0),
-                    image_features[subj_idx].unsqueeze(0),
+                    relation_image_features[obj_idx].unsqueeze(0),
+                    relation_image_features[subj_idx].unsqueeze(0),
                     self.text_features4[obj_label],
                     return_tokens=True,
                 )
@@ -1037,8 +1059,8 @@ class LowRankClipPredictor(nn.Module):
                 raw_pair_features.append(F.normalize(raw_pair_feature, dim=-1))
                 subject_features.append(F.normalize(subj_feature, dim=-1))
                 object_features.append(F.normalize(obj_feature, dim=-1))
-                subject_token_list.append(F.normalize(image_features[subj_idx].unsqueeze(0), dim=-1))
-                object_token_list.append(F.normalize(image_features[obj_idx].unsqueeze(0), dim=-1))
+                subject_token_list.append(F.normalize(relation_image_features[subj_idx].unsqueeze(0), dim=-1))
+                object_token_list.append(F.normalize(relation_image_features[obj_idx].unsqueeze(0), dim=-1))
                 mva_s2o_token_list.append(F.normalize(s2o_tokens, dim=-1))
                 mva_o2s_token_list.append(F.normalize(o2s_tokens, dim=-1))
 
