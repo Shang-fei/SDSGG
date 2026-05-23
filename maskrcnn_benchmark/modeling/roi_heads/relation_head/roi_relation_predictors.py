@@ -132,10 +132,9 @@ class MVA(nn.Module):
         token_output = self.token_norm(token_output + sub_features)
         x = self.adapter(sub_features,obj_features)
         if text_fea is not None:
-            xx=[]
-            for i in range(x.shape[0]):
-                xx.append(torch.cat([x[i],text_fea]).unsqueeze(0))
-            x=torch.cat(xx)
+            if text_fea.dim() == 1:
+                text_fea = text_fea.unsqueeze(0).expand(x.size(0), -1)
+            x = torch.cat((x, text_fea.to(x.device, dtype=x.dtype)), dim=-1)
             x=self.linear(x)
             x=self.relu(x)
         ratio = 0.5
@@ -1025,53 +1024,28 @@ class LowRankClipPredictor(nn.Module):
             pair_idxs = rel_pair_idxs[i]
             box_info = get_box_info(proposals[i].bbox, proposal=proposals[i])
             pair_geometry = get_box_pair_info(box_info[pair_idxs[:, 0]], box_info[pair_idxs[:, 1]])
-            pair_features = []
-            raw_pair_features = []
-            subject_features = []
-            object_features = []
-            subject_token_list = []
-            object_token_list = []
-            mva_s2o_token_list = []
-            mva_o2s_token_list = []
-            for rel_index in pair_idxs:
-                subj_idx, obj_idx = rel_index[0], rel_index[1]
-                subj_label = obj_preds[i][subj_idx]
-                obj_label = obj_preds[i][obj_idx]
-                subj_feature = relation_image_features[subj_idx][0].unsqueeze(0)
-                obj_feature = relation_image_features[obj_idx][0].unsqueeze(0)
-
-                cross_output1, s2o_tokens = self.adaper_clip1(
-                    relation_image_features[subj_idx].unsqueeze(0),
-                    relation_image_features[obj_idx].unsqueeze(0),
-                    self.text_features3[subj_label],
-                    return_tokens=True,
-                )
-                cross_output2, o2s_tokens = self.adaper_clip2(
-                    relation_image_features[obj_idx].unsqueeze(0),
-                    relation_image_features[subj_idx].unsqueeze(0),
-                    self.text_features4[obj_label],
-                    return_tokens=True,
-                )
-                pair_features.append(F.normalize((cross_output1 + cross_output2) / 2, dim=-1))
-
-                # CLIP pair feature is only used as the teacher term for basis_align.
-                raw_pair_feature = (subj_feature + obj_feature) / 2
-                raw_pair_features.append(F.normalize(raw_pair_feature, dim=-1))
-                subject_features.append(F.normalize(subj_feature, dim=-1))
-                object_features.append(F.normalize(obj_feature, dim=-1))
-                subject_token_list.append(F.normalize(relation_image_features[subj_idx].unsqueeze(0), dim=-1))
-                object_token_list.append(F.normalize(relation_image_features[obj_idx].unsqueeze(0), dim=-1))
-                mva_s2o_token_list.append(F.normalize(s2o_tokens, dim=-1))
-                mva_o2s_token_list.append(F.normalize(o2s_tokens, dim=-1))
-
-            pair_features = torch.cat(pair_features, dim=0)
-            raw_pair_features = torch.cat(raw_pair_features, dim=0)
-            subject_features = torch.cat(subject_features, dim=0)
-            object_features = torch.cat(object_features, dim=0)
-            subject_tokens = torch.cat(subject_token_list, dim=0)
-            object_tokens = torch.cat(object_token_list, dim=0)
-            mva_s2o_tokens = torch.cat(mva_s2o_token_list, dim=0)
-            mva_o2s_tokens = torch.cat(mva_o2s_token_list, dim=0)
+            subject_tokens = F.normalize(relation_image_features[pair_idxs[:, 0]], dim=-1)
+            object_tokens = F.normalize(relation_image_features[pair_idxs[:, 1]], dim=-1)
+            subj_labels = obj_preds[i][pair_idxs[:, 0]]
+            obj_labels = obj_preds[i][pair_idxs[:, 1]]
+            cross_output1, mva_s2o_tokens = self.adaper_clip1(
+                subject_tokens,
+                object_tokens,
+                self.text_features3[subj_labels],
+                return_tokens=True,
+            )
+            cross_output2, mva_o2s_tokens = self.adaper_clip2(
+                object_tokens,
+                subject_tokens,
+                self.text_features4[obj_labels],
+                return_tokens=True,
+            )
+            pair_features = F.normalize((cross_output1 + cross_output2) / 2, dim=-1)
+            subject_features = subject_tokens[:, 0]
+            object_features = object_tokens[:, 0]
+            raw_pair_features = F.normalize((subject_features + object_features) / 2, dim=-1)
+            mva_s2o_tokens = F.normalize(mva_s2o_tokens, dim=-1)
+            mva_o2s_tokens = F.normalize(mva_o2s_tokens, dim=-1)
             logits, basis_logits, aux_cache = self.relation_text_adapter.logits(
                 pair_features,
                 self.active_fg_predicate_indices,
