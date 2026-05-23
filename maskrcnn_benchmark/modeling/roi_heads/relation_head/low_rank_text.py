@@ -1,5 +1,4 @@
 import json
-import math
 
 import torch
 from torch import nn
@@ -65,45 +64,193 @@ def load_relation_prompt_texts(prompt_json, predicate_names, field=CORE_PROMPT_F
     return texts[1:]
 
 
-class CommonRelationExtractor(nn.Module):
-    def __init__(self, feature_dim, geometry_dim=32, prompt_scale=0.1, enabled=True):
-        super(CommonRelationExtractor, self).__init__()
+class RelationQueryBlock(nn.Module):
+    def __init__(self, feature_dim, num_heads=4, dropout=0.1):
+        super(RelationQueryBlock, self).__init__()
+        self.self_attn = nn.MultiheadAttention(
+            feature_dim,
+            num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.cross_attn = nn.MultiheadAttention(
+            feature_dim,
+            num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.ffn = nn.Sequential(
+            nn.Linear(feature_dim, feature_dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(feature_dim * 4, feature_dim),
+        )
+        self.norm1 = nn.LayerNorm(feature_dim)
+        self.norm2 = nn.LayerNorm(feature_dim)
+        self.norm3 = nn.LayerNorm(feature_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, query, memory):
+        x = query
+        q = self.norm1(x)
+        x = x + self.dropout(self.self_attn(q, q, q, need_weights=False)[0])
+        q = self.norm2(x)
+        memory = memory.to(q.dtype)
+        x = x + self.dropout(self.cross_attn(q, memory, memory, need_weights=False)[0])
+        x = x + self.dropout(self.ffn(self.norm3(x)))
+        return x
+
+
+class RelationQueryTransformer(nn.Module):
+    def __init__(
+        self,
+        feature_dim,
+        geometry_dim=32,
+        prompt_scale=0.1,
+        num_layers=2,
+        num_heads=4,
+        dropout=0.1,
+        enabled=True,
+    ):
+        super(RelationQueryTransformer, self).__init__()
         self.enabled = bool(enabled)
         self.prompt_scale = float(prompt_scale)
         self.common_prompt_delta = nn.Parameter(torch.zeros(feature_dim))
-        self.geometry_proj = nn.Sequential(
+        self.rel_prompt_delta = nn.Parameter(torch.zeros(feature_dim))
+        self.geometry_query = nn.Sequential(
             nn.LayerNorm(geometry_dim),
             nn.Linear(geometry_dim, feature_dim),
-            nn.ReLU(inplace=True),
+            nn.GELU(),
             nn.Linear(feature_dim, feature_dim),
+        )
+        self.geometry_token = nn.Sequential(
+            nn.LayerNorm(geometry_dim),
+            nn.Linear(geometry_dim, feature_dim),
+            nn.GELU(),
+            nn.Linear(feature_dim, feature_dim),
+        )
+        self.memory_norm = nn.LayerNorm(feature_dim)
+        self.query_norm = nn.LayerNorm(feature_dim)
+        self.blocks = nn.ModuleList(
+            [RelationQueryBlock(feature_dim, num_heads, dropout) for _ in range(max(int(num_layers), 1))]
         )
         self.output_norm = nn.LayerNorm(feature_dim)
 
-    def prompt(self, text_mean):
+    def common_prompt(self, text_mean):
         return text_mean.float() + self.prompt_scale * self.common_prompt_delta.float()
 
-    def forward(self, pair_features, raw_pair_features, subject_features, object_features, geometry_features, text_mean):
-        common_prompt = self.prompt(text_mean).to(pair_features.device)
-        if not self.enabled:
-            return pair_features, common_prompt
+    def relation_prompt(self, text_mean):
+        return text_mean.float() + self.prompt_scale * self.rel_prompt_delta.float()
 
-        geometry_token = F.normalize(self.geometry_proj(geometry_features.float()), dim=-1)
-        tokens = torch.stack(
+    def _as_tokens(self, features):
+        if features.dim() == 2:
+            return features.unsqueeze(1)
+        return features
+
+    def forward(
+        self,
+        pair_feature,
+        subject_tokens,
+        object_tokens,
+        mva_s2o_tokens,
+        mva_o2s_tokens,
+        geometry_features,
+        text_mean,
+    ):
+        pair_feature = F.normalize(pair_feature.float(), dim=-1)
+        subject_tokens = F.normalize(self._as_tokens(subject_tokens).float(), dim=-1)
+        object_tokens = F.normalize(self._as_tokens(object_tokens).float(), dim=-1)
+        mva_s2o_tokens = F.normalize(self._as_tokens(mva_s2o_tokens).float(), dim=-1)
+        mva_o2s_tokens = F.normalize(self._as_tokens(mva_o2s_tokens).float(), dim=-1)
+        geometry_features = geometry_features.float().to(pair_feature.device)
+
+        common_prompt = self.common_prompt(text_mean).to(pair_feature.device)
+        rel_prompt = self.relation_prompt(text_mean).to(pair_feature.device)
+        if not self.enabled:
+            return pair_feature, pair_feature, common_prompt
+
+        geo_query = self.geometry_query(geometry_features)
+        geo_token = F.normalize(self.geometry_token(geometry_features), dim=-1).unsqueeze(1)
+        subject_cls = subject_tokens[:, :1]
+        object_cls = object_tokens[:, :1]
+        pair_cls = pair_feature.unsqueeze(1)
+        memory = torch.cat(
             (
-                pair_features.float(),
-                raw_pair_features.float(),
-                subject_features.float(),
-                object_features.float(),
-                geometry_token.float(),
+                subject_tokens,
+                object_tokens,
+                mva_s2o_tokens,
+                mva_o2s_tokens,
+                subject_cls,
+                object_cls,
+                pair_cls,
+                geo_token,
             ),
             dim=1,
         )
-        query = F.normalize(common_prompt, dim=-1)
-        attn = torch.matmul(tokens, query.view(-1, 1)).squeeze(-1)
-        attn = F.softmax(attn / math.sqrt(tokens.size(-1)), dim=-1)
-        common_feature = (attn.unsqueeze(-1) * tokens).sum(dim=1)
-        common_feature = self.output_norm(common_feature + pair_features.float())
-        return F.normalize(common_feature, dim=-1), common_prompt
+        memory = self.memory_norm(memory)
+
+        query = torch.stack(
+            (
+                common_prompt.view(1, -1).expand(pair_feature.size(0), -1) + geo_query,
+                rel_prompt.view(1, -1).expand(pair_feature.size(0), -1) + geo_query,
+            ),
+            dim=1,
+        )
+        query = self.query_norm(query)
+        for block in self.blocks:
+            query = block(query, memory)
+
+        z_common = F.normalize(self.output_norm(query[:, 0] + pair_feature), dim=-1)
+        z_rel = F.normalize(self.output_norm(query[:, 1] + pair_feature), dim=-1)
+        return z_common, z_rel, common_prompt
+
+
+class SharedWAdapter(nn.Module):
+    def __init__(self, feature_dim, rank_dim, geometry_dim=32, scale=0.25, enabled=True):
+        super(SharedWAdapter, self).__init__()
+        self.enabled = bool(enabled)
+        self.scale = float(scale)
+        self.gate = nn.Sequential(
+            nn.LayerNorm(feature_dim + geometry_dim),
+            nn.Linear(feature_dim + geometry_dim, feature_dim),
+            nn.GELU(),
+            nn.Linear(feature_dim, rank_dim),
+        )
+        nn.init.zeros_(self.gate[-1].weight)
+        nn.init.zeros_(self.gate[-1].bias)
+
+    def forward(self, z_rel, geometry, weights, active_mask):
+        if not self.enabled or self.scale <= 0:
+            return weights.unsqueeze(0).expand(z_rel.size(0), -1, -1)
+        gate_input = torch.cat((z_rel.float(), geometry.float()), dim=-1)
+        gate = torch.tanh(self.gate(gate_input))
+        factor = 1 + self.scale * gate.unsqueeze(1) * active_mask.unsqueeze(0)
+        return weights.unsqueeze(0) * factor
+
+
+class SemanticTransport(nn.Module):
+    def __init__(self, feature_dim, geometry_dim=32, step_scale=0.2, enabled=True):
+        super(SemanticTransport, self).__init__()
+        self.enabled = bool(enabled)
+        self.step_scale = float(step_scale)
+        self.mlp = nn.Sequential(
+            nn.LayerNorm(feature_dim * 2 + geometry_dim),
+            nn.Linear(feature_dim * 2 + geometry_dim, feature_dim),
+            nn.GELU(),
+            nn.Linear(feature_dim, feature_dim),
+        )
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+
+    def forward(self, z_rel, delta_text, geometry):
+        if not self.enabled or self.step_scale <= 0:
+            return z_rel
+        geometry = geometry.float().to(z_rel.device)
+        while geometry.dim() < z_rel.dim():
+            geometry = geometry.unsqueeze(-2)
+        geometry = geometry.expand(*z_rel.shape[:-1], geometry.size(-1))
+        step = self.mlp(torch.cat((z_rel.float(), delta_text.float(), geometry), dim=-1))
+        return F.normalize(z_rel.float() + self.step_scale * step, dim=-1)
 
 
 class CoreRelationTextAdapter(nn.Module):
@@ -141,6 +288,17 @@ class CoreRelationTextAdapter(nn.Module):
         weight_anchor_weight=0.005,
         w_active_threshold=0.05,
         visual_lowrank_residual_scale=0.2,
+        relation_query_layers=2,
+        relation_query_heads=4,
+        relation_query_dropout=0.1,
+        shared_w_adapter_enabled=True,
+        shared_w_adapter_scale=0.25,
+        transport_logit_weight=None,
+        semantic_transport_enabled=None,
+        transport_topk_anchor=None,
+        transport_loss_weight=None,
+        transport_cycle_weight=0.02,
+        transport_step_scale=0.2,
     ):
         super(CoreRelationTextAdapter, self).__init__()
         self.decomposer = HOLaLowRankDecomposer(
@@ -163,55 +321,59 @@ class CoreRelationTextAdapter(nn.Module):
         self.lowrank_temperature = address_logit_temperature
         self.residual_logit_weight = float(residual_logit_weight)
         self.text_logit_weight = float(text_logit_weight)
-        self.delta_logit_weight = float(delta_logit_weight)
+        self.transport_logit_weight = float(
+            delta_logit_weight if transport_logit_weight is None else transport_logit_weight
+        )
         self.common_loss_weight = float(common_loss_weight)
         self.residual_align_weight = float(residual_align_weight)
-        self.delta_transfer_enabled = bool(delta_transfer_enabled)
-        self.delta_topk_anchor = int(delta_topk_anchor)
+        self.semantic_transport_enabled = bool(
+            delta_transfer_enabled if semantic_transport_enabled is None else semantic_transport_enabled
+        )
+        self.transport_topk_anchor = int(delta_topk_anchor if transport_topk_anchor is None else transport_topk_anchor)
         self.delta_aux_topk = int(delta_aux_topk)
-        self.delta_loss_weight = float(delta_loss_weight)
-        self.delta_dir_weight = float(delta_dir_weight)
-        self.visual_gate_scale = float(visual_gate_scale)
+        self.transport_loss_weight = float(delta_loss_weight if transport_loss_weight is None else transport_loss_weight)
+        self.transport_cycle_weight = float(transport_cycle_weight)
         self.w_active_threshold = float(w_active_threshold)
         self.visual_lowrank_residual_scale = float(visual_lowrank_residual_scale)
         rank_dim = self.decomposer.basis_feat.size(0)
         feature_dim = text_features.size(-1)
 
-        self.common_extractor = CommonRelationExtractor(
+        self.relation_queries = RelationQueryTransformer(
             feature_dim,
             geometry_dim=32,
             prompt_scale=common_prompt_scale,
+            num_layers=relation_query_layers,
+            num_heads=relation_query_heads,
+            dropout=relation_query_dropout,
             enabled=common_prompt_enabled,
         )
-        visual_context_dim = feature_dim * 5 + 32
-        self.visual_lowrank_encoder = nn.Sequential(
-            nn.LayerNorm(visual_context_dim),
-            nn.Linear(visual_context_dim, feature_dim),
-            nn.ReLU(inplace=True),
+        self.rank_projector = nn.Sequential(
+            nn.LayerNorm(feature_dim * 2 + 32),
+            nn.Linear(feature_dim * 2 + 32, feature_dim),
+            nn.GELU(),
             nn.Linear(feature_dim, rank_dim),
         )
-        self.visual_lowrank_norm = nn.LayerNorm(rank_dim)
-        self.visual_lowrank_gate = nn.Sequential(
-            nn.LayerNorm(rank_dim),
-            nn.Linear(rank_dim, rank_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(rank_dim, rank_dim),
+        self.rank_norm = nn.LayerNorm(rank_dim)
+        self.shared_w_adapter = SharedWAdapter(
+            feature_dim,
+            rank_dim,
+            geometry_dim=32,
+            scale=shared_w_adapter_scale,
+            enabled=shared_w_adapter_enabled,
         )
-        self.delta_gate = nn.Sequential(
-            nn.LayerNorm(rank_dim * 2),
-            nn.Linear(rank_dim * 2, rank_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(rank_dim, rank_dim),
+        self.semantic_transport = SemanticTransport(
+            feature_dim,
+            geometry_dim=32,
+            step_scale=transport_step_scale,
+            enabled=self.semantic_transport_enabled,
         )
-        nn.init.zeros_(self.visual_lowrank_encoder[-1].weight)
-        nn.init.zeros_(self.visual_lowrank_encoder[-1].bias)
-        nn.init.zeros_(self.visual_lowrank_gate[-1].weight)
-        nn.init.zeros_(self.visual_lowrank_gate[-1].bias)
-        nn.init.zeros_(self.delta_gate[-1].weight)
-        nn.init.zeros_(self.delta_gate[-1].bias)
+        nn.init.zeros_(self.rank_projector[-1].weight)
+        nn.init.zeros_(self.rank_projector[-1].bias)
 
         # Kept for old configs; the new path uses residual/text/delta weights.
         self.address_logit_weight = float(address_logit_weight)
+        self._debug_transport_abs = None
+        self._debug_transport_std = None
 
     def active_class_weights(self, active_fg_indices, normalize=False):
         weights = self.class_weights_by_indices(active_fg_indices)
@@ -245,31 +407,26 @@ class CoreRelationTextAdapter(nn.Module):
             return torch.ones_like(weights)
         return (weights > self.w_active_threshold).float()
 
-    def _visual_gate(self, visual_lowrank, active_fg_indices):
-        if self.visual_gate_scale <= 0:
-            return None
-        gate_delta = torch.tanh(self.visual_lowrank_gate(visual_lowrank.float()))
-        gate = 1 + self.visual_gate_scale * gate_delta
-        active_mask = self._weight_active_mask(active_fg_indices)
-        return 1 + (gate.unsqueeze(1) - 1) * active_mask.unsqueeze(0)
+    def adapted_class_weights(self, z_rel, geometry, indices):
+        weights = self.class_weights_by_indices(indices).float()
+        active_mask = self._weight_active_mask(indices).to(weights.device)
+        return self.shared_w_adapter(z_rel, geometry, weights, active_mask)
 
-    def active_classifier(self, active_fg_indices, common_prompt, visual_gate=None):
-        weights = self.active_class_weights(active_fg_indices).float()
+    def active_classifier(self, adapted_weights, z_common):
         basis = self._basis_for_classifier()
-        if visual_gate is None:
-            classifier = common_prompt.float().view(1, -1) + weights @ basis
-            return F.normalize(classifier, dim=-1)
-
-        gated_weights = weights.unsqueeze(0) * visual_gate
-        residual = torch.matmul(gated_weights, basis)
-        classifier = common_prompt.float().view(1, 1, -1) + residual
+        residual = torch.matmul(adapted_weights.float(), basis)
+        classifier = z_common.float().unsqueeze(1) + residual
         return F.normalize(classifier, dim=-1)
 
-    def lowrank_logits(self, visual_lowrank, active_fg_indices):
+    def lowrank_logits(self, visual_lowrank, active_fg_indices, adapted_weights=None):
         visual_lowrank = F.normalize(visual_lowrank.float(), dim=-1)
-        weights = self.active_class_weights(active_fg_indices, normalize=True).float()
+        if adapted_weights is None:
+            weights = self.active_class_weights(active_fg_indices, normalize=True).float()
+            weights = weights.unsqueeze(0).expand(visual_lowrank.size(0), -1, -1)
+        else:
+            weights = F.normalize(adapted_weights.float(), dim=-1)
         temperature = max(float(self.lowrank_temperature), 1e-6)
-        return visual_lowrank @ weights.t() / temperature
+        return torch.einsum("nr,ncr->nc", visual_lowrank, weights) / temperature
 
     def _prepare_visual_inputs(
         self,
@@ -289,41 +446,63 @@ class CoreRelationTextAdapter(nn.Module):
             geometry = geometry_features.float().to(pair.device)
         return pair, raw, subject, obj, geometry
 
-    def _delta_shift(self, visual_lowrank, delta):
-        gate_input = torch.cat((visual_lowrank.float(), delta.float()), dim=-1)
-        gate = torch.sigmoid(self.delta_gate(gate_input))
-        return visual_lowrank + gate * delta, gate
+    def _prepare_tokens(self, features, fallback):
+        if features is None:
+            return fallback.unsqueeze(1)
+        if features.dim() == 2:
+            return features.unsqueeze(1)
+        return features
 
-    def delta_transfer_logits(self, visual_lowrank, active_fg_indices, base_anchor_fg_indices):
+    def _rank_features(self, z_rel, z_common, geometry):
+        base_rank = self.basis_logits(z_rel)
+        rank_delta = self.rank_projector(torch.cat((z_rel.float(), z_common.float(), geometry.float()), dim=-1))
+        return self.rank_norm(base_rank + self.visual_lowrank_residual_scale * rank_delta)
+
+    def _delta_text(self, delta_rank):
+        basis = self._basis_for_classifier()
+        return torch.matmul(delta_rank.float(), basis)
+
+    def transport_logits(
+        self,
+        z_rel,
+        geometry,
+        visual_lowrank,
+        active_fg_indices,
+        base_anchor_fg_indices,
+        active_classifier,
+    ):
         if (
-            not self.delta_transfer_enabled
-            or self.delta_logit_weight <= 0
+            not self.semantic_transport_enabled
+            or self.transport_logit_weight <= 0
             or base_anchor_fg_indices is None
             or base_anchor_fg_indices.numel() == 0
         ):
-            return visual_lowrank.new_zeros((visual_lowrank.size(0), active_fg_indices.numel()))
+            return z_rel.new_zeros((z_rel.size(0), active_fg_indices.numel()))
 
         anchor_weights = self.class_weights_by_indices(base_anchor_fg_indices)
         candidate_weights = self.active_class_weights(active_fg_indices)
         if anchor_weights.size(0) == 0 or candidate_weights.size(0) == 0:
-            return visual_lowrank.new_zeros((visual_lowrank.size(0), active_fg_indices.numel()))
+            return z_rel.new_zeros((z_rel.size(0), active_fg_indices.numel()))
 
         anchor_logits = self.lowrank_logits(visual_lowrank, base_anchor_fg_indices)
-        k = min(max(self.delta_topk_anchor, 1), anchor_weights.size(0))
+        k = min(max(self.transport_topk_anchor, 1), anchor_weights.size(0))
         top_logits, top_indices = anchor_logits.topk(k=k, dim=-1)
         top_anchor_weights = anchor_weights[top_indices]
         anchor_prob = F.softmax(top_logits, dim=-1)
 
         delta = candidate_weights.view(1, 1, candidate_weights.size(0), -1)
         delta = delta - top_anchor_weights.unsqueeze(2)
-        visual = visual_lowrank.view(visual_lowrank.size(0), 1, 1, -1).expand_as(delta)
-        shifted, _ = self._delta_shift(visual, delta)
+        delta_text = self._delta_text(delta)
+        visual = z_rel.view(z_rel.size(0), 1, 1, -1).expand_as(delta_text)
+        shifted = self.semantic_transport(visual, delta_text, geometry)
 
-        candidate_norm = F.normalize(candidate_weights, dim=-1).view(1, 1, candidate_weights.size(0), -1)
-        shifted = F.normalize(shifted, dim=-1)
-        temperature = max(float(self.lowrank_temperature), 1e-6)
-        scores = (shifted * candidate_norm).sum(dim=-1) / temperature
-        return (anchor_prob.unsqueeze(-1) * scores).sum(dim=1)
+        classifier = active_classifier.unsqueeze(1)
+        temperature = max(float(self.logit_temperature), 1e-6)
+        scores = (F.normalize(shifted, dim=-1) * classifier).sum(dim=-1) / temperature
+        logits = (anchor_prob.unsqueeze(-1) * scores).sum(dim=1)
+        self._debug_transport_abs = logits.detach().float().abs().mean()
+        self._debug_transport_std = logits.detach().float().std()
+        return logits
 
     def logits(
         self,
@@ -332,6 +511,10 @@ class CoreRelationTextAdapter(nn.Module):
         raw_visual_features=None,
         subject_features=None,
         object_features=None,
+        subject_tokens=None,
+        object_tokens=None,
+        mva_s2o_tokens=None,
+        mva_o2s_tokens=None,
         geometry_features=None,
         base_anchor_fg_indices=None,
     ):
@@ -342,37 +525,42 @@ class CoreRelationTextAdapter(nn.Module):
             object_features=object_features,
             geometry_features=geometry_features,
         )
-        common_feature, common_prompt = self.common_extractor(
+        subject_tokens = self._prepare_tokens(subject_tokens, subject)
+        object_tokens = self._prepare_tokens(object_tokens, obj)
+        mva_s2o_tokens = self._prepare_tokens(mva_s2o_tokens, pair)
+        mva_o2s_tokens = self._prepare_tokens(mva_o2s_tokens, pair)
+
+        z_common, z_rel, common_prompt = self.relation_queries(
             pair,
-            raw,
-            subject,
-            obj,
+            subject_tokens,
+            object_tokens,
+            mva_s2o_tokens,
+            mva_o2s_tokens,
             geometry,
             self.decomposer.text_mean,
         )
 
-        base_lowrank = self.basis_logits(pair)
-        visual_context = torch.cat((common_feature, pair, raw, subject, obj, geometry), dim=-1)
-        visual_delta = self.visual_lowrank_encoder(visual_context.float())
-        visual_lowrank = self.visual_lowrank_norm(
-            base_lowrank + self.visual_lowrank_residual_scale * visual_delta
-        )
+        visual_lowrank = self._rank_features(z_rel, z_common, geometry)
 
-        visual_gate = self._visual_gate(visual_lowrank, active_fg_indices)
-        classifier = self.active_classifier(active_fg_indices, common_prompt, visual_gate)
-        if classifier.dim() == 3:
-            text_logits = torch.einsum("nd,ncd->nc", pair, classifier)
-        else:
-            text_logits = pair @ classifier.t()
+        adapted_weights = self.adapted_class_weights(z_rel, geometry, active_fg_indices)
+        classifier = self.active_classifier(adapted_weights, z_common)
+        text_logits = torch.einsum("nd,ncd->nc", z_rel, classifier)
         text_logits = text_logits / max(float(self.logit_temperature), 1e-6)
 
-        residual_logits = self.lowrank_logits(visual_lowrank, active_fg_indices)
-        delta_logits = self.delta_transfer_logits(visual_lowrank, active_fg_indices, base_anchor_fg_indices)
+        residual_logits = self.lowrank_logits(visual_lowrank, active_fg_indices, adapted_weights)
+        transport_logits = self.transport_logits(
+            z_rel,
+            geometry,
+            visual_lowrank,
+            active_fg_indices,
+            base_anchor_fg_indices,
+            classifier,
+        )
 
         logit_parts = [
             (self.residual_logit_weight, residual_logits),
             (self.text_logit_weight, text_logits),
-            (self.delta_logit_weight if self.delta_transfer_enabled else 0.0, delta_logits),
+            (self.transport_logit_weight if self.semantic_transport_enabled else 0.0, transport_logits),
         ]
         total_weight = sum(max(weight, 0.0) for weight, _ in logit_parts)
         if total_weight <= 0:
@@ -380,9 +568,11 @@ class CoreRelationTextAdapter(nn.Module):
         logits = sum(max(weight, 0.0) * part for weight, part in logit_parts) / total_weight
 
         aux_cache = {
-            "common_features": common_feature,
+            "common_features": z_common,
             "common_prompt": common_prompt,
+            "z_rel": z_rel,
             "visual_lowrank": visual_lowrank,
+            "geometry": geometry,
             "active_fg_indices": active_fg_indices.detach(),
             "base_anchor_fg_indices": None if base_anchor_fg_indices is None else base_anchor_fg_indices.detach(),
         }
@@ -393,7 +583,9 @@ class CoreRelationTextAdapter(nn.Module):
             return None
         return {
             "common_features": torch.cat([item["common_features"] for item in aux_cache], dim=0),
+            "z_rel": torch.cat([item["z_rel"] for item in aux_cache], dim=0),
             "visual_lowrank": torch.cat([item["visual_lowrank"] for item in aux_cache], dim=0),
+            "geometry": torch.cat([item["geometry"] for item in aux_cache], dim=0),
             "common_prompt": aux_cache[0]["common_prompt"],
             "active_fg_indices": aux_cache[0]["active_fg_indices"],
             "base_anchor_fg_indices": aux_cache[0]["base_anchor_fg_indices"],
@@ -406,6 +598,8 @@ class CoreRelationTextAdapter(nn.Module):
             return losses
 
         visual_lowrank = cache["visual_lowrank"]
+        z_rel = cache["z_rel"]
+        geometry = cache["geometry"]
         labels = labels.to(visual_lowrank.device).long().view(-1)
         if labels.numel() != visual_lowrank.size(0):
             raise ValueError(
@@ -418,7 +612,7 @@ class CoreRelationTextAdapter(nn.Module):
         valid = (labels > 0) & (labels <= active_fg_indices.numel())
         zero = visual_lowrank.sum() * 0
 
-        if self.common_extractor.enabled and self.common_loss_weight > 0:
+        if self.relation_queries.enabled and self.common_loss_weight > 0:
             if valid.any():
                 target = F.normalize(cache["common_prompt"].view(1, -1), dim=-1)
                 common = F.normalize(cache["common_features"][valid], dim=-1)
@@ -432,39 +626,54 @@ class CoreRelationTextAdapter(nn.Module):
                 local_labels = labels[valid] - 1
                 target = self.active_class_weights(active_fg_indices)[local_labels].detach()
                 residual_loss = 1 - F.cosine_similarity(visual_lowrank[valid], target, dim=-1)
-                losses["loss_lr_residual_align"] = residual_loss.mean() * self.residual_align_weight
+                losses["loss_lr_rank_align"] = residual_loss.mean() * self.residual_align_weight
             else:
-                losses["loss_lr_residual_align"] = zero
+                losses["loss_lr_rank_align"] = zero
 
-        if self.delta_transfer_enabled and (self.delta_loss_weight > 0 or self.delta_dir_weight > 0):
-            delta_cls, delta_dir = self._delta_auxiliary_losses(
-                visual_lowrank,
+        if self.semantic_transport_enabled and (
+            self.transport_loss_weight > 0 or self.transport_cycle_weight > 0
+        ):
+            transport_cls, transport_cycle = self._transport_auxiliary_losses(
+                z_rel,
+                cache["common_features"],
+                geometry,
                 labels,
                 valid,
                 active_fg_indices,
                 cache["base_anchor_fg_indices"],
             )
-            if self.delta_loss_weight > 0:
-                losses["loss_lr_delta_cls"] = delta_cls * self.delta_loss_weight
-            if self.delta_dir_weight > 0:
-                losses["loss_lr_delta_dir"] = delta_dir * self.delta_dir_weight
+            if self.transport_loss_weight > 0:
+                losses["loss_lr_transport_cls"] = transport_cls * self.transport_loss_weight
+            if self.transport_cycle_weight > 0:
+                losses["loss_lr_transport_cycle"] = transport_cycle * self.transport_cycle_weight
 
         return losses
 
-    def _delta_auxiliary_losses(self, visual_lowrank, labels, valid, active_fg_indices, base_anchor_fg_indices):
-        zero = visual_lowrank.sum() * 0
+    def _transport_auxiliary_losses(
+        self,
+        z_rel,
+        z_common,
+        geometry,
+        labels,
+        valid,
+        active_fg_indices,
+        base_anchor_fg_indices,
+    ):
+        zero = z_rel.sum() * 0
         if not valid.any() or base_anchor_fg_indices is None or base_anchor_fg_indices.numel() == 0:
             return zero, zero
 
-        base_anchor_fg_indices = base_anchor_fg_indices.to(visual_lowrank.device).long()
+        base_anchor_fg_indices = base_anchor_fg_indices.to(z_rel.device).long()
         anchor_weights = self.class_weights_by_indices(base_anchor_fg_indices)
         if anchor_weights.size(0) <= 1:
             return zero, zero
 
         local_labels = labels[valid] - 1
-        gt_fg_indices = active_fg_indices[local_labels].to(visual_lowrank.device)
+        gt_fg_indices = active_fg_indices[local_labels].to(z_rel.device)
         gt_weights = self.class_weights_by_indices(gt_fg_indices)
-        gt_visual = visual_lowrank[valid]
+        gt_visual = z_rel[valid]
+        gt_common = z_common[valid]
+        gt_geometry = geometry[valid]
 
         sim = F.normalize(gt_weights, dim=-1) @ F.normalize(anchor_weights, dim=-1).t()
         same_predicate = gt_fg_indices.view(-1, 1) == base_anchor_fg_indices.view(1, -1)
@@ -477,22 +686,24 @@ class CoreRelationTextAdapter(nn.Module):
 
         target_weights = anchor_weights[target_indices]
         delta = target_weights - gt_weights.unsqueeze(1)
-        visual = gt_visual.unsqueeze(1).expand_as(delta)
-        shifted, _ = self._delta_shift(visual, delta)
+        delta_text = self._delta_text(delta)
+        visual = gt_visual.unsqueeze(1).expand_as(delta_text)
+        shifted = self.semantic_transport(visual, delta_text, gt_geometry)
 
+        anchor_weights_per_pair = self.adapted_class_weights(gt_visual, gt_geometry, base_anchor_fg_indices)
+        anchor_classifier = self.active_classifier(anchor_weights_per_pair, gt_common)
         shifted_norm = F.normalize(shifted, dim=-1)
-        anchor_norm = F.normalize(anchor_weights, dim=-1)
-        temperature = max(float(self.lowrank_temperature), 1e-6)
-        logits = torch.matmul(shifted_norm, anchor_norm.t()) / temperature
+        temperature = max(float(self.logit_temperature), 1e-6)
+        logits = torch.einsum("nkd,nad->nka", shifted_norm, anchor_classifier) / temperature
 
         flat_valid = finite.view(-1)
         cls_loss = F.cross_entropy(
             logits.view(-1, anchor_weights.size(0))[flat_valid],
             target_indices.reshape(-1)[flat_valid],
         )
-        direction = shifted - visual
-        dir_loss = 1 - F.cosine_similarity(direction[finite], delta[finite], dim=-1)
-        return cls_loss, dir_loss.mean()
+        cycle = self.semantic_transport(shifted, -delta_text, gt_geometry)
+        cycle_loss = 1 - F.cosine_similarity(cycle[finite], visual[finite], dim=-1)
+        return cls_loss, cycle_loss.mean()
 
     def losses(self, aux_cache=None, labels=None):
         losses = {}
@@ -513,7 +724,12 @@ class CoreRelationTextAdapter(nn.Module):
         return losses
 
     def debug_stats(self):
-        return self.decomposer.debug_stats()
+        stats = self.decomposer.debug_stats()
+        if self._debug_transport_abs is not None:
+            stats["transport_abs"] = self._debug_transport_abs
+        if self._debug_transport_std is not None:
+            stats["transport_std"] = self._debug_transport_std
+        return stats
 
     def weight_usage_stats(self, active_fg_indices, threshold=0.05):
         with torch.no_grad():

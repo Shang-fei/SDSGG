@@ -122,10 +122,14 @@ class MVA(nn.Module):
         super().__init__()
         self.layer_norm = nn.LayerNorm(512).half()
         self.adapter = Adapter(512, 4).half()
+        self.token_attn = nn.MultiheadAttention(512, 8, batch_first=True).half()
+        self.token_norm = nn.LayerNorm(512).half()
         self.linear=nn.Linear(1024, 512, bias=False).half()
         self.relu = nn.ReLU(inplace=True)
 
-    def forward(self, sub_features,obj_features,text_fea=None):
+    def forward(self, sub_features,obj_features,text_fea=None, return_tokens=False):
+        token_output = self.token_attn(sub_features, obj_features, obj_features, need_weights=False)[0]
+        token_output = self.token_norm(token_output + sub_features)
         x = self.adapter(sub_features,obj_features)
         if text_fea is not None:
             xx=[]
@@ -137,6 +141,10 @@ class MVA(nn.Module):
         ratio = 0.5
         sub_features= ratio * x + (1 - ratio) * sub_features[:,0,:]
 
+        if return_tokens:
+            token_output = token_output.clone()
+            token_output[:, 0, :] = sub_features
+            return sub_features, token_output
         return sub_features
 
 @registry.ROI_RELATION_PREDICTOR.register("GQAClipPredictor")
@@ -762,6 +770,17 @@ class LowRankClipPredictor(nn.Module):
             weight_anchor_weight=self.low_rank_cfg.WEIGHT_ANCHOR_WEIGHT,
             w_active_threshold=self.low_rank_cfg.W_ACTIVE_THRESHOLD,
             visual_lowrank_residual_scale=self.low_rank_cfg.VISUAL_LOWRANK_RESIDUAL_SCALE,
+            relation_query_layers=self.low_rank_cfg.RELATION_QUERY_LAYERS,
+            relation_query_heads=self.low_rank_cfg.RELATION_QUERY_HEADS,
+            relation_query_dropout=self.low_rank_cfg.RELATION_QUERY_DROPOUT,
+            shared_w_adapter_enabled=self.low_rank_cfg.SHARED_W_ADAPTER_ENABLED,
+            shared_w_adapter_scale=self.low_rank_cfg.SHARED_W_ADAPTER_SCALE,
+            transport_logit_weight=self.low_rank_cfg.TRANSPORT_LOGIT_WEIGHT,
+            semantic_transport_enabled=self.low_rank_cfg.SEMANTIC_TRANSPORT_ENABLED,
+            transport_topk_anchor=self.low_rank_cfg.TRANSPORT_TOPK_ANCHOR,
+            transport_loss_weight=self.low_rank_cfg.TRANSPORT_LOSS_WEIGHT,
+            transport_cycle_weight=self.low_rank_cfg.TRANSPORT_CYCLE_WEIGHT,
+            transport_step_scale=self.low_rank_cfg.TRANSPORT_STEP_SCALE,
         ).to(self.device)
 
     def _encode_relation_texts(self):
@@ -896,6 +915,10 @@ class LowRankClipPredictor(nn.Module):
             parts.append("W_active={:.2f}".format(weight_stats["W_active"].item()))
             parts.append("W_max_share={:.4f}".format(weight_stats["W_max_share"].item()))
             parts.append("recon_cos={:.4f}".format(stats["recon_cos"].item()))
+            if "transport_abs" in stats:
+                parts.append("transport_abs={:.4f}".format(stats["transport_abs"].item()))
+            if "transport_std" in stats:
+                parts.append("transport_std={:.4f}".format(stats["transport_std"].item()))
             if labels is not None and labels.numel() > 0:
                 pred_labels = relation_logits[:, 1:].argmax(dim=1) + 1
                 valid_gt = labels.long() > 0
@@ -984,6 +1007,10 @@ class LowRankClipPredictor(nn.Module):
             raw_pair_features = []
             subject_features = []
             object_features = []
+            subject_token_list = []
+            object_token_list = []
+            mva_s2o_token_list = []
+            mva_o2s_token_list = []
             for rel_index in pair_idxs:
                 subj_idx, obj_idx = rel_index[0], rel_index[1]
                 subj_label = obj_preds[i][subj_idx]
@@ -991,15 +1018,17 @@ class LowRankClipPredictor(nn.Module):
                 subj_feature = image_features[subj_idx][0].unsqueeze(0)
                 obj_feature = image_features[obj_idx][0].unsqueeze(0)
 
-                cross_output1 = self.adaper_clip1(
+                cross_output1, s2o_tokens = self.adaper_clip1(
                     image_features[subj_idx].unsqueeze(0),
                     image_features[obj_idx].unsqueeze(0),
                     self.text_features3[subj_label],
+                    return_tokens=True,
                 )
-                cross_output2 = self.adaper_clip2(
+                cross_output2, o2s_tokens = self.adaper_clip2(
                     image_features[obj_idx].unsqueeze(0),
                     image_features[subj_idx].unsqueeze(0),
                     self.text_features4[obj_label],
+                    return_tokens=True,
                 )
                 pair_features.append(F.normalize((cross_output1 + cross_output2) / 2, dim=-1))
 
@@ -1008,17 +1037,29 @@ class LowRankClipPredictor(nn.Module):
                 raw_pair_features.append(F.normalize(raw_pair_feature, dim=-1))
                 subject_features.append(F.normalize(subj_feature, dim=-1))
                 object_features.append(F.normalize(obj_feature, dim=-1))
+                subject_token_list.append(F.normalize(image_features[subj_idx].unsqueeze(0), dim=-1))
+                object_token_list.append(F.normalize(image_features[obj_idx].unsqueeze(0), dim=-1))
+                mva_s2o_token_list.append(F.normalize(s2o_tokens, dim=-1))
+                mva_o2s_token_list.append(F.normalize(o2s_tokens, dim=-1))
 
             pair_features = torch.cat(pair_features, dim=0)
             raw_pair_features = torch.cat(raw_pair_features, dim=0)
             subject_features = torch.cat(subject_features, dim=0)
             object_features = torch.cat(object_features, dim=0)
+            subject_tokens = torch.cat(subject_token_list, dim=0)
+            object_tokens = torch.cat(object_token_list, dim=0)
+            mva_s2o_tokens = torch.cat(mva_s2o_token_list, dim=0)
+            mva_o2s_tokens = torch.cat(mva_o2s_token_list, dim=0)
             logits, basis_logits, aux_cache = self.relation_text_adapter.logits(
                 pair_features,
                 self.active_fg_predicate_indices,
                 raw_visual_features=raw_pair_features,
                 subject_features=subject_features,
                 object_features=object_features,
+                subject_tokens=subject_tokens,
+                object_tokens=object_tokens,
+                mva_s2o_tokens=mva_s2o_tokens,
+                mva_o2s_tokens=mva_o2s_tokens,
                 geometry_features=pair_geometry,
                 base_anchor_fg_indices=self.base_anchor_fg_indices,
             )
