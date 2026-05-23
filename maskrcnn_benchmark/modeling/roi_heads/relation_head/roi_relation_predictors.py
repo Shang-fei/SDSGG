@@ -19,6 +19,7 @@ from .utils_relation import layer_init, get_box_info, get_box_pair_info
 from .low_rank_text import (
     CoreRelationTextAdapter,
     VG_PREDICATE_ID,
+    build_relation_texts,
     build_predicate_splits,
     build_full_predicate_names,
     load_relation_prompt_texts,
@@ -128,8 +129,10 @@ class MVA(nn.Module):
         self.relu = nn.ReLU(inplace=True)
 
     def forward(self, sub_features,obj_features,text_fea=None, return_tokens=False):
-        token_output = self.token_attn(sub_features, obj_features, obj_features, need_weights=False)[0]
-        token_output = self.token_norm(token_output + sub_features)
+        token_output = None
+        if return_tokens:
+            token_output = self.token_attn(sub_features, obj_features, obj_features, need_weights=False)[0]
+            token_output = self.token_norm(token_output + sub_features)
         x = self.adapter(sub_features,obj_features)
         if text_fea is not None:
             if text_fea.dim() == 1:
@@ -783,10 +786,11 @@ class LowRankClipPredictor(nn.Module):
         ).to(self.device)
 
     def _encode_relation_texts(self):
-        relation_texts = load_relation_prompt_texts(
+        relation_texts = build_relation_texts(
             self.low_rank_cfg.PROMPT_JSON,
             self.predicate_names,
             self.low_rank_cfg.PROMPT_FIELD,
+            getattr(self.low_rank_cfg, "RELATION_TEXT_SOURCE", "decomposed"),
         )
         text_tokens = clip.tokenize(relation_texts).to(self.device)
         text_features = self.clip_model.encode_text(text_tokens).float()
@@ -1114,6 +1118,9 @@ class CorePromptClipPredictor(nn.Module):
         self.num_rel_cls = config.MODEL.ROI_RELATION_HEAD.NUM_CLASSES
         self.device = config.MODEL.DEVICE
         self.prompt_cfg = config.MODEL.ROI_RELATION_HEAD.LOW_RANK_TEXT
+        self.core_visual_source = getattr(self.prompt_cfg, "CORE_VISUAL_SOURCE", "mva").lower()
+        if self.core_visual_source not in ("mva", "clip_union"):
+            raise ValueError("Unsupported LOW_RANK_TEXT.CORE_VISUAL_SOURCE: {}".format(self.core_visual_source))
         self.debug_step = 0
 
         statistics = get_dataset_statistics(config)
@@ -1153,10 +1160,11 @@ class CorePromptClipPredictor(nn.Module):
         self.logit_temperature = self.prompt_cfg.CLASSIFIER_TEMPERATURE
 
     def _encode_relation_texts(self):
-        relation_texts = load_relation_prompt_texts(
+        relation_texts = build_relation_texts(
             self.prompt_cfg.PROMPT_JSON,
             self.predicate_names,
             self.prompt_cfg.PROMPT_FIELD,
+            getattr(self.prompt_cfg, "RELATION_TEXT_SOURCE", "decomposed"),
         )
         text_tokens = clip.tokenize(relation_texts).to(self.device)
         text_features = self.clip_model.encode_text(text_tokens)
@@ -1194,6 +1202,68 @@ class CorePromptClipPredictor(nn.Module):
             image_tensor.append(crop)
         image_tensor = torch.cat(image_tensor)
         return self.clip_model.encode_image(image_tensor)
+
+    def _encode_pair_union_crops(self, proposal, pair_idxs, image):
+        image_tensor = []
+        for pair_idx in pair_idxs:
+            sub_box = proposal.bbox[pair_idx[0]]
+            obj_box = proposal.bbox[pair_idx[1]]
+            crop = crop_and_resize(image.unsqueeze(0), sub_box, obj_box)
+            crop = crop[0].permute(1, 2, 0).detach().cpu().numpy() * 255
+            crop = Image.fromarray(np.uint8(crop))
+            crop = self.clip_preprocess(crop).unsqueeze(0).to(self.device)
+            image_tensor.append(crop)
+        image_tensor = torch.cat(image_tensor)
+        return self.clip_model.encode_image(image_tensor)
+
+    def _compress_visual_tokens(self, image_features):
+        token_limit = int(getattr(self.prompt_cfg, "VISUAL_TOKEN_LIMIT", 0))
+        if image_features.dim() != 3 or token_limit <= 0 or image_features.size(1) <= token_limit:
+            return image_features
+        if token_limit == 1:
+            return image_features[:, :1]
+
+        patch_budget = token_limit - 1
+        patch_tokens = image_features[:, 1:]
+        if patch_tokens.size(1) <= patch_budget:
+            return image_features
+
+        sample_idx = torch.linspace(
+            0,
+            patch_tokens.size(1) - 1,
+            steps=patch_budget,
+            device=image_features.device,
+        ).round().long()
+        sampled_patches = patch_tokens.index_select(1, sample_idx)
+        return torch.cat((image_features[:, :1], sampled_patches), dim=1)
+
+    def _build_pair_features(self, proposal, pair_idxs, obj_preds, image):
+        if self.core_visual_source == "clip_union":
+            with torch.no_grad():
+                union_features = self._encode_pair_union_crops(proposal, pair_idxs, image)
+            if union_features.dim() == 3:
+                union_features = union_features[:, 0, :]
+            return F.normalize(union_features, dim=-1), None
+
+        with torch.no_grad():
+            image_features = self._encode_object_crops(proposal, image)
+        image_features = self._compress_visual_tokens(image_features)
+        subject_tokens = F.normalize(image_features[pair_idxs[:, 0]], dim=-1)
+        object_tokens = F.normalize(image_features[pair_idxs[:, 1]], dim=-1)
+        subj_labels = obj_preds[pair_idxs[:, 0]]
+        obj_labels = obj_preds[pair_idxs[:, 1]]
+        cross_output1 = self.adaper_clip1(
+            subject_tokens,
+            object_tokens,
+            self.text_features3[subj_labels],
+        )
+        cross_output2 = self.adaper_clip2(
+            object_tokens,
+            subject_tokens,
+            self.text_features4[obj_labels],
+        )
+        pair_features = F.normalize((cross_output1 + cross_output2) / 2, dim=-1)
+        return pair_features, image_features
 
     def _original_clip_similarity_logits(self, image_features, rel_index, subj_label, dtype):
         subj_label = int(subj_label.detach().cpu().item())
@@ -1291,43 +1361,28 @@ class CorePromptClipPredictor(nn.Module):
         active_text_features = self.relation_text_features[self.active_fg_predicate_indices].float()
         active_text_features = F.normalize(active_text_features, dim=-1)
         for i in range(len(num_rels)):
-            with torch.no_grad():
-                image_features = self._encode_object_crops(proposals[i], img[i])
-
             pair_idxs = rel_pair_idxs[i]
-            pair_features = []
-            for rel_index in pair_idxs:
-                obj_n1 = obj_preds[i][rel_index[0]]
-                obj_n2 = obj_preds[i][rel_index[1]]
-
-                text_sub = self.text_features3[obj_n1]
-                text_obj = self.text_features4[obj_n2]
-                cross_output1 = self.adaper_clip1(
-                    image_features[rel_index[0]].unsqueeze(0),
-                    image_features[rel_index[1]].unsqueeze(0),
-                    text_sub,
-                )
-                cross_output2 = self.adaper_clip2(
-                    image_features[rel_index[1]].unsqueeze(0),
-                    image_features[rel_index[0]].unsqueeze(0),
-                    text_obj,
-                )
-                pair_feature = F.normalize((cross_output1 + cross_output2) / 2, dim=-1)
-                pair_features.append(pair_feature)
-
-            pair_features = torch.cat(pair_features, dim=0)
+            pair_features, image_features_for_eval = self._build_pair_features(
+                proposals[i],
+                pair_idxs,
+                obj_preds[i],
+                img[i],
+            )
             logits = pair_features.float() @ active_text_features.t()
             logits = logits / self.logit_temperature
             bg_logits = logits.new_zeros((logits.size(0), 1))
             logits = torch.cat((bg_logits, logits), dim=1)
             original_clip_eval_weight = min(max(float(self.prompt_cfg.ORIGINAL_CLIP_EVAL_WEIGHT), 0.0), 1.0)
             if not self.training and original_clip_eval_weight > 0:
+                if image_features_for_eval is None:
+                    with torch.no_grad():
+                        image_features_for_eval = self._encode_object_crops(proposals[i], img[i])
                 original_clip_logits = []
                 for rel_index in pair_idxs:
                     subj_label = obj_preds[i][rel_index[0]]
                     original_clip_logits.append(
                         self._original_clip_similarity_logits(
-                            image_features,
+                            image_features_for_eval,
                             rel_index,
                             subj_label,
                             logits.dtype,

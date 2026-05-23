@@ -64,6 +64,15 @@ def load_relation_prompt_texts(prompt_json, predicate_names, field=CORE_PROMPT_F
     return texts[1:]
 
 
+def build_relation_texts(prompt_json, predicate_names, field=CORE_PROMPT_FIELD, source="decomposed"):
+    source = (source or "decomposed").lower()
+    if source in ("decomposed", "prompt", "prompt_json", "description"):
+        return load_relation_prompt_texts(prompt_json, predicate_names, field)
+    if source in ("relation_of", "a_relation_of"):
+        return ["a relation of {}".format(name) for name in predicate_names[1:]]
+    raise ValueError("Unsupported LOW_RANK_TEXT.RELATION_TEXT_SOURCE: {}".format(source))
+
+
 class RelationQueryBlock(nn.Module):
     def __init__(self, feature_dim, num_heads=4, dropout=0.1):
         super(RelationQueryBlock, self).__init__()
