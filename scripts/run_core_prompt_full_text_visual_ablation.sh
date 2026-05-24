@@ -35,6 +35,7 @@ run_union_zero_shot() {
     --nproc_per_node=1 \
     tools/relation_train_net.py \
     --eval-only \
+    --eval-val \
     --config-file "${CONFIG_FILE}" \
     "${COMMON_OPTS[@]}" \
     MODEL.ROI_RELATION_HEAD.LOW_RANK_TEXT.CORE_VISUAL_SOURCE clip_union \
@@ -42,7 +43,7 @@ run_union_zero_shot() {
     MODEL.ROI_RELATION_HEAD.LOW_RANK_TEXT.ORIGINAL_CLIP_EVAL_WEIGHT 0.0 \
     MODEL.ROI_RELATION_HEAD.LOW_RANK_TEXT.DEBUG_INTERVAL 0 \
     OUTPUT_DIR "${output_dir}" \
-    > "${log_file}" 2>&1
+    > "${log_file}"
 }
 
 run_mva_train() {
@@ -72,7 +73,7 @@ run_mva_train() {
     SOLVER.VAL_PERIOD 4000 \
     SOLVER.CHECKPOINT_PERIOD 4000 \
     OUTPUT_DIR "${output_dir}" \
-    > "${log_file}" 2>&1
+    > "${log_file}"
 }
 
 TEXT_SOURCES=(decomposed relation_of)

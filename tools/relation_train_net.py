@@ -359,6 +359,12 @@ def main():
         action="store_true",
     )
     parser.add_argument(
+        "--eval-val",
+        dest="eval_val",
+        help="When using --eval-only, run validation before test.",
+        action="store_true",
+    )
+    parser.add_argument(
         "opts",
         help="Modify config options using the command-line",
         default=None,
@@ -408,6 +414,12 @@ def main():
         device = torch.device(cfg.MODEL.DEVICE)
         model.to(device)
 
+        load_mapping = {"roi_heads.relation.box_feature_extractor": "roi_heads.box.feature_extractor",
+                        "roi_heads.relation.union_feature_extractor.feature_extractor": "roi_heads.box.feature_extractor"}
+        if cfg.MODEL.ATTRIBUTE_ON:
+            load_mapping["roi_heads.relation.att_feature_extractor"] = "roi_heads.attribute.feature_extractor"
+            load_mapping["roi_heads.relation.union_feature_extractor.att_feature_extractor"] = "roi_heads.attribute.feature_extractor"
+
         save_to_disk = get_rank() == 0
         checkpointer = DetectronCheckpointer(
             cfg,
@@ -416,7 +428,10 @@ def main():
             save_to_disk=save_to_disk,
             custom_scheduler=True,
         )
-        checkpointer.load(cfg.MODEL.PRETRAINED_DETECTOR_CKPT, with_optim=False)
+        checkpointer.load(cfg.MODEL.PRETRAINED_DETECTOR_CKPT, with_optim=False, load_mapping=load_mapping)
+        if args.eval_val:
+            val_data_loaders = make_data_loader(cfg, mode='val', is_distributed=args.distributed)
+            run_val(cfg, model, val_data_loaders, args.distributed, logger)
         run_test(cfg, model, args.distributed, logger)
         return
 
