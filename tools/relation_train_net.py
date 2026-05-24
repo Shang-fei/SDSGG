@@ -353,6 +353,12 @@ def main():
         action="store_true",
     )
     parser.add_argument(
+        "--eval-only",
+        dest="eval_only",
+        help="Only run evaluation with the loaded checkpoint, without training.",
+        action="store_true",
+    )
+    parser.add_argument(
         "opts",
         help="Modify config options using the command-line",
         default=None,
@@ -396,6 +402,23 @@ def main():
     logger.info("Saving config into: {}".format(output_config_path))
     # save overloaded model config in the output directory
     save_config(cfg, output_config_path)
+
+    if args.eval_only:
+        model = build_detection_model(cfg)
+        device = torch.device(cfg.MODEL.DEVICE)
+        model.to(device)
+
+        save_to_disk = get_rank() == 0
+        checkpointer = DetectronCheckpointer(
+            cfg,
+            model,
+            save_dir=output_dir,
+            save_to_disk=save_to_disk,
+            custom_scheduler=True,
+        )
+        checkpointer.load(cfg.MODEL.PRETRAINED_DETECTOR_CKPT, with_optim=False)
+        run_test(cfg, model, args.distributed, logger)
+        return
 
     model = train(cfg, args.local_rank, args.distributed, logger)
 
