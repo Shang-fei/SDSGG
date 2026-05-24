@@ -1131,6 +1131,8 @@ class CorePromptClipPredictor(nn.Module):
         self.context_layer = TransformerContext(config, obj_classes, rel_classes, in_channels)
         self.adaper_clip1 = MVA()
         self.adaper_clip2 = MVA()
+        self.clip_union_projection = nn.Linear(512, 512, bias=False).half()
+        nn.init.eye_(self.clip_union_projection.weight)
         self.obj_names = obj_classes
         self.train_predicate_names = rel_classes
         self.id_dict = VG_PREDICATE_ID
@@ -1243,6 +1245,9 @@ class CorePromptClipPredictor(nn.Module):
                 union_features = self._encode_pair_union_crops(proposal, pair_idxs, image)
             if union_features.dim() == 3:
                 union_features = union_features[:, 0, :]
+            union_features = self.clip_union_projection(
+                union_features.to(self.clip_union_projection.weight.dtype)
+            )
             return F.normalize(union_features, dim=-1), None
 
         with torch.no_grad():
@@ -1372,6 +1377,8 @@ class CorePromptClipPredictor(nn.Module):
             logits = logits / self.logit_temperature
             bg_logits = logits.new_zeros((logits.size(0), 1))
             logits = torch.cat((bg_logits, logits), dim=1)
+            if self.training:
+                logits = logits + self.clip_union_projection.weight.sum().to(logits.dtype) * 0.0
             original_clip_eval_weight = min(max(float(self.prompt_cfg.ORIGINAL_CLIP_EVAL_WEIGHT), 0.0), 1.0)
             if not self.training and original_clip_eval_weight > 0:
                 if image_features_for_eval is None:
