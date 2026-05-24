@@ -133,9 +133,9 @@ class LowRankBasisAlignmentLoss(nn.Module):
     def __init__(self, cfg):
         super(LowRankBasisAlignmentLoss, self).__init__()
         low_rank_cfg = cfg.MODEL.ROI_RELATION_HEAD.LOW_RANK_TEXT
-        self.alpha = low_rank_cfg.BASIS_ALIGN_ALPHA
-        self.beta = low_rank_cfg.BASIS_ALIGN_BETA
-        self.margin = low_rank_cfg.BASIS_ALIGN_MARGIN
+        self.alpha = getattr(low_rank_cfg, "BASIS_ALIGN_ALPHA", 2.0)
+        self.beta = getattr(low_rank_cfg, "BASIS_ALIGN_BETA", 0.01)
+        self.margin = getattr(low_rank_cfg, "BASIS_ALIGN_MARGIN", 0.03)
 
     def forward(self, relation_logits, rel_labels):
         if relation_logits.dim() != 3 or relation_logits.size(1) != 3:
