@@ -6,30 +6,25 @@ from torch.nn import functional as F
 def init_hola_low_rank_with_pca(text_features, rank):
     from sklearn.decomposition import PCA
 
-    # F: [N, d]
-    F_np = text_features.detach().cpu().float().numpy()
+    features_np = text_features.detach().cpu().float().numpy()
 
     if isinstance(rank, float) and rank <= 1:
         n_components = rank
     else:
-        n_components = min(int(rank), min(F_np.shape[0], F_np.shape[1]))
+        n_components = min(int(rank), min(features_np.shape[0], features_np.shape[1]))
         n_components = max(1, n_components)
 
     pca = PCA(n_components=n_components)
 
-    # W: [N, m]
-    W = pca.fit_transform(F_np) # (N, m)
-    B = pca.components_         # (m, d)
+    weights = pca.fit_transform(features_np)
+    basis = pca.components_
     mean = pca.mean_            # (d,)
 
-    W = torch.tensor(W, device=text_features.device, dtype=text_features.dtype)
-    B = torch.tensor(B, device=text_features.device, dtype=text_features.dtype)
+    weights = torch.tensor(weights, device=text_features.device, dtype=text_features.dtype)
+    basis = torch.tensor(basis, device=text_features.device, dtype=text_features.dtype)
     mean = torch.tensor(mean, device=text_features.device, dtype=text_features.dtype)
-
-    # normalize each basis vector b_i
-    B = F.normalize(B, dim=-1)
-
-    return B, W, mean
+    basis = F.normalize(basis, dim=-1)
+    return basis, weights, mean
 
 
 class HOLaLowRankDecomposer(nn.Module):
@@ -51,11 +46,8 @@ class HOLaLowRankDecomposer(nn.Module):
         sparsity_weight=0.1,
         basis_decorr_weight=0.001,
         weight_decorr_weight=0.001,
-        address_anchor_weight=0.0,
-        address_graph_weight=0.0,
-        address_graph_topk=5,
         weight_delta_scale=1.0,
-        weight_anchor_weight=None,
+        weight_anchor_weight=0.0,
     ):
         super(HOLaLowRankDecomposer, self).__init__()
         if train_mode not in ("w", "b", "both", "none"):
@@ -80,10 +72,6 @@ class HOLaLowRankDecomposer(nn.Module):
         self.register_buffer("original_text_features", text_features)
         self.register_buffer("text_mean", text_mean)
         self.register_buffer("initial_class_weights", weights.detach().clone())
-        self.register_buffer(
-            "address_graph",
-            self._build_address_graph(weights.detach().float(), int(address_graph_topk)),
-        )
 
         self.train_mode = train_mode
         self.recon_loss_weight = recon_loss_weight
@@ -91,26 +79,8 @@ class HOLaLowRankDecomposer(nn.Module):
         self.basis_decorr_weight = basis_decorr_weight
         self.weight_decorr_weight = weight_decorr_weight
         self.weight_delta_scale = float(weight_delta_scale)
-        self.weight_anchor_weight = (
-            address_anchor_weight if weight_anchor_weight is None else weight_anchor_weight
-        )
-        self.address_graph_weight = address_graph_weight
+        self.weight_anchor_weight = float(weight_anchor_weight)
         self.recon_loss = nn.MSELoss(reduction="sum")
-
-    @staticmethod
-    def _build_address_graph(weights, topk):
-        if weights.size(0) <= 1 or topk <= 0:
-            return weights.new_zeros((weights.size(0), weights.size(0)))
-
-        normalized = F.normalize(weights, dim=-1)
-        sim = (normalized @ normalized.t()).clamp_min(0)
-        sim.fill_diagonal_(0)
-        k = min(topk, weights.size(0) - 1)
-        values, indices = sim.topk(k=k, dim=1)
-        graph = torch.zeros_like(sim)
-        graph.scatter_(1, indices, values)
-        graph = torch.maximum(graph, graph.t())
-        return graph
 
     def effective_class_weights(self):
         weights = self.class_weights
@@ -162,13 +132,7 @@ class HOLaLowRankDecomposer(nn.Module):
             losses["basis_decorr"] = disentangle.abs().sum() * self.basis_decorr_weight
         if self.weight_anchor_weight > 0:
             delta = self.class_weights.float() - self.initial_class_weights.float()
-            losses["lowrank_anchor"] = delta.pow(2).mean() * self.weight_anchor_weight
-        if self.address_graph_weight > 0 and self.address_graph.sum() > 0:
-            graph = self.address_graph.float().to(self.class_weights.device)
-            delta = self.class_weights.float() - self.initial_class_weights.float()
-            dist = torch.cdist(delta, delta, p=2).pow(2)
-            losses["address_graph"] = (graph * dist).sum() / graph.sum().clamp_min(1e-6)
-            losses["address_graph"] = losses["address_graph"] * self.address_graph_weight
+            losses["weight_anchor"] = delta.pow(2).mean() * self.weight_anchor_weight
         return losses
 
     def debug_stats(self):

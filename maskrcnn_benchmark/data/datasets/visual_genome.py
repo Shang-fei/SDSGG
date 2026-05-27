@@ -155,40 +155,30 @@ class VGDataset(torch.utils.data.Dataset):
         self.ind_to_classes, self.ind_to_predicates = new_ind_to_classes, new_ind_to_predicates
         self.categories = {i: self.ind_to_classes[i] for i in range(len(self.ind_to_classes))}
 
-    def _set_base(self):
-        self._filter_labels(cfg.OV_SETTING.OBJS_BASE, cfg.OV_SETTING.PRDCS_BASE, self.split)
-
-    def _set_novel(self):
-        self._filter_labels(cfg.OV_SETTING.OBJS_NOVEL, cfg.OV_SETTING.PRDCS_NOVEL, self.split)
-
     def _change_part(self):
-        if self.split == 'train':
-            if cfg.OV_SETTING.TRAIN_PART == 'base':
-                self._set_base()
-            elif cfg.OV_SETTING.TRAIN_PART == 'novel':
-                self._set_novel()
-            elif cfg.OV_SETTING.TRAIN_PART == 'semantic':
-                self._filter_labels(cfg.OV_SETTING.OBJS_BASE, cfg.OV_SETTING.SEMAN, self.split)
-            elif cfg.OV_SETTING.TRAIN_PART == 'total':
-                self._filter_labels(cfg.OV_SETTING.OBJS_BASE, cfg.OV_SETTING.PRDCS_BASE+cfg.OV_SETTING.PRDCS_NOVEL, self.split)
-        elif self.split == 'val':
-            if cfg.OV_SETTING.VAL_PART == 'base':
-                self._set_base()
-            elif cfg.OV_SETTING.VAL_PART == 'novel':
-                self._set_novel()
-            elif cfg.OV_SETTING.VAL_PART == 'semantic':
-                self._filter_labels(cfg.OV_SETTING.OBJS_BASE, cfg.OV_SETTING.SEMAN, self.split)
-            elif cfg.OV_SETTING.VAL_PART == 'total':
-                pass
-        elif self.split == 'test':
-            if cfg.OV_SETTING.TEST_PART == 'base':
-                self._set_base()
-            elif cfg.OV_SETTING.TEST_PART == 'novel':
-                self._set_novel()
-            elif cfg.OV_SETTING.TEST_PART == 'semantic':
-                self._filter_labels(cfg.OV_SETTING.OBJS_BASE, cfg.OV_SETTING.SEMAN, self.split)
-            elif cfg.OV_SETTING.TEST_PART == 'total':
-                pass
+        part = getattr(cfg.OV_SETTING, "{}_PART".format(self.split.upper())).lower()
+        filter_spec = self._ov_filter_spec(part)
+        if filter_spec is None:
+            return
+        obj_names, predicate_names = filter_spec
+        self._filter_labels(obj_names, predicate_names, self.split)
+
+    def _ov_filter_spec(self, part):
+        part_specs = {
+            "base": (cfg.OV_SETTING.OBJS_BASE, cfg.OV_SETTING.PRDCS_BASE),
+            "novel": (cfg.OV_SETTING.OBJS_NOVEL, cfg.OV_SETTING.PRDCS_NOVEL),
+            "semantic": (cfg.OV_SETTING.OBJS_BASE, cfg.OV_SETTING.SEMAN),
+        }
+        if part == "total":
+            if self.split == "train":
+                predicates = cfg.OV_SETTING.PRDCS_BASE + cfg.OV_SETTING.PRDCS_NOVEL
+                return cfg.OV_SETTING.OBJS_BASE, predicates
+            return None
+        if part not in part_specs:
+            raise ValueError(
+                "Unsupported OV_SETTING.{}_PART: {}".format(self.split.upper(), part)
+            )
+        return part_specs[part]
 
     def _export_valid_pair(self):
         info = {}

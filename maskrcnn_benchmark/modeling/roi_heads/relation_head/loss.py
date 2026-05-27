@@ -17,7 +17,6 @@ from maskrcnn_benchmark.modeling.utils import cat
 from .relation_losses import (
     ClipDescriptionRegressionLoss,
     ForegroundPredicateAlignmentLoss,
-    LowRankBasisAlignmentLoss,
 )
 
 curpath=os.path.dirname(__file__)
@@ -76,18 +75,6 @@ class RelationLossComputation(object):
         self.use_label_smoothing = use_label_smoothing
         predictor = cfg.MODEL.ROI_RELATION_HEAD.PREDICTOR if cfg is not None else ""
         if predictor == "LowRankClipPredictor":
-            low_rank_loss_type = cfg.MODEL.ROI_RELATION_HEAD.LOW_RANK_TEXT.LOSS_TYPE
-            if low_rank_loss_type == "basis_align":
-                self.relation_criterion = LowRankBasisAlignmentLoss(cfg)
-            elif low_rank_loss_type == "predicate_focal":
-                self.relation_criterion = ForegroundPredicateAlignmentLoss(
-                    cfg,
-                    predicate_proportion,
-                    device,
-                )
-            else:
-                raise ValueError("Unsupported LOW_RANK_TEXT.LOSS_TYPE: {}".format(low_rank_loss_type))
-        elif predictor == "CorePromptClipPredictor":
             self.relation_criterion = ForegroundPredicateAlignmentLoss(
                 cfg,
                 predicate_proportion,

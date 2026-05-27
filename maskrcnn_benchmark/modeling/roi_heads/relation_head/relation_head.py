@@ -39,8 +39,11 @@ class ROIRelationHead(torch.nn.Module):
         # parameters
         self.use_union_box = self.cfg.MODEL.ROI_RELATION_HEAD.PREDICT_USE_VISION
 
-    def updata(self,mode):
-        self.predictor.updata(mode)
+    def update_split(self, mode):
+        self.predictor.update_split(mode)
+
+    def updata(self, mode):
+        self.update_split(mode)
 
     def forward(self, features, proposals, targets=None, logger=None,img=None):
         """

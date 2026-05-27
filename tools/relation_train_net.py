@@ -13,7 +13,6 @@ import time
 import datetime
 
 import torch
-from torch.nn.utils import clip_grad_norm_
 
 from maskrcnn_benchmark.config import cfg
 from maskrcnn_benchmark.data import make_data_loader
@@ -26,16 +25,9 @@ from maskrcnn_benchmark.utils.checkpoint import DetectronCheckpointer
 from maskrcnn_benchmark.utils.checkpoint import clip_grad_norm
 from maskrcnn_benchmark.utils.collect_env import collect_env_info
 from maskrcnn_benchmark.utils.comm import synchronize, get_rank, all_gather
-from maskrcnn_benchmark.utils.imports import import_file
 from maskrcnn_benchmark.utils.logger import setup_logger, debug_print
 from maskrcnn_benchmark.utils.miscellaneous import mkdir, save_config
 from maskrcnn_benchmark.utils.metric_logger import MetricLogger
-
-
-# See if we can use apex.DistributedDataParallel instead of the torch default,
-
-from torch.cuda.amp import autocast as autocast, GradScaler
-from thop import  profile
 
 def train(cfg, local_rank, distributed, logger):
     debug_print(logger, 'prepare training')
@@ -71,9 +63,6 @@ def train(cfg, local_rank, distributed, logger):
     optimizer = make_optimizer(cfg, model, logger, slow_heads=slow_heads, slow_ratio=10.0, rl_factor=float(num_batch))
     scheduler = make_lr_scheduler(cfg, optimizer, logger)
     debug_print(logger, 'end optimizer and shcedule')
-    # Initialize mixed-precision training
-    use_mixed_precision = cfg.DTYPE == "float16"
-
     if distributed:
         model = torch.nn.parallel.DistributedDataParallel(
             model, device_ids=[local_rank], output_device=local_rank,
@@ -126,17 +115,8 @@ def train(cfg, local_rank, distributed, logger):
     start_training_time = time.time()
     end = time.time()
     
-    scaler = GradScaler()
     print_first_grad = True
     for iteration, (images, targets, _) in enumerate(train_data_loader, start_iter):
-        tmp=0
-        for data in targets:
-
-            if data.get_field("relation").shape[0]==1:
-                print(data.get_field("relation"))
-                tmp=1
-        if tmp==1:
-            continue
         if any(len(target) < 1 for target in targets):
             logger.error(f"Iteration={iteration + 1} || Image Ids used for training {_} || targets Length={[len(target) for target in targets]}" )
         data_time = time.time() - end
@@ -160,9 +140,6 @@ def train(cfg, local_rank, distributed, logger):
         meters.update(loss=losses_reduced, **loss_dict_reduced)
 
         optimizer.zero_grad()
-        # Note: If mixed precision is not used, this ends up doing nothing
-        # Otherwise apply loss scaling for mixed-precision recipe
-
         losses.backward()
         
         # add clip_grad_norm from MOTIFS, tracking gradient, used for debug
@@ -256,7 +233,7 @@ def run_val(cfg, model, val_data_loaders, distributed, logger):
     val_result = []
     
     for dataset_name, val_data_loader in zip(dataset_names, val_data_loaders):
-        model.updata(cfg.OV_SETTING.VAL_PART)
+        model.update_split(cfg.OV_SETTING.VAL_PART)
         dataset_result = inference(
                             cfg,
                             model,
@@ -281,7 +258,7 @@ def run_val(cfg, model, val_data_loaders, distributed, logger):
     del gathered_result, valid_result
     torch.cuda.empty_cache()
 
-    model.updata(cfg.OV_SETTING.TRAIN_PART)
+    model.update_split(cfg.OV_SETTING.TRAIN_PART)
     return val_result
 
 def run_test(cfg, model, distributed, logger):
@@ -309,7 +286,7 @@ def run_test(cfg, model, distributed, logger):
     data_loaders_val = make_data_loader(cfg, mode='test', is_distributed=distributed)
     test_result = []
     for output_folder, dataset_name, data_loader_val in zip(output_folders, dataset_names, data_loaders_val):
-        model.updata(cfg.OV_SETTING.TEST_PART)
+        model.update_split(cfg.OV_SETTING.TEST_PART)
         dataset_result = inference(
             cfg,
             model,
@@ -325,7 +302,7 @@ def run_test(cfg, model, distributed, logger):
         )
         synchronize()
         test_result.append(dataset_result)
-    model.updata(cfg.OV_SETTING.TRAIN_PART)
+    model.update_split(cfg.OV_SETTING.TRAIN_PART)
     gathered_result = all_gather(torch.tensor(dataset_result).cpu())
     gathered_result = [t.view(-1) for t in gathered_result]
     gathered_result = torch.cat(gathered_result, dim=-1).view(-1)
@@ -350,18 +327,6 @@ def main():
         "--skip-test",
         dest="skip_test",
         help="Do not test the final model",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--eval-only",
-        dest="eval_only",
-        help="Only run evaluation with the loaded checkpoint, without training.",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--eval-val",
-        dest="eval_val",
-        help="When using --eval-only, run validation before test.",
         action="store_true",
     )
     parser.add_argument(
@@ -408,32 +373,6 @@ def main():
     logger.info("Saving config into: {}".format(output_config_path))
     # save overloaded model config in the output directory
     save_config(cfg, output_config_path)
-
-    if args.eval_only:
-        model = build_detection_model(cfg)
-        device = torch.device(cfg.MODEL.DEVICE)
-        model.to(device)
-
-        load_mapping = {"roi_heads.relation.box_feature_extractor": "roi_heads.box.feature_extractor",
-                        "roi_heads.relation.union_feature_extractor.feature_extractor": "roi_heads.box.feature_extractor"}
-        if cfg.MODEL.ATTRIBUTE_ON:
-            load_mapping["roi_heads.relation.att_feature_extractor"] = "roi_heads.attribute.feature_extractor"
-            load_mapping["roi_heads.relation.union_feature_extractor.att_feature_extractor"] = "roi_heads.attribute.feature_extractor"
-
-        save_to_disk = get_rank() == 0
-        checkpointer = DetectronCheckpointer(
-            cfg,
-            model,
-            save_dir=output_dir,
-            save_to_disk=save_to_disk,
-            custom_scheduler=True,
-        )
-        checkpointer.load(cfg.MODEL.PRETRAINED_DETECTOR_CKPT, with_optim=False, load_mapping=load_mapping)
-        if args.eval_val:
-            val_data_loaders = make_data_loader(cfg, mode='val', is_distributed=args.distributed)
-            run_val(cfg, model, val_data_loaders, args.distributed, logger)
-        run_test(cfg, model, args.distributed, logger)
-        return
 
     model = train(cfg, args.local_rank, args.distributed, logger)
 
