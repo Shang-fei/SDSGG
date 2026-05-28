@@ -1,5 +1,6 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved.
 import os
+import json
 import numpy as np
 import torch
 from maskrcnn_benchmark.modeling import registry
@@ -129,6 +130,103 @@ class MVA(nn.Module):
         sub_features= ratio * x + (1 - ratio) * sub_features[:,0,:]
 
         return sub_features
+
+
+def load_relation_concepts(concept_json, fallback_concepts):
+    if concept_json:
+        with open(concept_json, "r") as f:
+            concept_data = json.load(f)
+        if isinstance(concept_data, dict):
+            concept_data = concept_data.get("concepts", concept_data.get("relation_concepts"))
+        if not isinstance(concept_data, list):
+            raise ValueError("EZPC_TEXT.CONCEPT_JSON must contain a list or a 'concepts' field.")
+        return [str(concept) for concept in concept_data]
+    return [str(concept) for concept in fallback_concepts]
+
+
+class EZPCRelationConceptProjector(nn.Module):
+    """EZPC-style concept projection for relation predicates.
+
+    A is initialized from CLIP text embeddings of human-readable relation
+    concepts. Both pair visual features and predicate text features are
+    projected through A, so each predicate logit is decomposable into concept
+    contributions.
+    """
+
+    def __init__(
+        self,
+        concept_features,
+        predicate_text_features,
+        temperature=0.07,
+        match_loss_weight=0.01,
+        recon_loss_weight=0.1,
+        freeze_a=False,
+    ):
+        super(EZPCRelationConceptProjector, self).__init__()
+        concept_features = F.normalize(concept_features.float(), dim=-1)
+        predicate_text_features = F.normalize(predicate_text_features.float(), dim=-1)
+        concept_matrix = concept_features.t().contiguous()
+
+        if freeze_a:
+            self.register_buffer("A", concept_matrix)
+        else:
+            self.A = nn.Parameter(concept_matrix)
+        self.register_buffer("concept_anchor", concept_matrix.detach().clone())
+        self.register_buffer("predicate_text_features", predicate_text_features)
+
+        self.temperature = float(temperature)
+        self.match_loss_weight = float(match_loss_weight)
+        self.recon_loss_weight = float(recon_loss_weight)
+
+    def active_predicate_text(self, fg_ids):
+        return self.predicate_text_features[fg_ids.to(self.predicate_text_features.device).long()].float()
+
+    def project(self, features):
+        return features.float() @ self.A.float()
+
+    def logits(self, visual_features, fg_ids):
+        visual_features = F.normalize(visual_features.float(), dim=-1)
+        text_features = self.active_predicate_text(fg_ids)
+        text_features = F.normalize(text_features.float(), dim=-1)
+
+        visual_concepts = self.project(visual_features)
+        text_concepts = self.project(text_features)
+        temperature = max(self.temperature, 1e-6)
+        concept_logits = visual_concepts @ text_concepts.t() / temperature
+
+        with torch.no_grad():
+            teacher_logits = visual_features @ text_features.t() / temperature
+        return concept_logits, teacher_logits, visual_concepts, text_concepts
+
+    def concept_contributions(self, visual_features, fg_ids):
+        visual_features = F.normalize(visual_features.float(), dim=-1)
+        text_features = F.normalize(self.active_predicate_text(fg_ids), dim=-1)
+        visual_concepts = self.project(visual_features)
+        text_concepts = self.project(text_features)
+        return visual_concepts.unsqueeze(1) * text_concepts.unsqueeze(0)
+
+    def losses(self, concept_logits=None, teacher_logits=None):
+        losses = {}
+        if self.match_loss_weight > 0:
+            losses["loss_ezpc_match"] = (
+                F.mse_loss(self.A.float(), self.concept_anchor.float()) * self.match_loss_weight
+            )
+        if (
+            self.recon_loss_weight > 0
+            and concept_logits is not None
+            and teacher_logits is not None
+            and concept_logits.numel() > 0
+        ):
+            losses["loss_ezpc_recon"] = (
+                F.kl_div(
+                    F.log_softmax(concept_logits.float(), dim=-1),
+                    F.softmax(teacher_logits.float(), dim=-1),
+                    reduction="batchmean",
+                )
+                * self.recon_loss_weight
+            )
+        return losses
+
 
 @registry.ROI_RELATION_PREDICTOR.register("GQAClipPredictor")
 class GQAClipPredictor(nn.Module):
@@ -671,6 +769,156 @@ class ClipPredictor(nn.Module):
 
         add_losses = {}
         return obj_dists, rel_dists, add_losses
+
+
+@registry.ROI_RELATION_PREDICTOR.register("EZPCClipPredictor")
+class EZPCClipPredictor(nn.Module):
+    def __init__(self, config, in_channels):
+        super(EZPCClipPredictor, self).__init__()
+        self.attribute_on = config.MODEL.ATTRIBUTE_ON
+        self.num_obj_cls = config.MODEL.ROI_BOX_HEAD.NUM_CLASSES
+        self.num_att_cls = config.MODEL.ROI_ATTRIBUTE_HEAD.NUM_ATTRIBUTES
+        self.num_rel_cls = config.MODEL.ROI_RELATION_HEAD.NUM_CLASSES
+        self.device = config.MODEL.DEVICE
+        self.ezpc_cfg = config.MODEL.ROI_RELATION_HEAD.EZPC_TEXT
+
+        statistics = get_dataset_statistics(config)
+        obj_classes = statistics["obj_classes"]
+        rel_classes = statistics["rel_classes"]
+
+        self.obj_names = obj_classes
+        self.train_predicate_names = rel_classes
+        self.predicate_names = build_full_predicate_names(config)
+        self.rel_splits = build_predicate_splits(config)
+        self.clip_model, self.clip_preprocess = clip.load("ViT-B/32", device=self.device)
+        self.context_layer = TransformerContext(config, obj_classes, rel_classes, in_channels)
+        self.mva_s2o = MVA()
+        self.mva_o2s = MVA()
+        self.update_split(config.OV_SETTING.TRAIN_PART)
+
+        with torch.no_grad():
+            self._encode_object_role_texts()
+            concept_features = self._encode_relation_concepts()
+            predicate_text_features = self._encode_predicate_texts(config)
+
+        self.concept_projector = EZPCRelationConceptProjector(
+            concept_features=concept_features,
+            predicate_text_features=predicate_text_features,
+            temperature=self.ezpc_cfg.CLASSIFIER_TEMPERATURE,
+            match_loss_weight=self.ezpc_cfg.MATCH_LOSS_WEIGHT,
+            recon_loss_weight=self.ezpc_cfg.RECON_LOSS_WEIGHT,
+            freeze_a=self.ezpc_cfg.FREEZE_A,
+        ).to(self.device)
+
+    def _encode_texts(self, texts):
+        text_tokens = clip.tokenize(texts).to(self.device)
+        text_features = self.clip_model.encode_text(text_tokens).float()
+        return F.normalize(text_features, dim=-1)
+
+    def _encode_relation_concepts(self):
+        concepts = load_relation_concepts(
+            self.ezpc_cfg.CONCEPT_JSON,
+            self.ezpc_cfg.CONCEPTS,
+        )
+        if not concepts:
+            raise ValueError("EZPC_TEXT must provide at least one relation concept.")
+        self.relation_concepts = concepts
+        return self._encode_texts(["a photo showing " + concept for concept in concepts])
+
+    def _encode_predicate_texts(self, config):
+        prompt_json = config.MODEL.ROI_RELATION_HEAD.LOW_RANK_TEXT.PROMPT_JSON
+        prompt_field = config.MODEL.ROI_RELATION_HEAD.LOW_RANK_TEXT.PROMPT_FIELD
+        if prompt_json and os.path.exists(prompt_json):
+            relation_texts = load_relation_prompt_texts(prompt_json, self.predicate_names, prompt_field)
+        else:
+            template = self.ezpc_cfg.PREDICATE_PROMPT
+            relation_texts = [template.format(name) for name in self.predicate_names[1:]]
+        return self._encode_texts(relation_texts)
+
+    def _encode_object_role_texts(self):
+        self.subject_role_text = self._encode_texts(["a photo of subject" for _ in self.obj_names])
+        self.object_role_text = self._encode_texts(["a photo of object" for _ in self.obj_names])
+
+    def update_split(self, mode):
+        print("now is " + mode)
+        if mode not in ("base", "novel", "semantic", "total"):
+            raise ValueError("Unsupported OV relation split: {}".format(mode))
+        self.mode = mode
+        self.rel_ids = torch.as_tensor(self.rel_splits[mode], device=self.device, dtype=torch.long)
+        self.fg_rel_ids = self.rel_ids[1:] - 1
+
+    def updata(self, mode):
+        self.update_split(mode)
+
+    def _encode_object_crops(self, proposal, image):
+        image_tensor = []
+        for box in proposal.bbox:
+            crop = crop_and_resize(image.unsqueeze(0), box, box)
+            crop = crop[0].permute(1, 2, 0).detach().cpu().numpy() * 255
+            crop = Image.fromarray(np.uint8(crop))
+            crop = self.clip_preprocess(crop).unsqueeze(0).to(self.device)
+            image_tensor.append(crop)
+        image_tensor = torch.cat(image_tensor)
+        return self.clip_model.encode_image(image_tensor)
+
+    def forward(self, proposals, rel_pair_idxs, rel_labels, rel_binarys, roi_features, union_features, logger=None, img=None):
+        if self.attribute_on:
+            obj_dists, obj_preds, att_dists, edge_ctx = self.context_layer(roi_features, proposals, logger)
+        else:
+            obj_dists, obj_preds, edge_ctx = self.context_layer(roi_features, proposals, logger)
+
+        num_rels = [r.shape[0] for r in rel_pair_idxs]
+        num_objs = [len(b) for b in proposals]
+        assert len(num_rels) == len(num_objs)
+        obj_preds = obj_preds.split(num_objs, dim=0)
+
+        rel_dists = []
+        concept_logit_list = []
+        teacher_logit_list = []
+        for i in range(len(num_rels)):
+            if num_rels[i] == 0:
+                rel_dists.append(roi_features.new_zeros((0, len(self.rel_ids))))
+                continue
+
+            with torch.no_grad():
+                image_features = self._encode_object_crops(proposals[i], img[i])
+
+            pair_idxs = rel_pair_idxs[i]
+            subject_tokens = F.normalize(image_features[pair_idxs[:, 0]], dim=-1)
+            object_tokens = F.normalize(image_features[pair_idxs[:, 1]], dim=-1)
+            subj_labels = obj_preds[i][pair_idxs[:, 0]]
+            obj_labels = obj_preds[i][pair_idxs[:, 1]]
+
+            cross_output1 = self.mva_s2o(
+                subject_tokens,
+                object_tokens,
+                self.subject_role_text[subj_labels],
+            )
+            cross_output2 = self.mva_o2s(
+                object_tokens,
+                subject_tokens,
+                self.object_role_text[obj_labels],
+            )
+            pair_features = F.normalize((cross_output1.float() + cross_output2.float()) / 2, dim=-1)
+
+            concept_logits, teacher_logits, _, _ = self.concept_projector.logits(
+                pair_features,
+                self.fg_rel_ids,
+            )
+            bg_logits = concept_logits.new_zeros((concept_logits.size(0), 1))
+            logits = torch.cat((bg_logits, concept_logits), dim=1)
+
+            rel_dists.append(logits)
+            concept_logit_list.append(concept_logits)
+            teacher_logit_list.append(teacher_logits)
+
+        obj_dists = obj_dists.split(num_objs, dim=0)
+        add_losses = {}
+        if self.training:
+            concept_logits = torch.cat(concept_logit_list, dim=0) if concept_logit_list else None
+            teacher_logits = torch.cat(teacher_logit_list, dim=0) if teacher_logit_list else None
+            add_losses.update(self.concept_projector.losses(concept_logits, teacher_logits))
+        return obj_dists, tuple(rel_dists), add_losses
 
 
 @registry.ROI_RELATION_PREDICTOR.register("LowRankClipPredictor")

@@ -343,6 +343,41 @@ _C.MODEL.ROI_RELATION_HEAD.LOW_RANK_TEXT.FOCAL_ALPHA = 1.0
 _C.MODEL.ROI_RELATION_HEAD.LOW_RANK_TEXT.CLASS_WEIGHT_POWER = 0.5
 _C.MODEL.ROI_RELATION_HEAD.LOW_RANK_TEXT.CLASS_WEIGHT_MIN = 0.25
 _C.MODEL.ROI_RELATION_HEAD.LOW_RANK_TEXT.CLASS_WEIGHT_MAX = 4.0
+
+# EZPC-style relation concept projection. The predictor initializes A from
+# CLIP text embeddings of these relation concepts, then projects both pair
+# visual features and predicate text features into the same concept space.
+_C.MODEL.ROI_RELATION_HEAD.EZPC_TEXT = CN()
+_C.MODEL.ROI_RELATION_HEAD.EZPC_TEXT.CONCEPT_JSON = ""
+_C.MODEL.ROI_RELATION_HEAD.EZPC_TEXT.CONCEPTS = [
+    "objects overlap",
+    "objects are spatially separated",
+    "one object is above another",
+    "one object is below another",
+    "one object is inside another",
+    "one object is in front of another",
+    "one object is behind another",
+    "direct physical contact",
+    "no physical contact",
+    "supporting weight",
+    "attached or connected",
+    "part whole structure",
+    "surface marking or text",
+    "human hand manipulation",
+    "holding or carrying",
+    "wearing or covering body",
+    "riding or sitting support",
+    "using a tool or object",
+    "eating or drinking interaction",
+    "looking or watching attention",
+    "motion through a scene",
+    "object has functional affordance",
+]
+_C.MODEL.ROI_RELATION_HEAD.EZPC_TEXT.PREDICATE_PROMPT = "a photo of a {} relation"
+_C.MODEL.ROI_RELATION_HEAD.EZPC_TEXT.CLASSIFIER_TEMPERATURE = 0.07
+_C.MODEL.ROI_RELATION_HEAD.EZPC_TEXT.MATCH_LOSS_WEIGHT = 0.01
+_C.MODEL.ROI_RELATION_HEAD.EZPC_TEXT.RECON_LOSS_WEIGHT = 0.1
+_C.MODEL.ROI_RELATION_HEAD.EZPC_TEXT.FREEZE_A = False
 _C.MODEL.ROI_RELATION_HEAD.REQUIRE_BOX_OVERLAP = True
 _C.MODEL.ROI_RELATION_HEAD.NUM_SAMPLE_PER_GT_REL = 4  # when sample fg relationship from gt, the max number of corresponding proposal pairs
 
