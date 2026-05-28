@@ -795,6 +795,7 @@ class EZPCClipPredictor(nn.Module):
         self.mva_s2o = MVA()
         self.mva_o2s = MVA()
         self.update_split(config.OV_SETTING.TRAIN_PART)
+        self._check_train_predicate_order()
 
         with torch.no_grad():
             self._encode_object_role_texts()
@@ -849,6 +850,15 @@ class EZPCClipPredictor(nn.Module):
 
     def updata(self, mode):
         self.update_split(mode)
+
+    def _check_train_predicate_order(self):
+        rel_ids = self.rel_ids.detach().cpu().tolist()
+        active_names = [self.predicate_names[idx] for idx in rel_ids]
+        if active_names != self.train_predicate_names:
+            raise ValueError(
+                "EZPC active predicate order does not match dataset labels. "
+                "active={} dataset={}".format(active_names, self.train_predicate_names)
+            )
 
     def _encode_object_crops(self, proposal, image):
         image_tensor = []
@@ -909,8 +919,14 @@ class EZPCClipPredictor(nn.Module):
             logits = torch.cat((bg_logits, concept_logits), dim=1)
 
             rel_dists.append(logits)
-            concept_logit_list.append(concept_logits)
-            teacher_logit_list.append(teacher_logits)
+            if self.training and rel_labels is not None:
+                fg_mask = rel_labels[i].to(concept_logits.device).long() > 0
+                if fg_mask.any():
+                    concept_logit_list.append(concept_logits[fg_mask])
+                    teacher_logit_list.append(teacher_logits[fg_mask])
+            else:
+                concept_logit_list.append(concept_logits)
+                teacher_logit_list.append(teacher_logits)
 
         obj_dists = obj_dists.split(num_objs, dim=0)
         add_losses = {}
