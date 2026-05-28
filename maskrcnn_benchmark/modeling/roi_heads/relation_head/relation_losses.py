@@ -63,11 +63,12 @@ class ClipDescriptionRegressionLoss(nn.Module):
 class ForegroundPredicateAlignmentLoss(nn.Module):
     def __init__(self, cfg, predicate_proportion, device):
         super(ForegroundPredicateAlignmentLoss, self).__init__()
-        self.focal_gamma = cfg.MODEL.ROI_RELATION_HEAD.LOW_RANK_TEXT.FOCAL_GAMMA
-        self.focal_alpha = cfg.MODEL.ROI_RELATION_HEAD.LOW_RANK_TEXT.FOCAL_ALPHA
-        self.class_weight_power = cfg.MODEL.ROI_RELATION_HEAD.LOW_RANK_TEXT.CLASS_WEIGHT_POWER
-        self.class_weight_min = cfg.MODEL.ROI_RELATION_HEAD.LOW_RANK_TEXT.CLASS_WEIGHT_MIN
-        self.class_weight_max = cfg.MODEL.ROI_RELATION_HEAD.LOW_RANK_TEXT.CLASS_WEIGHT_MAX
+        loss_cfg = cfg.MODEL.ROI_RELATION_HEAD.PRIMITIVE_TEXT
+        self.focal_gamma = loss_cfg.FOCAL_GAMMA
+        self.focal_alpha = loss_cfg.FOCAL_ALPHA
+        self.class_weight_power = loss_cfg.CLASS_WEIGHT_POWER
+        self.class_weight_min = loss_cfg.CLASS_WEIGHT_MIN
+        self.class_weight_max = loss_cfg.CLASS_WEIGHT_MAX
 
         pred_weight = 1.0 / torch.FloatTensor([0.5] + predicate_proportion).to(device)
         self.register_buffer("pred_weight", self._build_active_pred_weight(cfg, pred_weight))

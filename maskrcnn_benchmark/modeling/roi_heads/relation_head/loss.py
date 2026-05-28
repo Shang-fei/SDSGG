@@ -74,7 +74,7 @@ class RelationLossComputation(object):
         self.attribute_bgfg_ratio = attribute_bgfg_ratio
         self.use_label_smoothing = use_label_smoothing
         predictor = cfg.MODEL.ROI_RELATION_HEAD.PREDICTOR if cfg is not None else ""
-        if predictor in ("LowRankClipPredictor", "EZPCClipPredictor"):
+        if predictor == "PrimitiveLowRankClipPredictor":
             self.relation_criterion = ForegroundPredicateAlignmentLoss(
                 cfg,
                 predicate_proportion,

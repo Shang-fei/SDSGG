@@ -43,7 +43,7 @@ def build_full_predicate_names(cfg):
 
 def load_relation_prompt_texts(prompt_json, predicate_names, field=CORE_PROMPT_FIELD):
     if not prompt_json:
-        raise ValueError("LOW_RANK_TEXT.PROMPT_JSON must point to a predicate prompt JSON.")
+        raise ValueError("prompt_json must point to a predicate prompt JSON.")
     with open(prompt_json, "r") as f:
         prompt_data = json.load(f)
 
@@ -64,8 +64,8 @@ class CoreRelationTextAdapter(nn.Module):
     The adapter owns only the text decomposition path:
       text_features ~= mean + W B
 
-    It deliberately avoids visual transport/gating experiments so LowRankClipPredictor
-    has a clean, auditable baseline.
+    It deliberately avoids visual transport/gating experiments so the predictor has
+    a clean, auditable text-decomposition baseline.
     """
 
     def __init__(

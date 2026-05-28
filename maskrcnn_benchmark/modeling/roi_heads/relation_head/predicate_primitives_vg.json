@@ -1,0 +1,248 @@
+{
+  "primitive_bank": [
+    "vertical spatial ordering",
+    "horizontal spatial ordering",
+    "depth ordering",
+    "spatial proximity",
+    "spatial separation",
+    "physical contact",
+    "no physical contact",
+    "surface support",
+    "load bearing support",
+    "containment",
+    "surrounding enclosure",
+    "attachment",
+    "part whole composition",
+    "ownership or possession",
+    "body part association",
+    "material composition",
+    "surface marking",
+    "text or symbol display",
+    "covering or occlusion",
+    "wearable attachment",
+    "hand manipulation",
+    "carrying motion",
+    "tool use",
+    "functional affordance",
+    "eating interaction",
+    "riding posture",
+    "sitting posture",
+    "standing posture",
+    "lying posture",
+    "walking motion",
+    "flying motion",
+    "growth attachment",
+    "hanging suspension",
+    "parking or placement",
+    "play activity",
+    "visual attention",
+    "directed relation",
+    "source relation",
+    "target relation",
+    "path or traversal",
+    "generic association",
+    "conjunction"
+  ],
+  "predicates": {
+    "above": {
+      "description": "The subject is vertically higher than the object, with the two entities separated or layered in image space.",
+      "primitives": ["vertical spatial ordering", "spatial separation"]
+    },
+    "across": {
+      "description": "The subject spans, crosses, or moves from one side of the object or region to another.",
+      "primitives": ["path or traversal", "horizontal spatial ordering", "directed relation"]
+    },
+    "against": {
+      "description": "The subject is pressed near or in contact with the object, often leaning on or touching its surface.",
+      "primitives": ["physical contact", "surface support", "spatial proximity"]
+    },
+    "along": {
+      "description": "The subject follows the direction, boundary, or extent of the object or scene region.",
+      "primitives": ["path or traversal", "horizontal spatial ordering", "spatial proximity"]
+    },
+    "and": {
+      "description": "The subject and object are jointly present as an associated pair without a more specific visual interaction.",
+      "primitives": ["conjunction", "generic association", "spatial proximity"]
+    },
+    "at": {
+      "description": "The subject is located at or directed toward the object, place, or target region.",
+      "primitives": ["spatial proximity", "target relation", "directed relation"]
+    },
+    "attached to": {
+      "description": "The subject is physically fastened, joined, or connected to the object.",
+      "primitives": ["attachment", "physical contact", "spatial proximity"]
+    },
+    "behind": {
+      "description": "The subject is farther back than the object in depth ordering or partially hidden by it.",
+      "primitives": ["depth ordering", "spatial separation", "covering or occlusion"]
+    },
+    "belonging to": {
+      "description": "The subject is visually associated with the object as something owned, carried, or possessed by it.",
+      "primitives": ["ownership or possession", "generic association", "spatial proximity"]
+    },
+    "between": {
+      "description": "The subject lies in the spatial interval separating other objects or parts of a region.",
+      "primitives": ["horizontal spatial ordering", "spatial proximity", "spatial separation"]
+    },
+    "carrying": {
+      "description": "The subject supports and transports the object, typically through hand, body, or vehicle contact.",
+      "primitives": ["carrying motion", "hand manipulation", "physical contact", "functional affordance"]
+    },
+    "covered in": {
+      "description": "The subject surface is visibly covered by many instances, material, texture, or markings from the object.",
+      "primitives": ["covering or occlusion", "surface marking", "physical contact"]
+    },
+    "covering": {
+      "description": "The subject lies over or occludes the object, hiding part of the object from view.",
+      "primitives": ["covering or occlusion", "physical contact", "vertical spatial ordering"]
+    },
+    "eating": {
+      "description": "The subject consumes or bites the object, usually involving mouth contact and edible affordance.",
+      "primitives": ["eating interaction", "functional affordance", "physical contact", "directed relation"]
+    },
+    "flying in": {
+      "description": "The subject is airborne within a scene region or container-like area.",
+      "primitives": ["flying motion", "containment", "path or traversal"]
+    },
+    "for": {
+      "description": "The subject is intended for, used for, or visually directed toward the object or purpose.",
+      "primitives": ["target relation", "functional affordance", "generic association"]
+    },
+    "from": {
+      "description": "The subject originates at, moves away from, or is visually sourced from the object or region.",
+      "primitives": ["source relation", "directed relation", "path or traversal"]
+    },
+    "growing on": {
+      "description": "The subject is a plant-like or natural part emerging from and attached to the object surface.",
+      "primitives": ["growth attachment", "attachment", "surface support"]
+    },
+    "hanging from": {
+      "description": "The subject is suspended below the object by an attachment or support point.",
+      "primitives": ["hanging suspension", "attachment", "vertical spatial ordering", "physical contact"]
+    },
+    "has": {
+      "description": "The object is a visible part, attribute, or possessed component of the subject.",
+      "primitives": ["ownership or possession", "part whole composition", "body part association"]
+    },
+    "holding": {
+      "description": "The subject grasps or supports the object, usually with hands or a similar manipulator.",
+      "primitives": ["hand manipulation", "physical contact", "functional affordance"]
+    },
+    "in": {
+      "description": "The subject is located inside the object, region, or enclosing space.",
+      "primitives": ["containment", "surrounding enclosure", "spatial proximity"]
+    },
+    "in front of": {
+      "description": "The subject is closer to the viewer than the object in depth ordering.",
+      "primitives": ["depth ordering", "spatial separation", "covering or occlusion"]
+    },
+    "laying on": {
+      "description": "The subject is reclined or spread on the object surface with supporting contact.",
+      "primitives": ["lying posture", "surface support", "physical contact"]
+    },
+    "looking at": {
+      "description": "The subject directs its gaze or visual attention toward the object.",
+      "primitives": ["visual attention", "directed relation", "target relation"]
+    },
+    "lying on": {
+      "description": "The subject lies horizontally on the object or surface with visible support.",
+      "primitives": ["lying posture", "surface support", "physical contact"]
+    },
+    "made of": {
+      "description": "The subject is composed of the material or substance denoted by the object.",
+      "primitives": ["material composition", "part whole composition"]
+    },
+    "mounted on": {
+      "description": "The subject is fixed onto the object surface or support structure.",
+      "primitives": ["attachment", "surface support", "physical contact"]
+    },
+    "near": {
+      "description": "The subject is spatially close to the object without necessarily touching it.",
+      "primitives": ["spatial proximity", "spatial separation", "no physical contact"]
+    },
+    "of": {
+      "description": "The subject is semantically or visually associated with the object as a part, attribute, or possession.",
+      "primitives": ["part whole composition", "ownership or possession", "generic association"]
+    },
+    "on": {
+      "description": "The subject is located on the object surface, often with contact, support, or attachment.",
+      "primitives": ["surface support", "vertical spatial ordering", "physical contact", "attachment"]
+    },
+    "on back of": {
+      "description": "The subject is positioned on the back side or dorsal surface of the object.",
+      "primitives": ["surface support", "body part association", "riding posture", "physical contact"]
+    },
+    "over": {
+      "description": "The subject is above or spanning over the object, often without direct contact.",
+      "primitives": ["vertical spatial ordering", "spatial separation", "covering or occlusion"]
+    },
+    "painted on": {
+      "description": "The subject is a visual mark, image, or color pattern applied to the object surface.",
+      "primitives": ["surface marking", "attachment", "physical contact"]
+    },
+    "parked on": {
+      "description": "The subject vehicle or movable object is stationary on a supporting surface or region.",
+      "primitives": ["parking or placement", "surface support", "physical contact"]
+    },
+    "part of": {
+      "description": "The subject is a visible component or subregion belonging to the object.",
+      "primitives": ["part whole composition", "attachment", "generic association"]
+    },
+    "playing": {
+      "description": "The subject engages with the object in a play, sport, or recreational action.",
+      "primitives": ["play activity", "hand manipulation", "functional affordance", "directed relation"]
+    },
+    "riding": {
+      "description": "The subject sits, stands, or balances on the object while using it for transport or support.",
+      "primitives": ["riding posture", "surface support", "functional affordance", "physical contact"]
+    },
+    "says": {
+      "description": "The subject displays text, symbols, or readable markings corresponding to the object.",
+      "primitives": ["text or symbol display", "surface marking", "generic association"]
+    },
+    "sitting on": {
+      "description": "The subject is seated on the object surface with body support.",
+      "primitives": ["sitting posture", "surface support", "physical contact"]
+    },
+    "standing on": {
+      "description": "The subject stands upright on the object or surface with weight-bearing contact.",
+      "primitives": ["standing posture", "load bearing support", "physical contact", "surface support"]
+    },
+    "to": {
+      "description": "The subject is directed toward the object as a destination, target, or endpoint.",
+      "primitives": ["target relation", "directed relation", "path or traversal"]
+    },
+    "under": {
+      "description": "The subject is vertically lower than and beneath the object.",
+      "primitives": ["vertical spatial ordering", "spatial separation", "depth ordering"]
+    },
+    "using": {
+      "description": "The subject manipulates or operates the object as a tool or functional item.",
+      "primitives": ["tool use", "functional affordance", "hand manipulation", "directed relation"]
+    },
+    "walking in": {
+      "description": "The subject walks within a region, space, or containing scene area.",
+      "primitives": ["walking motion", "containment", "path or traversal"]
+    },
+    "walking on": {
+      "description": "The subject walks across or on top of a supporting surface.",
+      "primitives": ["walking motion", "surface support", "physical contact", "path or traversal"]
+    },
+    "watching": {
+      "description": "The subject visually attends to the object or event over time.",
+      "primitives": ["visual attention", "directed relation", "target relation"]
+    },
+    "wearing": {
+      "description": "The subject has the object attached to or covering its body as clothing or an accessory.",
+      "primitives": ["wearable attachment", "body part association", "physical contact", "covering or occlusion"]
+    },
+    "wears": {
+      "description": "The subject wears the object on its body as clothing, equipment, or an accessory.",
+      "primitives": ["wearable attachment", "body part association", "physical contact", "covering or occlusion"]
+    },
+    "with": {
+      "description": "The subject appears together with the object in a broad visual association.",
+      "primitives": ["generic association", "spatial proximity", "conjunction"]
+    }
+  }
+}
