@@ -423,6 +423,7 @@ class PrimitiveLowRankClipPredictor(nn.Module):
         self.num_rel_cls = config.MODEL.ROI_RELATION_HEAD.NUM_CLASSES
         self.device = config.MODEL.DEVICE
         self.primitive_cfg = config.MODEL.ROI_RELATION_HEAD.PRIMITIVE_TEXT
+        self.debug_log_period = int(self.primitive_cfg.DEBUG_LOG_PERIOD)
 
         statistics = get_dataset_statistics(config)
         obj_classes = statistics["obj_classes"]
@@ -438,6 +439,7 @@ class PrimitiveLowRankClipPredictor(nn.Module):
         self.mva_o2s = MVA()
         self.update_split(config.OV_SETTING.TRAIN_PART)
         self._check_train_predicate_order()
+        self.register_buffer("_debug_forward_count", torch.zeros((), dtype=torch.long))
 
         primitive_json = self._resolve_primitive_json(self.primitive_cfg.JSON_PATH)
         (
@@ -464,6 +466,17 @@ class PrimitiveLowRankClipPredictor(nn.Module):
             weight_decorr_weight=self.primitive_cfg.WEIGHT_DECORR_WEIGHT,
             basis_anchor_weight=self.primitive_cfg.BASIS_ANCHOR_WEIGHT,
         ).to(self.device)
+        print(
+            "PrimitiveLowRankClipPredictor: predicates={} primitives={} train_basis={} "
+            "train_weight={} temperature={} debug_log_period={}".format(
+                len(predicate_texts),
+                len(primitive_texts),
+                self.primitive_cfg.TRAIN_BASIS,
+                self.primitive_cfg.TRAIN_WEIGHT,
+                self.primitive_cfg.CLASSIFIER_TEMPERATURE,
+                self.debug_log_period,
+            )
+        )
 
     def _resolve_primitive_json(self, json_path):
         if os.path.isabs(json_path):
@@ -510,6 +523,53 @@ class PrimitiveLowRankClipPredictor(nn.Module):
         image_tensor = torch.cat(image_tensor)
         return self.clip_model.encode_image(image_tensor)
 
+    def _log_debug_stats(self, rel_dists, primitive_logits, pair_features, logger):
+        if not self.training or self.debug_log_period <= 0:
+            return
+        self._debug_forward_count.add_(1)
+        if int(self._debug_forward_count.item()) % self.debug_log_period != 0:
+            return
+
+        valid_rel_dists = [x for x in rel_dists if x.numel() > 0]
+        if not valid_rel_dists or not primitive_logits or not pair_features:
+            return
+        fg_logits = torch.cat([x[:, 1:].detach().float() for x in valid_rel_dists], dim=0)
+        if fg_logits.numel() == 0:
+            return
+        primitive_logits = torch.cat(primitive_logits, dim=0).detach().float()
+        pair_features = torch.cat(pair_features, dim=0).detach().float()
+        stats = self.primitive_text_adapter.debug_stats()
+        message = (
+            "PrimitiveLowRank debug step={step} split={split} pairs={pairs} "
+            "pred_logit_mean={pred_mean:.4f} pred_logit_std={pred_std:.4f} "
+            "pred_logit_min={pred_min:.4f} pred_logit_max={pred_max:.4f} "
+            "primitive_logit_mean={prim_mean:.4f} primitive_logit_std={prim_std:.4f} "
+            "primitive_logit_min={prim_min:.4f} primitive_logit_max={prim_max:.4f} "
+            "pair_norm={pair_norm:.4f} w_abs_mean={w_abs_mean:.4f} "
+            "w_abs_max={w_abs_max:.4f} w_nonzero_005={w_nonzero_005:.4f} "
+            "basis_norm_mean={basis_norm_mean:.4f} basis_rel_shift_mean={basis_rel_shift_mean:.4f} "
+            "basis_rel_shift_max={basis_rel_shift_max:.4f} basis_corr_offdiag={basis_corr_offdiag:.4f} "
+            "recon_cos_mean={recon_cos_mean:.4f} recon_cos_min={recon_cos_min:.4f}"
+        ).format(
+            step=int(self._debug_forward_count.item()),
+            split=self.mode,
+            pairs=fg_logits.size(0),
+            pred_mean=fg_logits.mean().item(),
+            pred_std=fg_logits.std(unbiased=False).item(),
+            pred_min=fg_logits.min().item(),
+            pred_max=fg_logits.max().item(),
+            prim_mean=primitive_logits.mean().item(),
+            prim_std=primitive_logits.std(unbiased=False).item(),
+            prim_min=primitive_logits.min().item(),
+            prim_max=primitive_logits.max().item(),
+            pair_norm=pair_features.norm(dim=-1).mean().item(),
+            **stats
+        )
+        if logger is not None:
+            logger.info(message)
+        else:
+            print(message)
+
     def forward(self, proposals, rel_pair_idxs, rel_labels, rel_binarys, roi_features, union_features, logger=None, img=None):
         if self.attribute_on:
             obj_dists, obj_preds, att_dists, edge_ctx = self.context_layer(roi_features, proposals, logger)
@@ -522,6 +582,8 @@ class PrimitiveLowRankClipPredictor(nn.Module):
         obj_preds = obj_preds.split(num_objs, dim=0)
 
         rel_dists = []
+        primitive_logits_for_debug = []
+        pair_features_for_debug = []
         for i in range(len(num_rels)):
             if num_rels[i] == 0:
                 rel_dists.append(roi_features.new_zeros((0, len(self.rel_ids))))
@@ -547,11 +609,15 @@ class PrimitiveLowRankClipPredictor(nn.Module):
                 self.object_role_text[obj_labels],
             )
             pair_features = F.normalize((cross_output1.float() + cross_output2.float()) / 2, dim=-1)
-            logits, _ = self.primitive_text_adapter.logits(pair_features, self.fg_rel_ids)
+            logits, primitive_logits = self.primitive_text_adapter.logits(pair_features, self.fg_rel_ids)
+            if self.training and self.debug_log_period > 0:
+                primitive_logits_for_debug.append(primitive_logits)
+                pair_features_for_debug.append(pair_features)
             bg_logits = logits.new_zeros((logits.size(0), 1))
             rel_dists.append(torch.cat((bg_logits, logits), dim=1))
 
         obj_dists = obj_dists.split(num_objs, dim=0)
+        self._log_debug_stats(rel_dists, primitive_logits_for_debug, pair_features_for_debug, logger)
         add_losses = self.primitive_text_adapter.losses() if self.training else {}
         return obj_dists, tuple(rel_dists), add_losses
 

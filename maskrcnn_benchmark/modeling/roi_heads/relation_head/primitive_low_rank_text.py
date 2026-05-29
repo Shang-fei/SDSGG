@@ -136,6 +136,33 @@ class PrimitiveLowRankTextAdapter(nn.Module):
         logits = primitive_logits @ weights.t()
         return logits / max(self.logit_temperature, 1e-6), primitive_logits
 
+    def debug_stats(self):
+        with torch.no_grad():
+            weights = self.effective_class_weights()
+            basis = self.classifier_basis()
+            reconstructed = F.normalize(self.reconstruct(), dim=-1)
+            recon_cos = (reconstructed * self.predicate_features.float()).sum(dim=-1)
+            basis_shift = (self.basis_feat.float() - self.basis_anchor.float()).norm(dim=-1)
+            basis_anchor_norm = self.basis_anchor.float().norm(dim=-1).clamp_min(1e-6)
+            basis_rel_shift = basis_shift / basis_anchor_norm
+            basis_corr = basis @ basis.t()
+            basis_mask = torch.ones_like(basis_corr) - torch.eye(
+                basis_corr.size(0),
+                device=basis_corr.device,
+            ).type_as(basis_corr)
+
+            return {
+                "w_abs_mean": weights.abs().mean().item(),
+                "w_abs_max": weights.abs().max().item(),
+                "w_nonzero_005": (weights.abs() > 0.05).float().mean().item(),
+                "basis_norm_mean": self.basis_feat.float().norm(dim=-1).mean().item(),
+                "basis_rel_shift_mean": basis_rel_shift.mean().item(),
+                "basis_rel_shift_max": basis_rel_shift.max().item(),
+                "basis_corr_offdiag": (basis_corr * basis_mask).abs().mean().item(),
+                "recon_cos_mean": recon_cos.mean().item(),
+                "recon_cos_min": recon_cos.min().item(),
+            }
+
     def losses(self):
         losses = {}
         weights = self.effective_class_weights()
