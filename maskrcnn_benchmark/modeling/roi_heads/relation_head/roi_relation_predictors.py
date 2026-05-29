@@ -424,6 +424,9 @@ class PrimitiveLowRankClipPredictor(nn.Module):
         self.device = config.MODEL.DEVICE
         self.primitive_cfg = config.MODEL.ROI_RELATION_HEAD.PRIMITIVE_TEXT
         self.debug_log_period = int(self.primitive_cfg.DEBUG_LOG_PERIOD)
+        self.use_object_filter = bool(self.primitive_cfg.USE_OBJECT_FILTER)
+        self.object_filter_weight = float(self.primitive_cfg.OBJECT_FILTER_WEIGHT)
+        self.object_filter_temperature = float(self.primitive_cfg.OBJECT_FILTER_TEMPERATURE)
 
         statistics = get_dataset_statistics(config)
         obj_classes = statistics["obj_classes"]
@@ -437,6 +440,7 @@ class PrimitiveLowRankClipPredictor(nn.Module):
         self.context_layer = TransformerContext(config, obj_classes, rel_classes, in_channels)
         self.mva_s2o = MVA()
         self.mva_o2s = MVA()
+        self.object_filter_table = pd.read_csv(os.path.join(curpath, "filter_total.csv"))
         self.update_split(config.OV_SETTING.TRAIN_PART)
         self._check_train_predicate_order()
         self.register_buffer("_debug_forward_count", torch.zeros((), dtype=torch.long))
@@ -468,12 +472,15 @@ class PrimitiveLowRankClipPredictor(nn.Module):
         ).to(self.device)
         print(
             "PrimitiveLowRankClipPredictor: predicates={} primitives={} train_basis={} "
-            "train_weight={} temperature={} debug_log_period={}".format(
+            "train_weight={} temperature={} object_filter={} object_filter_weight={} "
+            "debug_log_period={}".format(
                 len(predicate_texts),
                 len(primitive_texts),
                 self.primitive_cfg.TRAIN_BASIS,
                 self.primitive_cfg.TRAIN_WEIGHT,
                 self.primitive_cfg.CLASSIFIER_TEMPERATURE,
+                self.use_object_filter,
+                self.object_filter_weight,
                 self.debug_log_period,
             )
         )
@@ -499,9 +506,23 @@ class PrimitiveLowRankClipPredictor(nn.Module):
         self.mode = mode
         self.rel_ids = torch.as_tensor(self.rel_splits[mode], device=self.device, dtype=torch.long)
         self.fg_rel_ids = self.rel_ids[1:] - 1
+        self._encode_object_filter_texts()
 
     def updata(self, mode):
         self.update_split(mode)
+
+    def _encode_object_filter_texts(self):
+        if not self.use_object_filter:
+            self.object_filter_texts = None
+            return
+        active_rows = self.rel_ids.detach().cpu().tolist()[1:]
+        filter_rows = self.object_filter_table.iloc[active_rows]
+        object_filter_texts = []
+        with torch.no_grad():
+            for obj_name in self.obj_names:
+                texts = ["a photo of " + str(text) for text in list(filter_rows[obj_name])]
+                object_filter_texts.append(self._encode_texts(texts).detach())
+        self.object_filter_texts = object_filter_texts
 
     def _check_train_predicate_order(self):
         rel_ids = self.rel_ids.detach().cpu().tolist()
@@ -522,6 +543,26 @@ class PrimitiveLowRankClipPredictor(nn.Module):
             image_tensor.append(crop)
         image_tensor = torch.cat(image_tensor)
         return self.clip_model.encode_image(image_tensor)
+
+    def _object_filter_logits(self, image_features, pair_idxs, subj_labels, obj_labels):
+        if not self.use_object_filter or self.object_filter_weight <= 0:
+            return None
+        subject_features = image_features[pair_idxs[:, 0]].float()
+        object_features = image_features[pair_idxs[:, 1]].float()
+        if subject_features.dim() == 3:
+            subject_features = subject_features[:, 0, :]
+            object_features = object_features[:, 0, :]
+        subject_features = F.normalize(subject_features, dim=-1)
+        object_features = F.normalize(object_features, dim=-1)
+        prior_logits = []
+        for pair_idx in range(pair_idxs.size(0)):
+            text_features = self.object_filter_texts[int(subj_labels[pair_idx].item())]
+            text_features = text_features.to(subject_features.device, dtype=subject_features.dtype)
+            subject_score = subject_features[pair_idx:pair_idx + 1] @ text_features.t()
+            object_score = object_features[pair_idx:pair_idx + 1] @ text_features.t()
+            prior_logits.append((subject_score + object_score) * 0.5)
+        prior_logits = torch.cat(prior_logits, dim=0)
+        return prior_logits / max(self.object_filter_temperature, 1e-6)
 
     def _log_debug_stats(self, rel_dists, primitive_logits, pair_features, logger):
         if not self.training or self.debug_log_period <= 0:
@@ -610,6 +651,15 @@ class PrimitiveLowRankClipPredictor(nn.Module):
             )
             pair_features = F.normalize((cross_output1.float() + cross_output2.float()) / 2, dim=-1)
             logits, primitive_logits = self.primitive_text_adapter.logits(pair_features, self.fg_rel_ids)
+            object_filter_logits = self._object_filter_logits(
+                image_features,
+                pair_idxs,
+                subj_labels,
+                obj_labels,
+            )
+            if object_filter_logits is not None:
+                filter_weight = min(max(self.object_filter_weight, 0.0), 1.0)
+                logits = logits * (1.0 - filter_weight) + object_filter_logits * filter_weight
             if self.training and self.debug_log_period > 0:
                 primitive_logits_for_debug.append(primitive_logits)
                 pair_features_for_debug.append(pair_features)
