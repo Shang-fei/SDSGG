@@ -53,7 +53,9 @@ class PrimitiveLowRankTextAdapter(nn.Module):
         train_weight=True,
         logit_temperature=0.07,
         recon_loss_weight=0.1,
+        cosine_recon_loss_weight=0.0,
         sparsity_weight=0.01,
+        mask_out_weight=0.0,
         basis_decorr_weight=0.001,
         weight_decorr_weight=0.001,
         basis_anchor_weight=0.01,
@@ -87,7 +89,9 @@ class PrimitiveLowRankTextAdapter(nn.Module):
 
         self.logit_temperature = float(logit_temperature)
         self.recon_loss_weight = float(recon_loss_weight)
+        self.cosine_recon_loss_weight = float(cosine_recon_loss_weight)
         self.sparsity_weight = float(sparsity_weight)
+        self.mask_out_weight = float(mask_out_weight)
         self.basis_decorr_weight = float(basis_decorr_weight)
         self.weight_decorr_weight = float(weight_decorr_weight)
         self.basis_anchor_weight = float(basis_anchor_weight)
@@ -142,6 +146,15 @@ class PrimitiveLowRankTextAdapter(nn.Module):
             basis = self.classifier_basis()
             reconstructed = F.normalize(self.reconstruct(), dim=-1)
             recon_cos = (reconstructed * self.predicate_features.float()).sum(dim=-1)
+            mask = getattr(self, "predicate_primitive_mask", None)
+            if mask is not None:
+                mask = mask.to(device=weights.device, dtype=weights.dtype)
+                mask_out_abs = (weights * (1.0 - mask)).abs().mean()
+                mask_in_count = mask.sum().clamp_min(1.0)
+                mask_in_abs = (weights * mask).abs().sum() / mask_in_count
+            else:
+                mask_out_abs = weights.new_zeros(())
+                mask_in_abs = weights.abs().mean()
             basis_shift = (self.basis_feat.float() - self.basis_anchor.float()).norm(dim=-1)
             basis_anchor_norm = self.basis_anchor.float().norm(dim=-1).clamp_min(1e-6)
             basis_rel_shift = basis_shift / basis_anchor_norm
@@ -155,12 +168,15 @@ class PrimitiveLowRankTextAdapter(nn.Module):
                 "w_abs_mean": weights.abs().mean().item(),
                 "w_abs_max": weights.abs().max().item(),
                 "w_nonzero_005": (weights.abs() > 0.05).float().mean().item(),
+                "w_mask_in_abs": mask_in_abs.item(),
+                "w_mask_out_abs": mask_out_abs.item(),
                 "basis_norm_mean": self.basis_feat.float().norm(dim=-1).mean().item(),
                 "basis_rel_shift_mean": basis_rel_shift.mean().item(),
                 "basis_rel_shift_max": basis_rel_shift.max().item(),
                 "basis_corr_offdiag": (basis_corr * basis_mask).abs().mean().item(),
                 "recon_cos_mean": recon_cos.mean().item(),
                 "recon_cos_min": recon_cos.min().item(),
+                "recon_cos_neg_frac": (recon_cos < 0).float().mean().item(),
             }
 
     def losses(self):
@@ -174,8 +190,20 @@ class PrimitiveLowRankTextAdapter(nn.Module):
                 F.mse_loss(reconstructed, self.predicate_features.float(), reduction="mean")
                 * self.recon_loss_weight
             )
+        if self.cosine_recon_loss_weight > 0:
+            reconstructed = F.normalize(self.reconstruct(), dim=-1)
+            target = self.predicate_features.float()
+            recon_cos = (reconstructed * target).sum(dim=-1)
+            losses["loss_primitive_recon_cos"] = (
+                (1.0 - recon_cos).mean() * self.cosine_recon_loss_weight
+            )
         if self.sparsity_weight > 0:
             losses["loss_primitive_sparse"] = weights.abs().mean() * self.sparsity_weight
+        if self.mask_out_weight > 0 and hasattr(self, "predicate_primitive_mask"):
+            mask = self.predicate_primitive_mask.to(device=weights.device, dtype=weights.dtype)
+            losses["loss_primitive_mask_out"] = (
+                (weights * (1.0 - mask)).abs().mean() * self.mask_out_weight
+            )
         if self.basis_decorr_weight > 0 and basis.size(0) > 1:
             corr = basis @ basis.t()
             mask = torch.ones_like(corr) - torch.eye(corr.size(0), device=corr.device).type_as(corr)

@@ -465,20 +465,24 @@ class PrimitiveLowRankClipPredictor(nn.Module):
             train_weight=self.primitive_cfg.TRAIN_WEIGHT,
             logit_temperature=self.primitive_cfg.CLASSIFIER_TEMPERATURE,
             recon_loss_weight=self.primitive_cfg.RECON_LOSS_WEIGHT,
+            cosine_recon_loss_weight=self.primitive_cfg.COSINE_RECON_LOSS_WEIGHT,
             sparsity_weight=self.primitive_cfg.SPARSITY_WEIGHT,
+            mask_out_weight=self.primitive_cfg.MASK_OUT_WEIGHT,
             basis_decorr_weight=self.primitive_cfg.BASIS_DECORR_WEIGHT,
             weight_decorr_weight=self.primitive_cfg.WEIGHT_DECORR_WEIGHT,
             basis_anchor_weight=self.primitive_cfg.BASIS_ANCHOR_WEIGHT,
         ).to(self.device)
         print(
             "PrimitiveLowRankClipPredictor: predicates={} primitives={} train_basis={} "
-            "train_weight={} temperature={} object_filter={} object_filter_weight={} "
-            "debug_log_period={}".format(
+            "train_weight={} temperature={} recon_cos_weight={} mask_out_weight={} "
+            "object_filter={} object_filter_weight={} debug_log_period={}".format(
                 len(predicate_texts),
                 len(primitive_texts),
                 self.primitive_cfg.TRAIN_BASIS,
                 self.primitive_cfg.TRAIN_WEIGHT,
                 self.primitive_cfg.CLASSIFIER_TEMPERATURE,
+                self.primitive_cfg.COSINE_RECON_LOSS_WEIGHT,
+                self.primitive_cfg.MASK_OUT_WEIGHT,
                 self.use_object_filter,
                 self.object_filter_weight,
                 self.debug_log_period,
@@ -588,9 +592,11 @@ class PrimitiveLowRankClipPredictor(nn.Module):
             "primitive_logit_min={prim_min:.4f} primitive_logit_max={prim_max:.4f} "
             "pair_norm={pair_norm:.4f} w_abs_mean={w_abs_mean:.4f} "
             "w_abs_max={w_abs_max:.4f} w_nonzero_005={w_nonzero_005:.4f} "
+            "w_mask_in_abs={w_mask_in_abs:.4f} w_mask_out_abs={w_mask_out_abs:.4f} "
             "basis_norm_mean={basis_norm_mean:.4f} basis_rel_shift_mean={basis_rel_shift_mean:.4f} "
             "basis_rel_shift_max={basis_rel_shift_max:.4f} basis_corr_offdiag={basis_corr_offdiag:.4f} "
-            "recon_cos_mean={recon_cos_mean:.4f} recon_cos_min={recon_cos_min:.4f}"
+            "recon_cos_mean={recon_cos_mean:.4f} recon_cos_min={recon_cos_min:.4f} "
+            "recon_cos_neg_frac={recon_cos_neg_frac:.4f}"
         ).format(
             step=int(self._debug_forward_count.item()),
             split=self.mode,
