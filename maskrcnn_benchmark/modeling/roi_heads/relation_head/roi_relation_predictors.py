@@ -475,7 +475,6 @@ class PrimitiveLowRankClipPredictor(nn.Module):
         print(
             "PrimitiveLowRankClipPredictor: predicates={} primitives={} train_basis={} "
             "train_weight={} temperature={} recon_cos_weight={} mask_out_weight={} "
-            "novel_weight_anchor_blend={} novel_basis_anchor_blend={} "
             "object_filter={} object_filter_weight={} debug_log_period={}".format(
                 len(predicate_texts),
                 len(primitive_texts),
@@ -484,8 +483,6 @@ class PrimitiveLowRankClipPredictor(nn.Module):
                 self.primitive_cfg.CLASSIFIER_TEMPERATURE,
                 self.primitive_cfg.COSINE_RECON_LOSS_WEIGHT,
                 self.primitive_cfg.MASK_OUT_WEIGHT,
-                self.primitive_cfg.NOVEL_WEIGHT_ANCHOR_BLEND,
-                self.primitive_cfg.NOVEL_BASIS_ANCHOR_BLEND,
                 self.use_object_filter,
                 self.object_filter_weight,
                 self.debug_log_period,
@@ -659,17 +656,9 @@ class PrimitiveLowRankClipPredictor(nn.Module):
                 self.object_role_text[obj_labels],
             )
             pair_features = F.normalize((cross_output1.float() + cross_output2.float()) / 2, dim=-1)
-            if self.mode == "novel":
-                weight_anchor_blend = self.primitive_cfg.NOVEL_WEIGHT_ANCHOR_BLEND
-                basis_anchor_blend = self.primitive_cfg.NOVEL_BASIS_ANCHOR_BLEND
-            else:
-                weight_anchor_blend = 0.0
-                basis_anchor_blend = 0.0
             logits, primitive_logits = self.primitive_text_adapter.logits(
                 pair_features,
                 self.fg_rel_ids,
-                weight_anchor_blend=weight_anchor_blend,
-                basis_anchor_blend=basis_anchor_blend,
             )
             object_filter_logits = self._object_filter_logits(
                 image_features,
