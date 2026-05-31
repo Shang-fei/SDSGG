@@ -119,6 +119,17 @@ class MVA(nn.Module):
 
         return sub_features
 
+def mva_in_chunks(mva, sub_features, obj_features, text_features, chunk_size=128):
+    outputs = []
+    for start in range(0, sub_features.size(0), chunk_size):
+        end = start + chunk_size
+        outputs.append(mva(
+            sub_features[start:end],
+            obj_features[start:end],
+            text_features[start:end],
+        ))
+    return torch.cat(outputs, dim=0)
+
 @registry.ROI_RELATION_PREDICTOR.register("ClipPredictor")
 class ClipPredictor(nn.Module):
     def __init__(self, config, in_channels):
@@ -361,12 +372,14 @@ class ClipPredictor(nn.Module):
             text_features1_norm = F.normalize(text_features1, dim=-1)
             text_features2_norm = F.normalize(text_features2, dim=-1)
 
-            cross_output1 = self.adaper_clip1(
+            cross_output1 = mva_in_chunks(
+                self.adaper_clip1,
                 image_features[subj_idx],
                 image_features[obj_idx],
                 self.text_features3[obj_n1],
             )
-            cross_output2 = self.adaper_clip2(
+            cross_output2 = mva_in_chunks(
+                self.adaper_clip2,
                 image_features[obj_idx],
                 image_features[subj_idx],
                 self.text_features4[obj_n2],
@@ -648,12 +661,14 @@ class PrimitiveLowRankClipPredictor(nn.Module):
             subj_labels = obj_preds[i][pair_idxs[:, 0]]
             obj_labels = obj_preds[i][pair_idxs[:, 1]]
 
-            cross_output1 = self.mva_s2o(
+            cross_output1 = mva_in_chunks(
+                self.mva_s2o,
                 subject_tokens,
                 object_tokens,
                 self.subject_role_text[subj_labels],
             )
-            cross_output2 = self.mva_o2s(
+            cross_output2 = mva_in_chunks(
+                self.mva_o2s,
                 object_tokens,
                 subject_tokens,
                 self.object_role_text[obj_labels],
