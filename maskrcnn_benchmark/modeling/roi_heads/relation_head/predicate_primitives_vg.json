@@ -8,28 +8,28 @@
     "two objects are physically touching",
     "one object rests on the top surface of another object",
     "one object supports the weight of another object",
-    "a sign, wheel, device, fixture, or object is fixed or fastened to another support object",
-    "a sign, lamp, bag, clothing, or object hangs downward from a higher support",
+    "one object is fixed or fastened to another object",
+    "one object hangs downward from a higher support",
     "one object is inside an enclosing object or region",
     "one object surrounds or contains another object",
-    "a cloth, body part, snow, food, or cover-like object covers or hides part of another object",
-    "a word, letter, number, sign, label, or logo is printed or written as text on a surface",
-    "a logo, stripe, symbol, picture, decoration, or colored mark is painted or drawn on a surface",
+    "one object covers or hides part of another object",
+    "one object is printed or written as text on a surface",
+    "one object is painted or drawn as a mark on a surface",
     "a person or animal wears an object on the body",
     "a hand grips or holds an object",
-    "a person or animal carries a bag, backpack, umbrella, food, tool, baby, or portable object while moving",
-    "a person uses a phone, camera, laptop, utensil, tool, sports gear, or equipment to perform an action",
+    "a person or animal carries an object while moving",
+    "a person uses an object as a tool",
     "a person or animal eats or bites an object",
-    "a person or animal rides on top of a horse, bicycle, motorcycle, board, vehicle, or animal",
-    "a person or animal sits on a chair, bench, couch, bed, horse, ground, or supporting object",
+    "a person or animal rides on top of a vehicle or animal",
+    "a person or animal sits on a supporting object",
     "a person or animal stands on a supporting surface",
-    "a person, animal, body, head, or limb lies across a bed, couch, floor, grass, ground, snow, or supporting surface",
-    "a person or animal walks through a room, street, field, water, snow, crowd, or scene region",
+    "a person or animal lies across a supporting surface",
+    "a person or animal walks through a region",
     "a person or animal walks on top of a surface",
     "an object or animal flies in the air",
-    "grass, flowers, leaves, branches, trees, or vegetation grows from soil, ground, tree, branch, wall, rock, or surface",
-    "a car, truck, bus, motorcycle, bicycle, train, airplane, or vehicle is parked on a road, street, track, runway, ground, or parking surface",
-    "a person, child, player, or animal plays with a ball, racket, bat, frisbee, skateboard, ski, toy, or musical instrument",
+    "a plant or natural part grows from a surface",
+    "a vehicle is parked on a road or ground surface",
+    "a person plays with sports equipment or a toy",
     "a person or animal looks toward another object",
     "a person watches another person object or event",
     "one object is a visible part of a larger object",
@@ -38,7 +38,7 @@
     "one object belongs to or is possessed by another object",
     "one object points or moves toward a target object",
     "one object comes from a source object or region",
-    "a road, bridge, wire, line, path, or long object crosses from one side of a region to the other",
+    "one object crosses from one side of a region to the other",
     "one object follows along the length or edge of another object",
     "two objects appear together as a loose pair",
     "one object is located at a place or target region",
@@ -61,9 +61,9 @@
       ]
     },
     "across": {
-      "description": "A road, street, bridge, wire, line, path, or long object extends across a region, surface, or scene area from one side to the opposite side rather than merely being near it.",
+      "description": "Road across field, bridge across water, wire across sky, line across shirt, path across ground: a long subject spans from one side of a region or surface to the other.",
       "primitives": [
-        "a road, bridge, wire, line, path, or long object crosses from one side of a region to the other",
+        "one object crosses from one side of a region to the other",
         "one object follows along the length or edge of another object",
         "one object spans over another object without necessarily touching"
       ]
@@ -80,7 +80,7 @@
       "description": "The subject is arranged or moving along the length, path, or boundary of the object.",
       "primitives": [
         "one object follows along the length or edge of another object",
-        "a road, bridge, wire, line, path, or long object crosses from one side of a region to the other",
+        "one object crosses from one side of a region to the other",
         "two objects are close together but not touching"
       ]
     },
@@ -103,7 +103,7 @@
     "attached to": {
       "description": "The subject is physically joined, fastened, or connected to the object.",
       "primitives": [
-        "a sign, wheel, device, fixture, or object is fixed or fastened to another support object",
+        "one object is fixed or fastened to another object",
         "two objects are physically touching",
         "one object is on a side surface of another object"
       ]
@@ -112,7 +112,7 @@
       "description": "The subject is farther back than the object or partly hidden behind it.",
       "primitives": [
         "one object is farther back in the scene behind another object",
-        "a cloth, body part, snow, food, or cover-like object covers or hides part of another object",
+        "one object covers or hides part of another object",
         "two objects are close together but not touching"
       ]
     },
@@ -133,9 +133,9 @@
       ]
     },
     "carrying": {
-      "description": "A person or animal is bearing and transporting a bag, backpack, umbrella, food, tool, baby, or other portable item with the body, hands, arms, mouth, or back; the carried item moves with the person or animal.",
+      "description": "Person carrying bag, man carrying backpack, woman carrying umbrella, child carrying toy, animal carrying food or stick: the subject transports a portable object with hand, arm, mouth, shoulder, or back.",
       "primitives": [
-        "a person or animal carries a bag, backpack, umbrella, food, tool, baby, or portable object while moving",
+        "a person or animal carries an object while moving",
         "a hand grips or holds an object",
         "one object is visually associated with another object"
       ]
@@ -143,15 +143,15 @@
     "covered in": {
       "description": "The subject surface is filled with the object as material, texture, marks, or many small instances.",
       "primitives": [
-        "a cloth, body part, snow, food, or cover-like object covers or hides part of another object",
-        "a logo, stripe, symbol, picture, decoration, or colored mark is painted or drawn on a surface",
+        "one object covers or hides part of another object",
+        "one object is painted or drawn as a mark on a surface",
         "two objects are physically touching"
       ]
     },
     "covering": {
-      "description": "A cover-like object, cloth, blanket, hand, body part, food, snow, or surface material is placed over, in front of, or spread across another item so that part of it is hidden or blocked from view.",
+      "description": "Cloth covering table, blanket covering bed, hand covering face, snow covering ground, food covering plate: the subject lies over or occludes the object and hides part of it.",
       "primitives": [
-        "a cloth, body part, snow, food, or cover-like object covers or hides part of another object",
+        "one object covers or hides part of another object",
         "two objects are physically touching",
         "one object spans over another object without necessarily touching"
       ]
@@ -184,23 +184,23 @@
       "description": "The subject comes out of, originates at, or moves away from the object or region.",
       "primitives": [
         "one object comes from a source object or region",
-        "a road, bridge, wire, line, path, or long object crosses from one side of a region to the other",
+        "one object crosses from one side of a region to the other",
         "one object points or moves toward a target object"
       ]
     },
     "growing on": {
-      "description": "Grass, flowers, leaves, branches, trees, or other vegetation naturally emerge from, root in, or grow out of soil, ground, a tree, branch, wall, rock, or plant surface, not simply resting on or artificially attached to it.",
+      "description": "Grass growing on ground, flowers growing on plant, leaves growing on branch, tree growing on hill, moss growing on rock or wall: vegetation is naturally rooted in or emerging from the object.",
       "primitives": [
-        "grass, flowers, leaves, branches, trees, or vegetation grows from soil, ground, tree, branch, wall, rock, or surface",
+        "a plant or natural part grows from a surface",
         "one object comes from a source object or region",
         "two objects are physically touching"
       ]
     },
     "hanging from": {
-      "description": "A sign, lamp, bag, clothing, curtain, object, or body part is suspended below and supported from a hook, branch, wall, ceiling, pole, hand, or other higher support, often dangling downward.",
+      "description": "Sign hanging from pole, lamp hanging from ceiling, bag hanging from shoulder, coat hanging from hook, fruit hanging from branch: the subject is suspended below a higher support.",
       "primitives": [
-        "a sign, lamp, bag, clothing, or object hangs downward from a higher support",
-        "a sign, wheel, device, fixture, or object is fixed or fastened to another support object",
+        "one object hangs downward from a higher support",
+        "one object is fixed or fastened to another object",
         "one object is visibly lower than another object in the image"
       ]
     },
@@ -213,7 +213,7 @@
       ]
     },
     "holding": {
-      "description": "A person, hand, arm, or animal has a phone, bat, racket, cup, food, tool, handle, or small object in direct grasp or manual contact, without necessarily walking or transporting it.",
+      "description": "Person holding phone, hand holding cup, player holding bat or racket, child holding toy, animal holding food: direct grasp or hand contact with the object, without necessarily transporting it.",
       "primitives": [
         "a hand grips or holds an object",
         "two objects are physically touching",
@@ -232,14 +232,14 @@
       "description": "The subject is closer to the camera than the object, appearing in front of it.",
       "primitives": [
         "one object is closer to the camera in front of another object",
-        "a cloth, body part, snow, food, or cover-like object covers or hides part of another object",
+        "one object covers or hides part of another object",
         "two objects are close together but not touching"
       ]
     },
     "laying on": {
       "description": "The subject is lying or spread across the object surface.",
       "primitives": [
-        "a person, animal, body, head, or limb lies across a bed, couch, floor, grass, ground, snow, or supporting surface",
+        "a person or animal lies across a supporting surface",
         "one object rests on the top surface of another object",
         "one object supports the weight of another object"
       ]
@@ -253,9 +253,9 @@
       ]
     },
     "lying on": {
-      "description": "A person, animal, body, head, or limb is reclined horizontally on a bed, couch, bench, floor, grass, ground, snow, or other supporting surface.",
+      "description": "Person lying on bed, animal lying on grass, body lying on ground, head lying on pillow, child lying on floor: the subject is reclined horizontally and supported by the object surface.",
       "primitives": [
-        "a person, animal, body, head, or limb lies across a bed, couch, floor, grass, ground, snow, or supporting surface",
+        "a person or animal lies across a supporting surface",
         "one object rests on the top surface of another object",
         "one object supports the weight of another object"
       ]
@@ -269,9 +269,9 @@
       ]
     },
     "mounted on": {
-      "description": "A sign, wheel, tire, screen, mirror, device, light, plate, or fixture is mechanically fixed, installed, or attached onto a wall, vehicle, pole, stand, handlebar, animal, or support base.",
+      "description": "Sign mounted on pole, wheel mounted on vehicle, tire mounted on car, mirror mounted on wall, light mounted on ceiling, device mounted on handlebar: the subject is fixed onto a support.",
       "primitives": [
-        "a sign, wheel, device, fixture, or object is fixed or fastened to another support object",
+        "one object is fixed or fastened to another object",
         "one object is on a side surface of another object",
         "two objects are physically touching"
       ]
@@ -313,21 +313,21 @@
       "primitives": [
         "one object spans over another object without necessarily touching",
         "one object is visibly higher than another object in the image",
-        "a cloth, body part, snow, food, or cover-like object covers or hides part of another object"
+        "one object covers or hides part of another object"
       ]
     },
     "painted on": {
-      "description": "A logo, letter, number, stripe, symbol, picture, decoration, or colored mark is painted or drawn on a wall, sign, vehicle, shirt, board, or other flat surface as surface artwork rather than a separate physical object.",
+      "description": "Logo painted on sign, number painted on car, stripe painted on shirt, picture painted on wall, symbol painted on board: a flat mark or artwork appears on the object's surface.",
       "primitives": [
-        "a logo, stripe, symbol, picture, decoration, or colored mark is painted or drawn on a surface",
-        "a word, letter, number, sign, label, or logo is printed or written as text on a surface",
+        "one object is painted or drawn as a mark on a surface",
+        "one object is printed or written as text on a surface",
         "one object is visually associated with another object"
       ]
     },
     "parked on": {
-      "description": "A car, truck, bus, motorcycle, bicycle, train, airplane, or other vehicle is stationary on a road, street, driveway, track, runway, ground, or parking surface, not actively moving or being ridden.",
+      "description": "Car parked on street, truck parked on road, bus parked on curb, motorcycle parked on sidewalk, bicycle parked on rack, airplane parked on runway: a vehicle is stationary on a surface.",
       "primitives": [
-        "a car, truck, bus, motorcycle, bicycle, train, airplane, or vehicle is parked on a road, street, track, runway, ground, or parking surface",
+        "a vehicle is parked on a road or ground surface",
         "one object rests on the top surface of another object",
         "one object supports the weight of another object"
       ]
@@ -336,22 +336,22 @@
       "description": "The subject is a visible component or subpart of the object.",
       "primitives": [
         "one object is a visible part of a larger object",
-        "a sign, wheel, device, fixture, or object is fixed or fastened to another support object",
+        "one object is fixed or fastened to another object",
         "one object is visually associated with another object"
       ]
     },
     "playing": {
-      "description": "A person, child, player, or animal is actively playing a sport, game, toy, ball, racket, bat, frisbee, skateboard, ski, guitar, or musical instrument, showing an intentional play action rather than merely holding or standing near it.",
+      "description": "Person playing sport, child playing game, player playing ball, man playing guitar, kid playing with toy, dog playing with frisbee: active play with equipment, toy, ball, or instrument.",
       "primitives": [
-        "a person, child, player, or animal plays with a ball, racket, bat, frisbee, skateboard, ski, toy, or musical instrument",
+        "a person plays with sports equipment or a toy",
         "a hand grips or holds an object",
         "one object is used for the purpose of another object"
       ]
     },
     "riding": {
-      "description": "A person, rider, child, or animal is seated or positioned on top of a horse, bicycle, motorcycle, skateboard, surfboard, ski, snowboard, boat, vehicle, or animal and is using it for transport or movement.",
+      "description": "Person riding horse, rider riding motorcycle, child riding bike, man riding skateboard, surfer riding surfboard, skier riding skis: the subject is on top of a moving carrier.",
       "primitives": [
-        "a person or animal rides on top of a horse, bicycle, motorcycle, board, vehicle, or animal",
+        "a person or animal rides on top of a vehicle or animal",
         "one object rests on the top surface of another object",
         "one object supports the weight of another object"
       ]
@@ -359,21 +359,21 @@
     "says": {
       "description": "The subject displays written text, symbols, or readable markings.",
       "primitives": [
-        "a word, letter, number, sign, label, or logo is printed or written as text on a surface",
-        "a logo, stripe, symbol, picture, decoration, or colored mark is painted or drawn on a surface",
+        "one object is printed or written as text on a surface",
+        "one object is painted or drawn as a mark on a surface",
         "one object is visually associated with another object"
       ]
     },
     "sitting on": {
-      "description": "A person, child, animal, or body is in a seated posture with hips or body supported by a chair, bench, couch, bed, horse, stool, table edge, ground, or other sitting surface.",
+      "description": "Person sitting on chair, child sitting on bench, animal sitting on ground, rider sitting on horse, man sitting on couch: seated posture with body supported by the object.",
       "primitives": [
-        "a person or animal sits on a chair, bench, couch, bed, horse, ground, or supporting object",
+        "a person or animal sits on a supporting object",
         "one object rests on the top surface of another object",
         "one object supports the weight of another object"
       ]
     },
     "standing on": {
-      "description": "A person, animal, player, or upright object stands with feet, legs, wheels, or base supported by ground, floor, street, field, table, board, or another top surface.",
+      "description": "Person standing on ground, animal standing on grass, player standing on field, object standing on table, feet standing on floor: upright posture supported by the object surface.",
       "primitives": [
         "a person or animal stands on a supporting surface",
         "one object supports the weight of another object",
@@ -385,7 +385,7 @@
       "primitives": [
         "one object is directed to an endpoint or destination",
         "one object points or moves toward a target object",
-        "a road, bridge, wire, line, path, or long object crosses from one side of a region to the other"
+        "one object crosses from one side of a region to the other"
       ]
     },
     "under": {
@@ -397,19 +397,19 @@
       ]
     },
     "using": {
-      "description": "A person, hand, player, or animal actively operates or employs a phone, camera, laptop, tool, utensil, bat, racket, skateboard, ski, surfboard, or equipment to perform an action, beyond simply holding or being near it.",
+      "description": "Person using phone, hand using tool, player using racket or bat, skier using skis, surfer using surfboard, cook using utensil: the object is operated as a tool or equipment.",
       "primitives": [
-        "a person uses a phone, camera, laptop, utensil, tool, sports gear, or equipment to perform an action",
+        "a person uses an object as a tool",
         "a hand grips or holds an object",
         "one object is used for the purpose of another object"
       ]
     },
     "walking in": {
-      "description": "The subject walks inside or through a scene region.",
+      "description": "Person walking in street, animal walking in field, man walking in snow, child walking in room, people walking in water or crowd: walking through an enclosing scene region.",
       "primitives": [
-        "a person or animal walks through a room, street, field, water, snow, crowd, or scene region",
+        "a person or animal walks through a region",
         "one object is inside an enclosing object or region",
-        "a road, bridge, wire, line, path, or long object crosses from one side of a region to the other"
+        "one object crosses from one side of a region to the other"
       ]
     },
     "walking on": {
@@ -433,7 +433,7 @@
       "primitives": [
         "a person or animal wears an object on the body",
         "one object is attached around a body part like clothing or gear",
-        "a cloth, body part, snow, food, or cover-like object covers or hides part of another object"
+        "one object covers or hides part of another object"
       ]
     },
     "wears": {

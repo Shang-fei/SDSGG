@@ -81,6 +81,7 @@ class PrimitiveLowRankTextAdapter(nn.Module):
         else:
             self.register_buffer("class_weights", init_weight)
 
+        self.register_buffer("class_weight_anchor", init_weight.detach().clone())
         self.register_buffer("basis_anchor", primitive_features.detach().clone())
         self.register_buffer("predicate_features", predicate_features.detach().clone())
         self.register_buffer("text_mean", text_mean.detach().clone())
@@ -121,22 +122,36 @@ class PrimitiveLowRankTextAdapter(nn.Module):
             init_weight[pred_idx, primitive_idx] = selected_weight.squeeze(0)
         return init_weight
 
-    def classifier_basis(self):
-        return F.normalize(self.basis_feat.float(), dim=-1)
+    def classifier_basis(self, anchor_blend=0.0):
+        basis = self.basis_feat.float()
+        anchor_blend = float(anchor_blend)
+        if anchor_blend > 0:
+            anchor_blend = min(max(anchor_blend, 0.0), 1.0)
+            basis = basis * (1.0 - anchor_blend) + self.basis_anchor.float() * anchor_blend
+        return F.normalize(basis, dim=-1)
 
-    def effective_class_weights(self):
-        return self.class_weights.float()
+    def effective_class_weights(self, anchor_blend=0.0):
+        weights = self.class_weights.float()
+        anchor_blend = float(anchor_blend)
+        if anchor_blend > 0:
+            anchor_blend = min(max(anchor_blend, 0.0), 1.0)
+            weights = weights * (1.0 - anchor_blend) + self.class_weight_anchor.float() * anchor_blend
+        return weights
 
     def reconstruct(self):
         return self.text_mean.unsqueeze(0) + self.effective_class_weights() @ self.classifier_basis()
 
-    def active_weights(self, fg_ids):
-        return self.effective_class_weights()[fg_ids.to(self.class_weights.device).long()].float()
+    def active_weights(self, fg_ids, anchor_blend=0.0):
+        return self.effective_class_weights(anchor_blend=anchor_blend)[
+            fg_ids.to(self.class_weights.device).long()
+        ].float()
 
-    def logits(self, visual_features, fg_ids):
+    def logits(self, visual_features, fg_ids, weight_anchor_blend=0.0, basis_anchor_blend=0.0):
         visual_features = F.normalize(visual_features.float(), dim=-1)
-        primitive_logits = visual_features @ self.classifier_basis().t()
-        weights = self.active_weights(fg_ids)
+        primitive_logits = visual_features @ self.classifier_basis(
+            anchor_blend=basis_anchor_blend
+        ).t()
+        weights = self.active_weights(fg_ids, anchor_blend=weight_anchor_blend)
         logits = primitive_logits @ weights.t()
         return logits / max(self.logit_temperature, 1e-6), primitive_logits
 
