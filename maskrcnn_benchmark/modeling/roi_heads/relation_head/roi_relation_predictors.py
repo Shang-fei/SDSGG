@@ -21,6 +21,7 @@ import time
 from PIL import Image
 import pandas as pd
 curpath=os.path.dirname(__file__)
+CLIP_MVA_CHUNK_SIZE = 8
 
 def crop_and_resize(image, posi1, posi2):
     posi = torch.cat((torch.min(posi1[0:2], posi2[0:2]),
@@ -119,7 +120,7 @@ class MVA(nn.Module):
 
         return sub_features
 
-def mva_in_chunks(mva, sub_features, obj_features, text_features, chunk_size=128):
+def mva_in_chunks(mva, sub_features, obj_features, text_features, chunk_size):
     outputs = []
     for start in range(0, sub_features.size(0), chunk_size):
         end = start + chunk_size
@@ -380,12 +381,14 @@ class ClipPredictor(nn.Module):
                 image_features[subj_idx],
                 image_features[obj_idx],
                 self.text_features3[obj_n1],
+                chunk_size=CLIP_MVA_CHUNK_SIZE,
             )
             cross_output2 = mva_in_chunks(
                 self.adaper_clip2,
                 image_features[obj_idx],
                 image_features[subj_idx],
                 self.text_features4[obj_n2],
+                chunk_size=CLIP_MVA_CHUNK_SIZE,
             )
             cross_output = (cross_output1 + cross_output2) / 2
             cross_output = F.normalize(cross_output, dim=-1)
@@ -664,14 +667,12 @@ class PrimitiveLowRankClipPredictor(nn.Module):
             subj_labels = obj_preds[i][pair_idxs[:, 0]]
             obj_labels = obj_preds[i][pair_idxs[:, 1]]
 
-            cross_output1 = mva_in_chunks(
-                self.mva_s2o,
+            cross_output1 = self.mva_s2o(
                 subject_tokens,
                 object_tokens,
                 self.subject_role_text[subj_labels],
             )
-            cross_output2 = mva_in_chunks(
-                self.mva_o2s,
+            cross_output2 = self.mva_o2s(
                 object_tokens,
                 subject_tokens,
                 self.object_role_text[obj_labels],
