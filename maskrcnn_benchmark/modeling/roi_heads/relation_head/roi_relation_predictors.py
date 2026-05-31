@@ -325,6 +325,9 @@ class ClipPredictor(nn.Module):
                 text_features5 = text_features5
                 self.texts5.append(text_features5.detach().cpu().numpy())
 
+    def update_split(self, mode):
+        self.updata(mode)
+
     def forward(self, proposals, rel_pair_idxs, rel_labels, rel_binarys, roi_features, union_features, logger=None,img=None):
         """
         Returns:
