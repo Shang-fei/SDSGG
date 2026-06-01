@@ -117,6 +117,7 @@ class PrimitiveLowRankTextAdapter(nn.Module):
 
         if self.distribution_enabled:
             num_predicates, num_primitives = init_weight.shape
+            sigma_prior = self._initialize_distribution_sigma_prior(init_weight)
             self.dist_context = nn.Sequential(
                 nn.Linear(distribution_context_dim, distribution_hidden_dim),
                 nn.ReLU(inplace=True),
@@ -127,10 +128,11 @@ class PrimitiveLowRankTextAdapter(nn.Module):
                 torch.empty(num_predicates, distribution_rank, num_primitives)
             )
             self.dist_rel_sigma = nn.Parameter(
-                torch.zeros(num_predicates, distribution_rank, num_primitives)
+                torch.empty(num_predicates, distribution_rank, num_primitives)
             )
-            self.dist_log_sigma = nn.Parameter(torch.full((num_predicates, num_primitives), -5.0))
-            nn.init.normal_(self.dist_rel_shift, mean=0.0, std=0.001)
+            self.dist_log_sigma = nn.Parameter(sigma_prior)
+            nn.init.normal_(self.dist_rel_shift, mean=0.0, std=0.02)
+            nn.init.normal_(self.dist_rel_sigma, mean=0.0, std=0.01)
 
     def _initialize_weights(self, centered_predicates, primitive_features, predicate_primitive_mask):
         if predicate_primitive_mask is None:
@@ -156,6 +158,21 @@ class PrimitiveLowRankTextAdapter(nn.Module):
             selected_weight = centered_predicates[pred_idx:pred_idx + 1] @ torch.pinverse(selected_basis)
             init_weight[pred_idx, primitive_idx] = selected_weight.squeeze(0)
         return init_weight
+
+    def _initialize_distribution_sigma_prior(self, init_weight):
+        weight_abs = init_weight.detach().abs()
+        prob = weight_abs / weight_abs.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        entropy = -(prob * prob.clamp_min(1e-6).log()).sum(dim=1)
+        active_count = (weight_abs > 1e-6).float().sum(dim=1).clamp_min(2.0)
+        max_entropy = active_count.log()
+        semantic_width = (entropy / max_entropy.clamp_min(1e-6)).clamp(0.0, 1.0)
+
+        min_sigma = 0.0005
+        max_sigma = 0.0020
+        target_sigma = min_sigma + (max_sigma - min_sigma) * semantic_width
+        target_softplus = (target_sigma / max(self.distribution_noise_scale, 1e-6)).clamp_min(1e-6)
+        log_sigma = torch.log(torch.expm1(target_softplus).clamp_min(1e-6))
+        return log_sigma.unsqueeze(1).expand_as(init_weight).clone()
 
     def classifier_basis(self, anchor_blend=0.0):
         basis = self.basis_feat.float()
