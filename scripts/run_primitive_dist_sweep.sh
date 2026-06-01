@@ -7,10 +7,9 @@ MASTER_PORT_BASE="${MASTER_PORT_BASE:-12030}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 
 CONFIG="${CONFIG:-configs/e2e_relation_X_101_32_8_FPN_1x_total.yaml}"
-GLOVE_DIR="${GLOVE_DIR:-path/glove}"
-PRETRAINED_DETECTOR_CKPT="${PRETRAINED_DETECTOR_CKPT:-/path/checkpoint/pretrained_faster_rcnn/model_final.pth}"
+GLOVE_DIR="${GLOVE_DIR:-../glove}"
 
-OUTPUT_ROOT="${OUTPUT_ROOT:-output/primitive_dist_sweep}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-/workspace/ccloud/sf/SDSGG/output/concept}"
 LOG_DIR="${LOG_DIR:-logs/primitive_dist_sweep}"
 LOG_FILE="${LOG_FILE:-${LOG_DIR}/sweep_$(date +%Y%m%d_%H%M%S).log}"
 
@@ -18,7 +17,7 @@ IMS_PER_BATCH="${IMS_PER_BATCH:-4}"
 TEST_IMS_PER_BATCH="${TEST_IMS_PER_BATCH:-2}"
 MAX_ITER="${MAX_ITER:-16000}"
 VAL_PERIOD="${VAL_PERIOD:-4000}"
-CHECKPOINT_PERIOD="${CHECKPOINT_PERIOD:-4000}"
+CHECKPOINT_PERIOD="${CHECKPOINT_PERIOD:-8000}"
 
 mkdir -p "${OUTPUT_ROOT}" "${LOG_DIR}"
 
@@ -70,7 +69,6 @@ for idx in "${!NAMES[@]}"; do
     SOLVER.VAL_PERIOD "${VAL_PERIOD}" \
     SOLVER.CHECKPOINT_PERIOD "${CHECKPOINT_PERIOD}" \
     GLOVE_DIR "${GLOVE_DIR}" \
-    MODEL.PRETRAINED_DETECTOR_CKPT "${PRETRAINED_DETECTOR_CKPT}" \
     OUTPUT_DIR "${output_dir}" \
     >> "${LOG_FILE}" 2>/dev/null
 
