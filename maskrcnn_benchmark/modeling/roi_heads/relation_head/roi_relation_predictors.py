@@ -416,7 +416,7 @@ class ClipPredictor(nn.Module):
                     obj_clip = F.normalize(image_features[obj_idx[mask], 0], dim=-1)
                     similarity31 = subj_clip @ text_features5.t() / 0.05
                     similarity32 = obj_clip @ text_features5.t() / 0.05
-                    similarity3[mask] = (similarity31 + similarity32) / 2
+                    similarity3[mask] = ((similarity31 + similarity32) / 2).to(similarity3.dtype)
 
                 probs = probs * 0.2 + similarity3 * 0.8
             rel_dist_per_batch.append(probs)
