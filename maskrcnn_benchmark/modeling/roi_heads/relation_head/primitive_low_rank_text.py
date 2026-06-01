@@ -59,6 +59,15 @@ class PrimitiveLowRankTextAdapter(nn.Module):
         basis_decorr_weight=0.001,
         weight_decorr_weight=0.001,
         basis_anchor_weight=0.01,
+        distribution_enabled=False,
+        distribution_context_dim=512,
+        distribution_hidden_dim=128,
+        distribution_rank=4,
+        distribution_shift_scale=0.1,
+        distribution_noise_scale=0.02,
+        distribution_shift_loss_weight=0.001,
+        distribution_var_loss_weight=0.001,
+        distribution_sample=True,
     ):
         super(PrimitiveLowRankTextAdapter, self).__init__()
         primitive_features = F.normalize(primitive_features.float(), dim=-1)
@@ -96,6 +105,32 @@ class PrimitiveLowRankTextAdapter(nn.Module):
         self.basis_decorr_weight = float(basis_decorr_weight)
         self.weight_decorr_weight = float(weight_decorr_weight)
         self.basis_anchor_weight = float(basis_anchor_weight)
+        self.distribution_enabled = bool(distribution_enabled)
+        self.distribution_shift_scale = float(distribution_shift_scale)
+        self.distribution_noise_scale = float(distribution_noise_scale)
+        self.distribution_shift_loss_weight = float(distribution_shift_loss_weight)
+        self.distribution_var_loss_weight = float(distribution_var_loss_weight)
+        self.distribution_sample = bool(distribution_sample)
+        self._distribution_shift_terms = []
+        self._distribution_var_terms = []
+        self._last_distribution_stats = {}
+
+        if self.distribution_enabled:
+            num_predicates, num_primitives = init_weight.shape
+            self.dist_context = nn.Sequential(
+                nn.Linear(distribution_context_dim, distribution_hidden_dim),
+                nn.ReLU(inplace=True),
+            )
+            self.dist_shift_proj = nn.Linear(distribution_hidden_dim, distribution_rank)
+            self.dist_sigma_proj = nn.Linear(distribution_hidden_dim, distribution_rank)
+            self.dist_rel_shift = nn.Parameter(
+                torch.empty(num_predicates, distribution_rank, num_primitives)
+            )
+            self.dist_rel_sigma = nn.Parameter(
+                torch.zeros(num_predicates, distribution_rank, num_primitives)
+            )
+            self.dist_log_sigma = nn.Parameter(torch.full((num_predicates, num_primitives), -5.0))
+            nn.init.normal_(self.dist_rel_shift, mean=0.0, std=0.001)
 
     def _initialize_weights(self, centered_predicates, primitive_features, predicate_primitive_mask):
         if predicate_primitive_mask is None:
@@ -146,13 +181,63 @@ class PrimitiveLowRankTextAdapter(nn.Module):
             fg_ids.to(self.class_weights.device).long()
         ].float()
 
-    def logits(self, visual_features, fg_ids, weight_anchor_blend=0.0, basis_anchor_blend=0.0):
+    def reset_distribution_losses(self):
+        self._distribution_shift_terms = []
+        self._distribution_var_terms = []
+
+    def _distribution_logits(self, primitive_logits, fg_ids, condition_features, base_weights):
+        condition_features = F.normalize(condition_features.float(), dim=-1)
+        hidden = self.dist_context(condition_features)
+        shift_context = torch.tanh(self.dist_shift_proj(hidden))
+        sigma_context = torch.tanh(self.dist_sigma_proj(hidden))
+        active_ids = fg_ids.to(self.class_weights.device).long()
+
+        rel_shift = self.dist_rel_shift[active_ids].float()
+        rel_sigma = self.dist_rel_sigma[active_ids].float()
+        delta = torch.einsum("nr,crk->nck", shift_context, rel_shift)
+        delta = torch.tanh(delta) * self.distribution_shift_scale
+
+        log_sigma = self.dist_log_sigma[active_ids].float().unsqueeze(0)
+        log_sigma = log_sigma + torch.einsum("nr,crk->nck", sigma_context, rel_sigma)
+        sigma = F.softplus(log_sigma.clamp(-8.0, 2.0)) * self.distribution_noise_scale
+
+        weights = base_weights.unsqueeze(0) + delta
+        if self.training and self.distribution_sample and self.distribution_noise_scale > 0:
+            weights = weights + torch.randn_like(weights) * sigma
+
+        logits = torch.einsum("nk,nck->nc", primitive_logits, weights)
+        self._record_distribution_terms(delta, sigma)
+        return logits
+
+    def _record_distribution_terms(self, delta, sigma):
+        if self.training:
+            self._distribution_shift_terms.append(delta.pow(2).mean())
+            self._distribution_var_terms.append(sigma.mean())
+        with torch.no_grad():
+            self._last_distribution_stats = {
+                "dist_shift_abs_mean": delta.detach().abs().mean().item(),
+                "dist_shift_abs_max": delta.detach().abs().max().item(),
+                "dist_sigma_mean": sigma.detach().mean().item(),
+                "dist_sigma_max": sigma.detach().max().item(),
+            }
+
+    def logits(
+        self,
+        visual_features,
+        fg_ids,
+        weight_anchor_blend=0.0,
+        basis_anchor_blend=0.0,
+        condition_features=None,
+    ):
         visual_features = F.normalize(visual_features.float(), dim=-1)
         primitive_logits = visual_features @ self.classifier_basis(
             anchor_blend=basis_anchor_blend
         ).t()
         weights = self.active_weights(fg_ids, anchor_blend=weight_anchor_blend)
-        logits = primitive_logits @ weights.t()
+        if self.distribution_enabled and condition_features is not None:
+            logits = self._distribution_logits(primitive_logits, fg_ids, condition_features, weights)
+        else:
+            logits = primitive_logits @ weights.t()
         return logits / max(self.logit_temperature, 1e-6), primitive_logits
 
     def debug_stats(self):
@@ -179,7 +264,7 @@ class PrimitiveLowRankTextAdapter(nn.Module):
                 device=basis_corr.device,
             ).type_as(basis_corr)
 
-            return {
+            stats = {
                 "w_abs_mean": weights.abs().mean().item(),
                 "w_abs_max": weights.abs().max().item(),
                 "w_nonzero_005": (weights.abs() > 0.05).float().mean().item(),
@@ -193,6 +278,14 @@ class PrimitiveLowRankTextAdapter(nn.Module):
                 "recon_cos_min": recon_cos.min().item(),
                 "recon_cos_neg_frac": (recon_cos < 0).float().mean().item(),
             }
+            stats.update({
+                "dist_shift_abs_mean": 0.0,
+                "dist_shift_abs_max": 0.0,
+                "dist_sigma_mean": 0.0,
+                "dist_sigma_max": 0.0,
+            })
+            stats.update(self._last_distribution_stats)
+            return stats
 
     def losses(self):
         losses = {}
@@ -233,4 +326,15 @@ class PrimitiveLowRankTextAdapter(nn.Module):
                 F.mse_loss(self.basis_feat.float(), self.basis_anchor.float(), reduction="mean")
                 * self.basis_anchor_weight
             )
+        if self.distribution_enabled and self._distribution_shift_terms:
+            if self.distribution_shift_loss_weight > 0:
+                losses["loss_primitive_dist_shift"] = (
+                    torch.stack(self._distribution_shift_terms).mean()
+                    * self.distribution_shift_loss_weight
+                )
+            if self.distribution_var_loss_weight > 0:
+                losses["loss_primitive_dist_var"] = (
+                    torch.stack(self._distribution_var_terms).mean()
+                    * self.distribution_var_loss_weight
+                )
         return losses

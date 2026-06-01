@@ -53,7 +53,7 @@
   ],
   "predicates": {
     "above": {
-      "description": "The subject appears higher than the object in the image, usually separated in vertical layout.",
+      "description": "bird above tree; sign above door; lamp above table; plane above clouds; vertical higher position with clear separation",
       "primitives": [
         "one object is visibly higher than another object in the image",
         "two objects are close together but not touching",
@@ -69,7 +69,7 @@
       ]
     },
     "against": {
-      "description": "The subject touches and leans on or presses against the object surface.",
+      "description": "person against wall; bike against fence; bag against chair; hand against face; physical contact on side surface",
       "primitives": [
         "two objects are physically touching",
         "one object rests on the top surface of another object",
@@ -77,7 +77,7 @@
       ]
     },
     "along": {
-      "description": "The subject is arranged or moving along the length, path, or boundary of the object.",
+      "description": "person along road; fence along street; line along edge; train along track; object following length or boundary",
       "primitives": [
         "one object follows along the length or edge of another object",
         "one object crosses from one side of a region to the other",
@@ -85,7 +85,7 @@
       ]
     },
     "and": {
-      "description": "The subject and object are both visible together as a paired but weakly specified relation.",
+      "description": "man and woman; fork and knife; cup and plate; dog and person; loose visual pair without strong contact",
       "primitives": [
         "two objects appear together as a loose pair",
         "one object is visually associated with another object",
@@ -93,7 +93,7 @@
       ]
     },
     "at": {
-      "description": "The subject is located at or visually directed toward the object or place.",
+      "description": "person at table; sign at street; clock at tower; child at window; located at place or target region",
       "primitives": [
         "one object is located at a place or target region",
         "one object points or moves toward a target object",
@@ -101,7 +101,7 @@
       ]
     },
     "attached to": {
-      "description": "The subject is physically joined, fastened, or connected to the object.",
+      "description": "handle attached to door; wheel attached to car; sign attached to pole; tag attached to bag; fixed physical connection",
       "primitives": [
         "one object is fixed or fastened to another object",
         "two objects are physically touching",
@@ -109,7 +109,7 @@
       ]
     },
     "behind": {
-      "description": "The subject is farther back than the object or partly hidden behind it.",
+      "description": "person behind car; building behind tree; dog behind fence; chair behind table; farther back or partly occluded",
       "primitives": [
         "one object is farther back in the scene behind another object",
         "one object covers or hides part of another object",
@@ -117,7 +117,7 @@
       ]
     },
     "belonging to": {
-      "description": "The subject is visually associated with the object as something owned, possessed, or carried by it.",
+      "description": "wheel belonging to car; handle belonging to bag; leaf belonging to plant; arm belonging to person; owned or component-like association",
       "primitives": [
         "one object belongs to or is possessed by another object",
         "one object is visually associated with another object",
@@ -125,7 +125,7 @@
       ]
     },
     "between": {
-      "description": "The subject is positioned in the space between surrounding objects or regions.",
+      "description": "person between cars; table between chairs; road between buildings; object in middle gap between surrounding things",
       "primitives": [
         "one object is between surrounding objects or regions",
         "two objects are close together but not touching",
@@ -141,7 +141,7 @@
       ]
     },
     "covered in": {
-      "description": "The subject surface is filled with the object as material, texture, marks, or many small instances.",
+      "description": "shirt covered in pattern; ground covered in snow; table covered in food; wall covered in signs; surface filled by material or texture",
       "primitives": [
         "one object covers or hides part of another object",
         "one object is painted or drawn as a mark on a surface",
@@ -157,7 +157,7 @@
       ]
     },
     "eating": {
-      "description": "The subject eats, bites, or consumes the object.",
+      "description": "person eating food; animal eating grass; child eating banana; mouth near food; teeth or bite contact with edible item",
       "primitives": [
         "a person or animal eats or bites an object",
         "two objects are physically touching",
@@ -165,7 +165,7 @@
       ]
     },
     "flying in": {
-      "description": "The subject is airborne inside a visible region or scene area.",
+      "description": "bird flying in sky; airplane flying in air; kite flying in sky; plane flying in clouds; motion in open air region",
       "primitives": [
         "an object or animal flies in the air",
         "one object is inside an enclosing object or region",
@@ -173,7 +173,7 @@
       ]
     },
     "for": {
-      "description": "The subject is intended for the object, purpose, target, or use case.",
+      "description": "plate for food; bag for carrying; rack for bike; equipment for sport; object serving purpose or target use",
       "primitives": [
         "one object is used for the purpose of another object",
         "one object points or moves toward a target object",
@@ -181,7 +181,7 @@
       ]
     },
     "from": {
-      "description": "The subject comes out of, originates at, or moves away from the object or region.",
+      "description": "smoke from engine; branch from tree; handle from cup; person from doorway; origin or source region",
       "primitives": [
         "one object comes from a source object or region",
         "one object crosses from one side of a region to the other",
@@ -205,7 +205,7 @@
       ]
     },
     "has": {
-      "description": "The object is a visible part, component, attribute, or possession of the subject.",
+      "description": "person has head; car has wheel; shirt has logo; animal has tail; larger entity with visible part or attribute",
       "primitives": [
         "one object is a visible part of a larger object",
         "one object is a body part of a person or animal",
@@ -213,7 +213,7 @@
       ]
     },
     "holding": {
-      "description": "Person holding phone, hand holding cup, player holding bat or racket, child holding toy, animal holding food: direct grasp or hand contact with the object, without necessarily transporting it.",
+      "description": "person holding phone; hand holding cup; player holding bat; child holding toy; direct hand grip or contact",
       "primitives": [
         "a hand grips or holds an object",
         "two objects are physically touching",
@@ -221,7 +221,7 @@
       ]
     },
     "in": {
-      "description": "The subject is inside the object, container, or enclosing region.",
+      "description": "person in room; dog in car; food in bowl; bird in cage; enclosed or contained region",
       "primitives": [
         "one object is inside an enclosing object or region",
         "one object surrounds or contains another object",
@@ -229,7 +229,7 @@
       ]
     },
     "in front of": {
-      "description": "The subject is closer to the camera than the object, appearing in front of it.",
+      "description": "person in front of car; chair in front of table; sign in front of building; closer camera depth with occlusion cue",
       "primitives": [
         "one object is closer to the camera in front of another object",
         "one object covers or hides part of another object",
@@ -237,7 +237,7 @@
       ]
     },
     "laying on": {
-      "description": "The subject is lying or spread across the object surface.",
+      "description": "person laying on bed; animal laying on grass; body laying on ground; blanket laying on couch; horizontal spread on support",
       "primitives": [
         "a person or animal lies across a supporting surface",
         "one object rests on the top surface of another object",
@@ -245,7 +245,7 @@
       ]
     },
     "looking at": {
-      "description": "The subject directs its gaze toward the object.",
+      "description": "person looking at phone; dog looking at person; player looking at ball; eyes or face directed toward target",
       "primitives": [
         "a person or animal looks toward another object",
         "one object points or moves toward a target object",
@@ -261,7 +261,7 @@
       ]
     },
     "made of": {
-      "description": "The subject is made from the material or substance named by the object.",
+      "description": "table made of wood; wall made of brick; shirt made of cloth; object composed of visible material",
       "primitives": [
         "one object is made from a visible material",
         "one object is a visible part of a larger object",
@@ -277,7 +277,7 @@
       ]
     },
     "near": {
-      "description": "The subject is close to the object without a specific contact or action.",
+      "description": "person near car; dog near table; tree near house; objects close with visible space and no specific contact",
       "primitives": [
         "two objects are close together but not touching",
         "two objects appear together as a loose pair",
@@ -285,7 +285,7 @@
       ]
     },
     "of": {
-      "description": "The subject is part of, possessed by, or visually associated with the object.",
+      "description": "wheel of car; handle of bag; branch of tree; head of person; component or possession relation",
       "primitives": [
         "one object is a visible part of a larger object",
         "one object belongs to or is possessed by another object",
@@ -293,7 +293,7 @@
       ]
     },
     "on": {
-      "description": "The subject is on the object surface with contact or support.",
+      "description": "person on horse; cup on table; book on shelf; car on road; supported contact on top or surface",
       "primitives": [
         "one object rests on the top surface of another object",
         "one object supports the weight of another object",
@@ -301,7 +301,7 @@
       ]
     },
     "on back of": {
-      "description": "The subject is located on the back side or back surface of the object.",
+      "description": "person on back of horse; bag on back of person; logo on back of shirt; object located on rear surface",
       "primitives": [
         "one object is on the back side of a person animal or object",
         "one object rests on the top surface of another object",
@@ -309,7 +309,7 @@
       ]
     },
     "over": {
-      "description": "The subject is above or spans over the object, with or without contact.",
+      "description": "bridge over water; plane over field; hand over plate; roof over door; spanning higher position",
       "primitives": [
         "one object spans over another object without necessarily touching",
         "one object is visibly higher than another object in the image",
@@ -333,7 +333,7 @@
       ]
     },
     "part of": {
-      "description": "The subject is a visible component or subpart of the object.",
+      "description": "wheel part of car; branch part of tree; handle part of cup; leg part of table; visible component within larger whole",
       "primitives": [
         "one object is a visible part of a larger object",
         "one object is fixed or fastened to another object",
@@ -357,7 +357,7 @@
       ]
     },
     "says": {
-      "description": "The subject displays written text, symbols, or readable markings.",
+      "description": "sign says word; shirt says logo; board says number; label says text; readable writing or symbol on surface",
       "primitives": [
         "one object is printed or written as text on a surface",
         "one object is painted or drawn as a mark on a surface",
@@ -373,7 +373,7 @@
       ]
     },
     "standing on": {
-      "description": "Person standing on ground, animal standing on grass, player standing on field, object standing on table, feet standing on floor: upright posture supported by the object surface.",
+      "description": "person standing on ground; animal standing on grass; player standing on field; feet standing on floor; upright support on surface",
       "primitives": [
         "a person or animal stands on a supporting surface",
         "one object supports the weight of another object",
@@ -381,7 +381,7 @@
       ]
     },
     "to": {
-      "description": "The subject is directed toward the object as an endpoint or destination.",
+      "description": "road to house; person walking to door; line to target; object directed toward endpoint or destination",
       "primitives": [
         "one object is directed to an endpoint or destination",
         "one object points or moves toward a target object",
@@ -389,7 +389,7 @@
       ]
     },
     "under": {
-      "description": "The subject appears below or beneath the object.",
+      "description": "person under umbrella; cat under table; wheel under car; object below another object with vertical cue",
       "primitives": [
         "one object is visibly lower than another object in the image",
         "one object spans over another object without necessarily touching",
@@ -413,7 +413,7 @@
       ]
     },
     "walking on": {
-      "description": "The subject walks on the top of a surface.",
+      "description": "person walking on sidewalk; animal walking on grass; player walking on field; feet moving on support surface",
       "primitives": [
         "a person or animal walks on top of a surface",
         "one object rests on the top surface of another object",
@@ -421,7 +421,7 @@
       ]
     },
     "watching": {
-      "description": "The subject watches or visually attends to the object or event.",
+      "description": "person watching TV; child watching game; woman watching animal; gaze and attention toward event or object",
       "primitives": [
         "a person watches another person object or event",
         "a person or animal looks toward another object",
@@ -429,7 +429,7 @@
       ]
     },
     "wearing": {
-      "description": "The subject wears the object as clothing, gear, or an accessory attached to the body.",
+      "description": "person wearing shirt; man wearing hat; skier wearing skis; dog wearing collar; clothing or gear attached to body",
       "primitives": [
         "a person or animal wears an object on the body",
         "one object is attached around a body part like clothing or gear",
@@ -437,7 +437,7 @@
       ]
     },
     "wears": {
-      "description": "The subject has the object worn on its body as clothing, gear, or an accessory.",
+      "description": "person wears shirt; man wears hat; child wears helmet; animal wears collar; body with worn clothing or accessory",
       "primitives": [
         "a person or animal wears an object on the body",
         "one object is attached around a body part like clothing or gear",
@@ -445,7 +445,7 @@
       ]
     },
     "with": {
-      "description": "The subject appears with the object as a broad visual association.",
+      "description": "person with bag; table with food; man with umbrella; dog with toy; broad co-occurrence or accompanying object",
       "primitives": [
         "two objects appear together as a loose pair",
         "one object is visually associated with another object",

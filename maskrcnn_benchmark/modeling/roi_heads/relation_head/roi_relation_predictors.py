@@ -493,11 +493,21 @@ class PrimitiveLowRankClipPredictor(nn.Module):
             basis_decorr_weight=self.primitive_cfg.BASIS_DECORR_WEIGHT,
             weight_decorr_weight=self.primitive_cfg.WEIGHT_DECORR_WEIGHT,
             basis_anchor_weight=self.primitive_cfg.BASIS_ANCHOR_WEIGHT,
+            distribution_enabled=self.primitive_cfg.DISTRIBUTION_ENABLED,
+            distribution_context_dim=512,
+            distribution_hidden_dim=self.primitive_cfg.DISTRIBUTION_HIDDEN_DIM,
+            distribution_rank=self.primitive_cfg.DISTRIBUTION_RANK,
+            distribution_shift_scale=self.primitive_cfg.DISTRIBUTION_SHIFT_SCALE,
+            distribution_noise_scale=self.primitive_cfg.DISTRIBUTION_NOISE_SCALE,
+            distribution_shift_loss_weight=self.primitive_cfg.DISTRIBUTION_SHIFT_LOSS_WEIGHT,
+            distribution_var_loss_weight=self.primitive_cfg.DISTRIBUTION_VAR_LOSS_WEIGHT,
+            distribution_sample=self.primitive_cfg.DISTRIBUTION_SAMPLE,
         ).to(self.device)
         print(
             "PrimitiveLowRankClipPredictor: predicates={} primitives={} train_basis={} "
             "train_weight={} temperature={} recon_cos_weight={} mask_out_weight={} "
-            "object_filter={} object_filter_weight={} debug_log_period={}".format(
+            "distribution={} dist_rank={} object_filter={} object_filter_weight={} "
+            "debug_log_period={}".format(
                 len(predicate_texts),
                 len(primitive_texts),
                 self.primitive_cfg.TRAIN_BASIS,
@@ -505,6 +515,8 @@ class PrimitiveLowRankClipPredictor(nn.Module):
                 self.primitive_cfg.CLASSIFIER_TEMPERATURE,
                 self.primitive_cfg.COSINE_RECON_LOSS_WEIGHT,
                 self.primitive_cfg.MASK_OUT_WEIGHT,
+                self.primitive_cfg.DISTRIBUTION_ENABLED,
+                self.primitive_cfg.DISTRIBUTION_RANK,
                 self.use_object_filter,
                 self.object_filter_weight,
                 self.debug_log_period,
@@ -524,6 +536,7 @@ class PrimitiveLowRankClipPredictor(nn.Module):
     def _encode_object_role_texts(self):
         self.subject_role_text = self._encode_texts(["a photo of subject" for _ in self.obj_names])
         self.object_role_text = self._encode_texts(["a photo of object" for _ in self.obj_names])
+        self.object_name_text = self._encode_texts(["a photo of " + name for name in self.obj_names])
 
     def update_split(self, mode):
         print("now is " + mode)
@@ -618,7 +631,9 @@ class PrimitiveLowRankClipPredictor(nn.Module):
             "basis_norm_mean={basis_norm_mean:.4f} basis_rel_shift_mean={basis_rel_shift_mean:.4f} "
             "basis_rel_shift_max={basis_rel_shift_max:.4f} basis_corr_offdiag={basis_corr_offdiag:.4f} "
             "recon_cos_mean={recon_cos_mean:.4f} recon_cos_min={recon_cos_min:.4f} "
-            "recon_cos_neg_frac={recon_cos_neg_frac:.4f}"
+            "recon_cos_neg_frac={recon_cos_neg_frac:.4f} dist_shift_abs_mean={dist_shift_abs_mean:.4f} "
+            "dist_shift_abs_max={dist_shift_abs_max:.4f} dist_sigma_mean={dist_sigma_mean:.4f} "
+            "dist_sigma_max={dist_sigma_max:.4f}"
         ).format(
             step=int(self._debug_forward_count.item()),
             split=self.mode,
@@ -653,6 +668,8 @@ class PrimitiveLowRankClipPredictor(nn.Module):
         rel_dists = []
         primitive_logits_for_debug = []
         pair_features_for_debug = []
+        if self.training:
+            self.primitive_text_adapter.reset_distribution_losses()
         for i in range(len(num_rels)):
             if num_rels[i] == 0:
                 rel_dists.append(roi_features.new_zeros((0, len(self.rel_ids))))
@@ -678,9 +695,15 @@ class PrimitiveLowRankClipPredictor(nn.Module):
                 self.object_role_text[obj_labels],
             )
             pair_features = F.normalize((cross_output1.float() + cross_output2.float()) / 2, dim=-1)
+            object_pair_text = F.normalize(
+                (self.object_name_text[subj_labels] + self.object_name_text[obj_labels]) * 0.5,
+                dim=-1,
+            )
+            condition_features = F.normalize(pair_features + object_pair_text, dim=-1)
             logits, primitive_logits = self.primitive_text_adapter.logits(
                 pair_features,
                 self.fg_rel_ids,
+                condition_features=condition_features,
             )
             object_filter_logits = self._object_filter_logits(
                 image_features,
