@@ -22,16 +22,16 @@ CHECKPOINT_PERIOD="${CHECKPOINT_PERIOD:-8000}"
 mkdir -p "${OUTPUT_ROOT}" "${LOG_DIR}"
 
 NAMES=(
+  "nodist_of05"
   "dist_s01_nosample_of05"
   "dist_s02_nosample_of05"
   "dist_s01_sample_of05"
-  "nodist_of05"
 )
 
-DIST_ENABLED=(True True True False)
-DIST_SAMPLE=(False False True False)
-SHIFT_SCALE=(0.1 0.2 0.1 0.0)
-NOISE_SCALE=(0.02 0.02 0.02 0.0)
+DIST_ENABLED=(False True True True)
+DIST_SAMPLE=(False False False True)
+SHIFT_SCALE=(0.0 0.1 0.2 0.1)
+NOISE_SCALE=(0.0 0.02 0.02 0.02)
 OBJECT_FILTER_WEIGHT=(0.5 0.5 0.5 0.5)
 
 echo "log_file=${LOG_FILE}" >> "${LOG_FILE}"
@@ -70,7 +70,7 @@ for idx in "${!NAMES[@]}"; do
     SOLVER.CHECKPOINT_PERIOD "${CHECKPOINT_PERIOD}" \
     GLOVE_DIR "${GLOVE_DIR}" \
     OUTPUT_DIR "${output_dir}" \
-    >> "${LOG_FILE}" 2>/dev/null
+    >> "${LOG_FILE}"
 
   status=$?
   echo "exit_code=${status}" >> "${LOG_FILE}"
