@@ -124,6 +124,8 @@ class PrimitiveLowRankTextAdapter(nn.Module):
             )
             self.dist_shift_proj = nn.Linear(distribution_hidden_dim, distribution_rank)
             self.dist_sigma_proj = nn.Linear(distribution_hidden_dim, distribution_rank)
+            self.dist_primitive_shift_proj = nn.Linear(distribution_hidden_dim, num_primitives)
+            self.dist_primitive_sigma_proj = nn.Linear(distribution_hidden_dim, num_primitives)
             self.dist_rel_shift = nn.Parameter(
                 torch.empty(num_predicates, distribution_rank, num_primitives)
             )
@@ -133,6 +135,10 @@ class PrimitiveLowRankTextAdapter(nn.Module):
             self.dist_log_sigma = nn.Parameter(sigma_prior)
             nn.init.normal_(self.dist_rel_shift, mean=0.0, std=0.02)
             nn.init.normal_(self.dist_rel_sigma, mean=0.0, std=0.01)
+            nn.init.normal_(self.dist_primitive_shift_proj.weight, mean=0.0, std=0.01)
+            nn.init.zeros_(self.dist_primitive_shift_proj.bias)
+            nn.init.normal_(self.dist_primitive_sigma_proj.weight, mean=0.0, std=0.005)
+            nn.init.zeros_(self.dist_primitive_sigma_proj.bias)
 
     def _initialize_weights(self, centered_predicates, primitive_features, predicate_primitive_mask):
         if predicate_primitive_mask is None:
@@ -209,13 +215,26 @@ class PrimitiveLowRankTextAdapter(nn.Module):
         sigma_context = torch.tanh(self.dist_sigma_proj(hidden))
         active_ids = fg_ids.to(self.class_weights.device).long()
 
-        rel_shift = self.dist_rel_shift[active_ids].float()
-        rel_sigma = self.dist_rel_sigma[active_ids].float()
-        delta = torch.einsum("nr,crk->nck", shift_context, rel_shift)
+        semantic_gate = self._semantic_distribution_gate(base_weights)
+        shared_delta = torch.tanh(self.dist_primitive_shift_proj(hidden))
+        residual_shift = torch.einsum(
+            "nr,crk->nck",
+            shift_context,
+            self.dist_rel_shift[active_ids].float(),
+        )
+        delta = shared_delta.unsqueeze(1) * semantic_gate.unsqueeze(0)
+        delta = delta + 0.1 * residual_shift
         delta = torch.tanh(delta) * self.distribution_shift_scale
 
         log_sigma = self.dist_log_sigma[active_ids].float().unsqueeze(0)
-        log_sigma = log_sigma + torch.einsum("nr,crk->nck", sigma_context, rel_sigma)
+        shared_sigma = torch.tanh(self.dist_primitive_sigma_proj(hidden))
+        residual_sigma = torch.einsum(
+            "nr,crk->nck",
+            sigma_context,
+            self.dist_rel_sigma[active_ids].float(),
+        )
+        log_sigma = log_sigma + shared_sigma.unsqueeze(1) * semantic_gate.unsqueeze(0)
+        log_sigma = log_sigma + 0.1 * residual_sigma
         sigma = F.softplus(log_sigma.clamp(-8.0, 2.0)) * self.distribution_noise_scale
 
         weights = base_weights.unsqueeze(0) + delta
@@ -225,6 +244,15 @@ class PrimitiveLowRankTextAdapter(nn.Module):
         logits = torch.einsum("nk,nck->nc", primitive_logits, weights)
         self._record_distribution_terms(delta, sigma)
         return logits
+
+    def _semantic_distribution_gate(self, base_weights):
+        gate = base_weights.detach().abs()
+        gate = gate / gate.amax(dim=1, keepdim=True).clamp_min(1e-6)
+        if hasattr(self, "predicate_primitive_mask"):
+            mask = self.predicate_primitive_mask.to(device=gate.device, dtype=gate.dtype)
+            if mask.shape == gate.shape:
+                gate = gate * (0.25 + 0.75 * mask)
+        return gate.clamp(0.0, 1.0)
 
     def _record_distribution_terms(self, delta, sigma):
         if self.training:
