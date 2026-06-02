@@ -449,12 +449,6 @@ class PrimitiveLowRankClipPredictor(nn.Module):
         self.use_object_filter = bool(self.primitive_cfg.USE_OBJECT_FILTER)
         self.object_filter_weight = float(self.primitive_cfg.OBJECT_FILTER_WEIGHT)
         self.object_filter_temperature = float(self.primitive_cfg.OBJECT_FILTER_TEMPERATURE)
-        self.novel_distribution_shift_scale = float(
-            getattr(self.primitive_cfg, "NOVEL_DISTRIBUTION_SHIFT_SCALE", 0.05)
-        )
-        self.novel_object_filter_weight = float(
-            getattr(self.primitive_cfg, "NOVEL_OBJECT_FILTER_WEIGHT", 0.2)
-        )
 
         statistics = get_dataset_statistics(config)
         obj_classes = statistics["obj_classes"]
@@ -556,18 +550,6 @@ class PrimitiveLowRankClipPredictor(nn.Module):
     def updata(self, mode):
         self.update_split(mode)
 
-    def _current_distribution_shift_scale(self):
-        if self.training:
-            return self.primitive_cfg.DISTRIBUTION_SHIFT_SCALE
-        if self.mode == "novel":
-            return self.novel_distribution_shift_scale
-        return self.primitive_cfg.DISTRIBUTION_SHIFT_SCALE
-
-    def _current_object_filter_weight(self):
-        if self.mode == "novel":
-            return self.novel_object_filter_weight
-        return self.object_filter_weight
-
     def _encode_object_filter_texts(self):
         if not self.use_object_filter:
             self.object_filter_texts = None
@@ -651,7 +633,11 @@ class PrimitiveLowRankClipPredictor(nn.Module):
             "recon_cos_mean={recon_cos_mean:.4f} recon_cos_min={recon_cos_min:.4f} "
             "recon_cos_neg_frac={recon_cos_neg_frac:.4f} dist_shift_abs_mean={dist_shift_abs_mean:.4f} "
             "dist_shift_abs_max={dist_shift_abs_max:.4f} dist_sigma_mean={dist_sigma_mean:.4f} "
-            "dist_sigma_max={dist_sigma_max:.4f}"
+            "dist_sigma_max={dist_sigma_max:.4f} dist_sigma_prior_mean={dist_sigma_prior_mean:.4f} "
+            "dist_sem_width_mean={dist_sem_width_mean:.4f} "
+            "dist_pair_coeff_abs_mean={dist_pair_coeff_abs_mean:.4f} "
+            "dist_pred_coeff_abs_mean={dist_pred_coeff_abs_mean:.4f} "
+            "dist_joint_coeff_abs_mean={dist_joint_coeff_abs_mean:.4f}"
         ).format(
             step=int(self._debug_forward_count.item()),
             split=self.mode,
@@ -722,7 +708,6 @@ class PrimitiveLowRankClipPredictor(nn.Module):
                 pair_features,
                 self.fg_rel_ids,
                 condition_features=condition_features,
-                distribution_shift_scale=self._current_distribution_shift_scale(),
             )
             object_filter_logits = self._object_filter_logits(
                 image_features,
@@ -731,7 +716,7 @@ class PrimitiveLowRankClipPredictor(nn.Module):
                 obj_labels,
             )
             if object_filter_logits is not None:
-                filter_weight = min(max(self._current_object_filter_weight(), 0.0), 1.0)
+                filter_weight = min(max(self.object_filter_weight, 0.0), 1.0)
                 logits = logits * (1.0 - filter_weight) + object_filter_logits * filter_weight
             if self.training and self.debug_log_period > 0:
                 primitive_logits_for_debug.append(primitive_logits)
