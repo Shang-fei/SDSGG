@@ -209,6 +209,22 @@ class PrimitiveLowRankTextAdapter(nn.Module):
         self._distribution_var_terms = []
 
     def _distribution_logits(self, primitive_logits, fg_ids, condition_features, base_weights):
+        return self._distribution_logits_with_scale(
+            primitive_logits,
+            fg_ids,
+            condition_features,
+            base_weights,
+            self.distribution_shift_scale,
+        )
+
+    def _distribution_logits_with_scale(
+        self,
+        primitive_logits,
+        fg_ids,
+        condition_features,
+        base_weights,
+        distribution_shift_scale,
+    ):
         condition_features = F.normalize(condition_features.float(), dim=-1)
         hidden = self.dist_context(condition_features)
         shift_context = torch.tanh(self.dist_shift_proj(hidden))
@@ -224,7 +240,7 @@ class PrimitiveLowRankTextAdapter(nn.Module):
         )
         delta = shared_delta.unsqueeze(1) * semantic_gate.unsqueeze(0)
         delta = delta + 0.1 * residual_shift
-        delta = torch.tanh(delta) * self.distribution_shift_scale
+        delta = torch.tanh(delta) * float(distribution_shift_scale)
 
         log_sigma = self.dist_log_sigma[active_ids].float().unsqueeze(0)
         shared_sigma = torch.tanh(self.dist_primitive_sigma_proj(hidden))
@@ -273,6 +289,7 @@ class PrimitiveLowRankTextAdapter(nn.Module):
         weight_anchor_blend=0.0,
         basis_anchor_blend=0.0,
         condition_features=None,
+        distribution_shift_scale=None,
     ):
         visual_features = F.normalize(visual_features.float(), dim=-1)
         primitive_logits = visual_features @ self.classifier_basis(
@@ -280,7 +297,15 @@ class PrimitiveLowRankTextAdapter(nn.Module):
         ).t()
         weights = self.active_weights(fg_ids, anchor_blend=weight_anchor_blend)
         if self.distribution_enabled and condition_features is not None:
-            logits = self._distribution_logits(primitive_logits, fg_ids, condition_features, weights)
+            if distribution_shift_scale is None:
+                distribution_shift_scale = self.distribution_shift_scale
+            logits = self._distribution_logits_with_scale(
+                primitive_logits,
+                fg_ids,
+                condition_features,
+                weights,
+                distribution_shift_scale,
+            )
         else:
             logits = primitive_logits @ weights.t()
         return logits / max(self.logit_temperature, 1e-6), primitive_logits
