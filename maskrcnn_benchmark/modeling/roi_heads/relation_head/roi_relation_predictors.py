@@ -536,7 +536,7 @@ class ClipV2Predictor(ClipPredictor):
         self.clip_v2_fg_full_ids = active_ids[1:]
 
     def update_split(self, mode):
-        super(ClipV2Predictor, self).update_split(mode)
+        ClipPredictor.updata(self, mode)
         if hasattr(self, "clip_v2_splits"):
             self._clip_v2_refresh_active(mode)
 
