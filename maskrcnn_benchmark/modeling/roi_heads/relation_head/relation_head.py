@@ -87,7 +87,7 @@ class ROIRelationHead(torch.nn.Module):
         
         # final classifier that converts the features into predictions
         # should corresponding to all the functions and layers after the self.context class
-        if self.predictor_name in ("ClipPredictor", "GQAClipPredictor"):
+        if self.predictor_name in ("ClipPredictor", "GQAClipPredictor", "SemanticBankGaussianPredictor"):
             refine_logits, relation_logits, add_losses = self.predictor(
                 proposals, rel_pair_idxs, rel_labels, rel_binarys, roi_features, union_features, logger, img, edge_maps
             )

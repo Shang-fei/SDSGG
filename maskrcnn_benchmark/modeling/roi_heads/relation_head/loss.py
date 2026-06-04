@@ -36,7 +36,8 @@ class RelationLossComputation(object):
         attribute_bgfg_ratio,
         use_label_smoothing,
         predicate_proportion,
-        device
+        device,
+        predictor_name
     ):
         """
         Arguments:
@@ -49,13 +50,16 @@ class RelationLossComputation(object):
         self.attribute_sampling = attribute_sampling
         self.attribute_bgfg_ratio = attribute_bgfg_ratio
         self.use_label_smoothing = use_label_smoothing
+        self.predictor_name = predictor_name
         self.pred_weight = (1.0 / torch.FloatTensor([0.5,] + predicate_proportion)).cuda()
 
         if self.use_label_smoothing:
             self.criterion_loss = Label_Smoothing_Regression(e=0.01)
         else:
             self.criterion_loss = nn.CrossEntropyLoss()
-        self.loss=Loss(gamma=0.0, alpha=1, size_average=True,device=device)
+        self.loss = None
+        if self.predictor_name != "SemanticBankGaussianPredictor":
+            self.loss = Loss(gamma=0.0, alpha=1, size_average=True, device=device)
         #self.focal_loss=MultiCEFocalLoss(class_num=25,device=device)
 
     def __call__(self, proposals, rel_labels, relation_logits, refine_logits):
@@ -87,7 +91,10 @@ class RelationLossComputation(object):
         fg_labels = cat([proposal.get_field("labels") for proposal in proposals], dim=0)
         rel_labels = cat(rel_labels, dim=0)
         
-        loss_relation = self.loss(relation_logits, rel_labels.long())
+        if self.predictor_name == "SemanticBankGaussianPredictor":
+            loss_relation = self.criterion_loss(relation_logits, rel_labels.long())
+        else:
+            loss_relation = self.loss(relation_logits, rel_labels.long())
         #loss_relation = self.criterion_loss(relation_logits, rel_labels.long())
         loss_refine_obj = self.criterion_loss(refine_obj_logits, fg_labels.long())
 
@@ -251,7 +258,8 @@ def make_roi_relation_loss_evaluator(cfg):
         cfg.MODEL.ROI_ATTRIBUTE_HEAD.ATTRIBUTE_BGFG_RATIO,
         cfg.MODEL.ROI_RELATION_HEAD.LABEL_SMOOTHING_LOSS,
         cfg.MODEL.ROI_RELATION_HEAD.REL_PROP,
-        cfg.MODEL.DEVICE
+        cfg.MODEL.DEVICE,
+        cfg.MODEL.ROI_RELATION_HEAD.PREDICTOR
     )
 
     return loss_evaluator
