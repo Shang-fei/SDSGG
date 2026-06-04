@@ -80,6 +80,11 @@ class RelationLossComputation(object):
                 predicate_proportion,
                 device,
             )
+        elif (
+            predictor == "clip_V2"
+            and cfg.MODEL.ROI_RELATION_HEAD.CLIP_V2.LOSS_TYPE == "w_align"
+        ):
+            self.relation_criterion = nn.CrossEntropyLoss()
         else:
             self.relation_criterion = ClipDescriptionRegressionLoss(cfg, device=device)
         if self.use_label_smoothing:

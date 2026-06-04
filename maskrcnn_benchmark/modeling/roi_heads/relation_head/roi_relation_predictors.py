@@ -21,7 +21,6 @@ import time
 from PIL import Image
 import pandas as pd
 curpath=os.path.dirname(__file__)
-CLIP_MVA_CHUNK_SIZE = 8
 
 def crop_and_resize(image, posi1, posi2):
     posi = torch.cat((torch.min(posi1[0:2], posi2[0:2]),
@@ -121,9 +120,14 @@ class MVA(nn.Module):
         return sub_features
 
 def mva_in_chunks(mva, sub_features, obj_features, text_features, chunk_size):
+    chunk_size = int(chunk_size)
+    if sub_features.size(0) == 0:
+        return sub_features.new_zeros((0, sub_features.size(-1)))
+    if chunk_size <= 0 or sub_features.size(0) <= chunk_size:
+        return mva(sub_features, obj_features, text_features)
     outputs = []
     for start in range(0, sub_features.size(0), chunk_size):
-        end = start + chunk_size
+        end = min(start + chunk_size, sub_features.size(0))
         outputs.append(mva(
             sub_features[start:end],
             obj_features[start:end],
@@ -152,6 +156,7 @@ class ClipPredictor(nn.Module):
             'att_classes']
         self.device=config.MODEL.DEVICE
         self.clip_model, self.clip_preprocess = clip.load("ViT-B/32", device=self.device)
+        self.clip_mva_chunk_size = int(config.MODEL.ROI_RELATION_HEAD.CLIP_MVA_CHUNK_SIZE)
 
         self.adaper_clip1 = MVA()
         self.adaper_clip2 = MVA()
@@ -350,6 +355,8 @@ class ClipPredictor(nn.Module):
         obj_preds = obj_preds.split(num_objs, dim=0)
 
         rel_dists=[]
+        text_features1_norm = F.normalize(self.text_features1, dim=-1)
+        text_features2_norm = F.normalize(self.text_features2, dim=-1)
         for i in range(len(num_rels)):
             rel_dist_per_batch=[]
             union_imges=[]
@@ -371,24 +378,19 @@ class ClipPredictor(nn.Module):
             obj_n1 = obj_preds[i][subj_idx]
             obj_n2 = obj_preds[i][obj_idx]
 
-            text_features1 = self.text_features1
-            text_features2 = self.text_features2
-            text_features1_norm = F.normalize(text_features1, dim=-1)
-            text_features2_norm = F.normalize(text_features2, dim=-1)
-
             cross_output1 = mva_in_chunks(
                 self.adaper_clip1,
                 image_features[subj_idx],
                 image_features[obj_idx],
                 self.text_features3[obj_n1],
-                chunk_size=CLIP_MVA_CHUNK_SIZE,
+                chunk_size=self.clip_mva_chunk_size,
             )
             cross_output2 = mva_in_chunks(
                 self.adaper_clip2,
                 image_features[obj_idx],
                 image_features[subj_idx],
                 self.text_features4[obj_n2],
-                chunk_size=CLIP_MVA_CHUNK_SIZE,
+                chunk_size=self.clip_mva_chunk_size,
             )
             cross_output = (cross_output1 + cross_output2) / 2
             cross_output = F.normalize(cross_output, dim=-1)
@@ -433,6 +435,364 @@ class ClipPredictor(nn.Module):
         add_losses = {}
         return obj_dists, rel_dists, add_losses
 
+
+
+@registry.ROI_RELATION_PREDICTOR.register("clip_V2")
+class ClipV2Predictor(ClipPredictor):
+    def __init__(self, config, in_channels):
+        super(ClipV2Predictor, self).__init__(config, in_channels)
+        self.clip_v2_cfg = config.MODEL.ROI_RELATION_HEAD.CLIP_V2
+        self.clip_v2_splits = build_predicate_splits(config)
+        self.clip_v2_predicate_names = build_full_predicate_names(config)
+        self.clip_v2_mode = "base"
+        self.clip_v2_loss_type = str(self.clip_v2_cfg.LOSS_TYPE)
+        self.clip_v2_distribution_enabled = bool(self.clip_v2_cfg.DISTRIBUTION_ENABLED)
+        self.clip_v2_debug_period = int(self.clip_v2_cfg.DEBUG_LOG_PERIOD)
+        self.clip_v2_w_residual_scale = float(self.clip_v2_cfg.W_RESIDUAL_SCALE)
+        self.clip_v2_recon_weight = float(self.clip_v2_cfg.RECON_LOSS_WEIGHT)
+        self.clip_v2_w_anchor_weight = float(self.clip_v2_cfg.W_ANCHOR_WEIGHT)
+        self.clip_v2_basis_anchor_weight = float(self.clip_v2_cfg.BASIS_ANCHOR_WEIGHT)
+        self.clip_v2_aux_weight = float(self.clip_v2_cfg.AUX_LOSS_WEIGHT)
+        self.clip_v2_dist_shift_weight = float(self.clip_v2_cfg.DISTRIBUTION_SHIFT_LOSS_WEIGHT)
+        self.clip_v2_dist_var_weight = float(self.clip_v2_cfg.DISTRIBUTION_VAR_LOSS_WEIGHT)
+        self.clip_v2_shift_scale = float(self.clip_v2_cfg.DISTRIBUTION_SHIFT_SCALE)
+        self.clip_v2_noise_scale = float(self.clip_v2_cfg.DISTRIBUTION_NOISE_SCALE)
+        self.clip_v2_sample = bool(self.clip_v2_cfg.DISTRIBUTION_SAMPLE)
+        if self.clip_v2_loss_type not in ("clip_regression", "w_align"):
+            raise ValueError("Unsupported clip_V2 loss type: {}".format(self.clip_v2_loss_type))
+
+        primitive_basis = self._clip_v2_init_primitive_basis()
+        self.clip_v2_basis = nn.Parameter(
+            primitive_basis.clone(),
+            requires_grad=bool(self.clip_v2_cfg.TRAIN_BASIS),
+        )
+        self.register_buffer("clip_v2_basis_anchor", primitive_basis.clone())
+
+        predicate_texts = ["a photo of " + name for name in self.clip_v2_predicate_names[1:]]
+        with torch.no_grad():
+            predicate_features = self._clip_v2_encode_texts(predicate_texts)
+        self.register_buffer("clip_v2_predicate_features", predicate_features)
+        self.register_buffer("clip_v2_text_mean", predicate_features.mean(dim=0))
+
+        self.clip_v2_w_residual = nn.Parameter(
+            torch.zeros(len(self.clip_v2_predicate_names) - 1, primitive_basis.size(0), device=self.device),
+            requires_grad=bool(self.clip_v2_cfg.TRAIN_W),
+        )
+
+        hidden_dim = int(self.clip_v2_cfg.DISTRIBUTION_HIDDEN_DIM)
+        rank = int(self.clip_v2_cfg.DISTRIBUTION_RANK)
+        self.clip_v2_dist_context = nn.Sequential(
+            nn.Linear(512, hidden_dim),
+            nn.ReLU(inplace=True),
+        ).to(self.device)
+        self.clip_v2_dist_pair = nn.Linear(hidden_dim, rank).to(self.device)
+        self.clip_v2_dist_basis = nn.Parameter(
+            torch.zeros(rank, primitive_basis.size(0), device=self.device)
+        )
+        nn.init.normal_(self.clip_v2_dist_pair.weight, std=0.01)
+        nn.init.constant_(self.clip_v2_dist_pair.bias, 0.0)
+        nn.init.normal_(self.clip_v2_dist_basis, std=0.01)
+
+        self.register_buffer("_clip_v2_debug_count", torch.zeros((), dtype=torch.long))
+        self.clip_v2_last_stats = {}
+        self.clip_v2_last_dist_losses = {}
+        self._clip_v2_refresh_active("base")
+        print(
+            "clip_V2: loss_type={} train_w={} train_basis={} distribution={} "
+            "rank={} shift_scale={} noise_scale={} aux_weight={} recon_weight={}".format(
+                self.clip_v2_loss_type,
+                self.clip_v2_cfg.TRAIN_W,
+                self.clip_v2_cfg.TRAIN_BASIS,
+                self.clip_v2_distribution_enabled,
+                self.clip_v2_cfg.DISTRIBUTION_RANK,
+                self.clip_v2_shift_scale,
+                self.clip_v2_noise_scale,
+                self.clip_v2_aux_weight,
+                self.clip_v2_recon_weight,
+            )
+        )
+
+    def _clip_v2_encode_texts(self, texts):
+        text_tokens = clip.tokenize(texts).to(self.device)
+        text_features = self.clip_model.encode_text(text_tokens).float()
+        return F.normalize(text_features, dim=-1)
+
+    def _clip_v2_init_primitive_basis(self):
+        positive = F.normalize(self.text_features1.float(), dim=-1)
+        negative = F.normalize(self.text_features2.float(), dim=-1)
+        basis = F.normalize(positive - negative, dim=-1)
+        return basis
+
+    def _clip_v2_refresh_active(self, mode):
+        if mode not in self.clip_v2_splits:
+            raise ValueError("Unsupported OV relation split: {}".format(mode))
+        self.clip_v2_mode = mode
+        active_ids = torch.as_tensor(
+            self.clip_v2_splits[mode],
+            device=self.device,
+            dtype=torch.long,
+        )
+        self.clip_v2_rel_ids = active_ids
+        self.clip_v2_fg_full_ids = active_ids[1:]
+
+    def update_split(self, mode):
+        super(ClipV2Predictor, self).update_split(mode)
+        if hasattr(self, "clip_v2_splits"):
+            self._clip_v2_refresh_active(mode)
+
+    def updata(self, mode):
+        self.update_split(mode)
+
+    def _clip_v2_active_residual(self):
+        fg_ids = self.clip_v2_fg_full_ids.to(self.clip_v2_w_residual.device).long() - 1
+        return self.clip_v2_w_residual[fg_ids].float() * self.clip_v2_w_residual_scale
+
+    def _clip_v2_effective_desc(self, desc):
+        base_w = desc.float()
+        support = (base_w.abs() > 0).float()
+        residual = self._clip_v2_active_residual().to(base_w.device)
+        return base_w + support * residual.unsqueeze(0), support
+
+    def _clip_v2_semantic_width(self, weights):
+        support = (weights.abs() > 1e-6).float()
+        active = support.sum(dim=-1).clamp_min(2.0)
+        prob = weights.abs() / weights.abs().sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        entropy = -(prob * (prob.clamp_min(1e-6).log())).sum(dim=-1)
+        return (entropy / active.log()).clamp(0.0, 1.0)
+
+    def _clip_v2_distribution_logits(self, similarity_delta, desc, condition_features):
+        weights, support = self._clip_v2_effective_desc(desc)
+        delta = weights.new_zeros(weights.shape)
+        sigma = weights.new_zeros(weights.shape)
+        semantic_width = self._clip_v2_semantic_width(weights.detach())
+        sigma_prior = self.clip_v2_noise_scale * (0.25 + 0.75 * semantic_width)
+
+        if self.clip_v2_distribution_enabled:
+            hidden = self.clip_v2_dist_context(condition_features.float())
+            pair_coeff = torch.tanh(self.clip_v2_dist_pair(hidden))
+            pair_shift = torch.tanh(pair_coeff @ self.clip_v2_dist_basis.float())
+            delta = self.clip_v2_shift_scale * pair_shift.unsqueeze(1) * support
+            sigma = sigma_prior.unsqueeze(-1) * support
+            weights = weights + delta
+            if self.training and self.clip_v2_sample and self.clip_v2_noise_scale > 0:
+                weights = weights + torch.randn_like(weights) * sigma
+
+        logits = (weights * similarity_delta.float().unsqueeze(1)).sum(dim=-1)
+        self.clip_v2_last_stats = {
+            "w_abs_mean": weights.detach().abs().mean().item(),
+            "w_abs_max": weights.detach().abs().max().item(),
+            "w_support": support.detach().mean().item(),
+            "dist_shift_abs_mean": delta.detach().abs().mean().item(),
+            "dist_shift_abs_max": delta.detach().abs().max().item(),
+            "dist_sigma_mean": sigma.detach().mean().item(),
+            "dist_sigma_max": sigma.detach().max().item(),
+            "dist_sem_width_mean": semantic_width.detach().mean().item(),
+        }
+        self.clip_v2_last_dist_losses = {
+            "loss_clip_v2_dist_shift": delta.pow(2).mean() * self.clip_v2_dist_shift_weight,
+            "loss_clip_v2_dist_var": sigma.pow(2).mean() * self.clip_v2_dist_var_weight,
+        }
+        return logits
+
+    def _clip_v2_reconstruction_losses(self):
+        desc = self.description_relation[1:].float()
+        weights, support = self._clip_v2_effective_desc(desc.permute(1, 0, 2))
+        weights = weights.permute(1, 0, 2)
+        support = support.permute(1, 0, 2)
+        valid_obj = (support.sum(dim=-1) > 0).float()
+        denom = valid_obj.sum(dim=1, keepdim=True).clamp_min(1.0)
+        avg_w = (weights * valid_obj.unsqueeze(-1)).sum(dim=1) / denom
+
+        basis = F.normalize(self.clip_v2_basis.float(), dim=-1)
+        target = self.clip_v2_predicate_features[
+            self.clip_v2_fg_full_ids.to(self.clip_v2_predicate_features.device).long() - 1
+        ].float()
+        recon = self.clip_v2_text_mean.float() + avg_w.to(basis.device) @ basis
+        recon_loss = (1.0 - F.cosine_similarity(recon, target, dim=-1)).mean()
+        residual = self._clip_v2_active_residual()
+        basis_anchor = (1.0 - (basis * self.clip_v2_basis_anchor.float()).sum(dim=-1)).mean()
+        return {
+            "loss_clip_v2_recon": recon_loss * self.clip_v2_recon_weight,
+            "loss_clip_v2_w_anchor": residual.pow(2).mean() * self.clip_v2_w_anchor_weight,
+            "loss_clip_v2_basis_anchor": basis_anchor * self.clip_v2_basis_anchor_weight,
+        }
+
+    def _clip_v2_aux_relation_loss(self, logits, labels):
+        if (
+            not self.training
+            or labels is None
+            or self.clip_v2_aux_weight <= 0
+            or logits.numel() == 0
+        ):
+            return logits.sum() * 0
+        labels = labels.to(logits.device).long()
+        valid = labels > 0
+        if valid.sum().item() == 0:
+            return logits.sum() * 0
+        bg = logits.new_zeros((logits.size(0), 1))
+        rel_logits = torch.cat((bg, logits), dim=1)
+        return F.cross_entropy(rel_logits[valid].float(), labels[valid]) * self.clip_v2_aux_weight
+
+    def _clip_v2_object_filter_logits(self, probs, image_features, subj_idx, obj_idx, obj_n1):
+        similarity3 = probs.new_zeros(probs.shape)
+        for obj_label in torch.unique(obj_n1):
+            mask = obj_n1 == obj_label
+            text_features5 = F.normalize(self._texts5_tensor(obj_label.item()), dim=-1)[1:]
+            subj_clip = F.normalize(image_features[subj_idx[mask], 0], dim=-1)
+            obj_clip = F.normalize(image_features[obj_idx[mask], 0], dim=-1)
+            similarity31 = subj_clip @ text_features5.t() / 0.05
+            similarity32 = obj_clip @ text_features5.t() / 0.05
+            similarity3[mask] = ((similarity31 + similarity32) / 2).to(similarity3.dtype)
+        return similarity3
+
+    def _clip_v2_log_debug(self, rel_dists, primitive_logits, logger):
+        if not self.training or self.clip_v2_debug_period <= 0:
+            return
+        self._clip_v2_debug_count.add_(1)
+        if int(self._clip_v2_debug_count.item()) % self.clip_v2_debug_period != 0:
+            return
+        valid_rel_dists = [x for x in rel_dists if x.numel() > 0]
+        valid_prims = [x for x in primitive_logits if x.numel() > 0]
+        if not valid_rel_dists or not valid_prims:
+            return
+        prim = torch.cat(valid_prims, dim=0).detach().float()
+        stats = self.clip_v2_last_stats
+        message = (
+            "clip_V2 debug step={step} split={split} pairs={pairs} "
+            "primitive_mean={prim_mean:.4f} primitive_std={prim_std:.4f} "
+            "w_abs_mean={w_abs_mean:.4f} w_abs_max={w_abs_max:.4f} "
+            "w_support={w_support:.4f} dist_shift_abs_mean={dist_shift_abs_mean:.4f} "
+            "dist_shift_abs_max={dist_shift_abs_max:.4f} dist_sigma_mean={dist_sigma_mean:.4f} "
+            "dist_sigma_max={dist_sigma_max:.4f} dist_sem_width_mean={dist_sem_width_mean:.4f}"
+        ).format(
+            step=int(self._clip_v2_debug_count.item()),
+            split=self.clip_v2_mode,
+            pairs=prim.size(0),
+            prim_mean=prim.mean().item(),
+            prim_std=prim.std(unbiased=False).item(),
+            w_abs_mean=stats.get("w_abs_mean", 0.0),
+            w_abs_max=stats.get("w_abs_max", 0.0),
+            w_support=stats.get("w_support", 0.0),
+            dist_shift_abs_mean=stats.get("dist_shift_abs_mean", 0.0),
+            dist_shift_abs_max=stats.get("dist_shift_abs_max", 0.0),
+            dist_sigma_mean=stats.get("dist_sigma_mean", 0.0),
+            dist_sigma_max=stats.get("dist_sigma_max", 0.0),
+            dist_sem_width_mean=stats.get("dist_sem_width_mean", 0.0),
+        )
+        if logger is not None:
+            logger.info(message)
+        else:
+            print(message)
+
+    def forward(self, proposals, rel_pair_idxs, rel_labels, rel_binarys, roi_features, union_features, logger=None,img=None):
+        if self.attribute_on:
+            obj_dists, obj_preds, att_dists, edge_ctx = self.context_layer(roi_features, proposals, logger)
+        else:
+            obj_dists, obj_preds, edge_ctx = self.context_layer(roi_features, proposals, logger)
+
+        num_rels = [r.shape[0] for r in rel_pair_idxs]
+        num_objs = [len(b) for b in proposals]
+        assert len(num_rels) == len(num_objs)
+        obj_preds = obj_preds.split(num_objs, dim=0)
+
+        rel_dists = []
+        primitive_logits_for_debug = []
+        aux_losses = []
+        dist_losses = {}
+        text_features1_norm = F.normalize(self.text_features1, dim=-1)
+        text_features2_norm = F.normalize(self.text_features2, dim=-1)
+        for i in range(len(num_rels)):
+            rel_dist_per_batch = []
+            image_tensor = []
+            with torch.no_grad():
+                for j in range(len(proposals[i].bbox)):
+                    union_img = crop_and_resize(img[i].unsqueeze(0), proposals[i].bbox[j], proposals[i].bbox[j])
+                    iimg = union_img[0].permute(1, 2, 0).detach().cpu().numpy() * 255
+                    iimg = Image.fromarray(np.uint8(iimg))
+                    union_img = self.clip_preprocess(iimg).unsqueeze(0).to(self.device)
+                    image_tensor.append(union_img)
+                image_tensor = torch.cat(image_tensor)
+                image_features = self.clip_model.encode_image(image_tensor)
+
+            pair_idxs = rel_pair_idxs[i]
+            subj_idx = pair_idxs[:, 0]
+            obj_idx = pair_idxs[:, 1]
+            obj_n1 = obj_preds[i][subj_idx]
+            obj_n2 = obj_preds[i][obj_idx]
+
+            cross_output1 = mva_in_chunks(
+                self.adaper_clip1,
+                image_features[subj_idx],
+                image_features[obj_idx],
+                self.text_features3[obj_n1],
+                chunk_size=self.clip_mva_chunk_size,
+            )
+            cross_output2 = mva_in_chunks(
+                self.adaper_clip2,
+                image_features[obj_idx],
+                image_features[subj_idx],
+                self.text_features4[obj_n2],
+                chunk_size=self.clip_mva_chunk_size,
+            )
+            cross_output = F.normalize((cross_output1 + cross_output2) / 2, dim=-1)
+
+            similarity1 = cross_output @ text_features1_norm.t()
+            similarity2 = cross_output @ text_features2_norm.t()
+            similarity_delta = (similarity1 - similarity2) / 0.05
+
+            if self.adaper_clip1.training:
+                image_features_clip = (image_features[subj_idx, 0] + image_features[obj_idx, 0]) / 2
+                image_features_clip = F.normalize(image_features_clip, dim=-1)
+                similarit_origin_1 = image_features_clip @ text_features1_norm.t()
+                similarit_origin_2 = image_features_clip @ text_features2_norm.t()
+                similarit_origin = (similarit_origin_1 - similarit_origin_2) / 0.05
+
+                desc = self.description_relation[:, obj_n1].permute(1, 0, 2)[:, 1:]
+                dist_logits = self._clip_v2_distribution_logits(similarity_delta, desc, cross_output.float())
+                labels = None if rel_labels is None else rel_labels[i]
+                if self.clip_v2_loss_type == "w_align":
+                    bg = dist_logits.new_zeros((dist_logits.size(0), 1))
+                    probs = torch.cat((bg, dist_logits), dim=1)
+                else:
+                    probs = torch.stack([similarity_delta, similarit_origin], dim=1)
+                    aux_losses.append(self._clip_v2_aux_relation_loss(dist_logits, labels))
+                for name, loss in self.clip_v2_last_dist_losses.items():
+                    dist_losses.setdefault(name, []).append(loss)
+                primitive_logits_for_debug.append(similarity_delta)
+            else:
+                desc = self.description_relation[:, obj_n1].permute(1, 0, 2)
+                dist_probs = self._clip_v2_distribution_logits(
+                    similarity_delta,
+                    desc[:, 1:],
+                    cross_output.float(),
+                )
+                similarity3 = self._clip_v2_object_filter_logits(
+                    dist_probs,
+                    image_features,
+                    subj_idx,
+                    obj_idx,
+                    obj_n1,
+                )
+                probs = dist_probs * 0.2 + similarity3 * 0.8
+                bg = probs.new_zeros((probs.size(0), 1))
+                probs = torch.cat((bg, probs), dim=1)
+
+            rel_dist_per_batch.append(probs)
+            rel_dist_per_batch = torch.cat(rel_dist_per_batch)
+            rel_dists.append(rel_dist_per_batch)
+
+        obj_dists = obj_dists.split(num_objs, dim=0)
+        rel_dists = tuple(rel_dists)
+        add_losses = {}
+        if self.training:
+            if aux_losses:
+                add_losses["loss_clip_v2_aux_rel"] = torch.stack(aux_losses).mean()
+            for name, losses in dist_losses.items():
+                if losses:
+                    add_losses[name] = torch.stack(losses).mean()
+            add_losses.update(self._clip_v2_reconstruction_losses())
+            self._clip_v2_log_debug(rel_dists, primitive_logits_for_debug, logger)
+        return obj_dists, rel_dists, add_losses
 
 
 @registry.ROI_RELATION_PREDICTOR.register("PrimitiveLowRankClipPredictor")
