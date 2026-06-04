@@ -750,10 +750,6 @@ class SemanticBankGaussianPredictor(nn.Module):
         assert in_channels is not None
 
         self.device = config.MODEL.DEVICE
-        self.use_edge_map = config.MODEL.ROI_RELATION_HEAD.USE_EDGE_MAP
-        self.edge_map_beta = config.MODEL.ROI_RELATION_HEAD.EDGE_MAP_BETA if self.use_edge_map else 0.0
-        self.use_edge_adapter = config.MODEL.ROI_RELATION_HEAD.USE_EDGE_ADAPTER if self.use_edge_map else False
-        self.edge_distill_weight = config.MODEL.ROI_RELATION_HEAD.EDGE_DISTILL_WEIGHT if self.use_edge_map else 0.0
 
         semantic_bank_cfg = config.MODEL.ROI_RELATION_HEAD.SEMANTIC_BANK
         bank_config = self._load_semantic_bank_config(semantic_bank_cfg.CONFIG_PATH)
@@ -781,7 +777,6 @@ class SemanticBankGaussianPredictor(nn.Module):
         self.context_layer = TransformerContext(config, obj_classes, rel_classes, in_channels)
         self.subject_adapter = MVA()
         self.object_adapter = MVA()
-        self.edge_adapter = EdgePrivilegedAdapter() if self.use_edge_adapter else None
         self.background_classifier = nn.Linear(512, 1).to(self.device)
 
         self.predicate_id_by_name = {
@@ -965,7 +960,7 @@ class SemanticBankGaussianPredictor(nn.Module):
                 self.active_mode, mode
             ))
 
-    def forward(self, proposals, rel_pair_idxs, rel_labels, rel_binarys, roi_features, union_features, logger=None, img=None, edge_maps=None):
+    def forward(self, proposals, rel_pair_idxs, rel_labels, rel_binarys, roi_features, union_features, logger=None, img=None):
         if img is None:
             raise ValueError("SemanticBankGaussianPredictor requires input images for CLIP visual features.")
 
@@ -980,14 +975,12 @@ class SemanticBankGaussianPredictor(nn.Module):
         obj_preds = obj_preds.split(num_objs, dim=0)
 
         rel_dists = []
-        edge_distill_losses = []
         visual_bank_activations = []
         raw_bank_activations = []
         relation_labels = []
 
         for image_idx in range(len(num_rels)):
             image_tensor = []
-            edge_tensor = []
             with torch.no_grad():
                 for box_idx in range(len(proposals[image_idx].bbox)):
                     object_crop = crop_and_resize(img[image_idx].unsqueeze(0), proposals[image_idx].bbox[box_idx], proposals[image_idx].bbox[box_idx])
@@ -995,35 +988,10 @@ class SemanticBankGaussianPredictor(nn.Module):
                     object_image = Image.fromarray(np.uint8(object_array))
                     image_tensor.append(self.clip_preprocess(object_image).unsqueeze(0).to(self.device))
 
-                    if self.use_edge_map and edge_maps is not None:
-                        edge_crop = crop_and_resize(edge_maps[image_idx].unsqueeze(0), proposals[image_idx].bbox[box_idx], proposals[image_idx].bbox[box_idx])
-                        if edge_crop.shape[1] == 1:
-                            edge_crop = edge_crop.repeat(1, 3, 1, 1)
-                        edge_array = edge_crop[0].permute(1, 2, 0).detach().cpu().numpy() * 255
-                        edge_image = Image.fromarray(np.uint8(edge_array))
-                        edge_tensor.append(self.clip_preprocess(edge_image).unsqueeze(0).to(self.device))
-
                 image_tensor = torch.cat(image_tensor, dim=0)
                 image_features = self.clip_model.encode_image(image_tensor)
-                if self.use_edge_map and edge_maps is not None and edge_tensor:
-                    edge_tensor = torch.cat(edge_tensor, dim=0)
-                    edge_features = self.clip_model.encode_image(edge_tensor)
-                else:
-                    edge_features = None
 
             image_features = F.normalize(image_features, dim=-1)
-            if self.use_edge_adapter:
-                student_features = self.edge_adapter(image_features)
-            else:
-                student_features = image_features
-
-            if self.training and self.use_edge_map and edge_features is not None and self.edge_distill_weight > 0:
-                edge_features = F.normalize(edge_features, dim=-1)
-                teacher_features = F.normalize(image_features + self.edge_map_beta * edge_features, dim=-1).detach()
-                edge_distill_loss = 1 - F.cosine_similarity(student_features, teacher_features, dim=-1).mean()
-                edge_distill_losses.append(edge_distill_loss)
-
-            image_features = student_features
             relation_logits_per_image = []
 
             for relation_index in rel_pair_idxs[image_idx]:
@@ -1081,11 +1049,6 @@ class SemanticBankGaussianPredictor(nn.Module):
         add_losses = {}
         if self.training:
             add_losses.update(self._compute_auxiliary_losses(visual_bank_activations, raw_bank_activations, relation_labels))
-        if edge_distill_losses:
-            edge_distill_loss_raw = torch.stack(edge_distill_losses).mean()
-            add_losses["loss_edge_distill"] = self.edge_distill_weight * edge_distill_loss_raw
-            add_losses["loss_edge_distill_raw"] = edge_distill_loss_raw.detach()
-            add_losses["edge_teacher_student_cos"] = (1 - edge_distill_loss_raw).detach()
         return obj_dists, rel_dists, add_losses
 
 
