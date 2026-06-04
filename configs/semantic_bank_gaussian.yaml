@@ -1,0 +1,234 @@
+settings:
+  tau_bank: 0.07
+  tau_cls: 1.0
+  sigma_min: 0.06
+  sigma_max: 0.35
+  entropy_weight: 0.5
+  uncertainty_weight: 0.3
+  text_variance_weight: 0.2
+  loss_nll_weight: 0.2
+  loss_prior_weight: 0.05
+  loss_clip_raw_weight: 0.05
+  object_filter_weight: 0.2
+
+semantic_bank_axes:
+  - name: overlap
+    positive: "two objects partially overlap or occlude each other"
+    negative: "two objects are clearly separated with visible space"
+  - name: interaction
+    positive: "subject and object have an active interaction"
+    negative: "subject and object have no visible interaction"
+  - name: surface_support
+    positive: "subject is supported by the surface of object"
+    negative: "subject is not supported by object"
+  - name: vertical_above
+    positive: "subject is spatially above object"
+    negative: "subject is spatially below object"
+  - name: containment
+    positive: "subject is inside or enclosed by object"
+    negative: "subject is outside object"
+  - name: attachment
+    positive: "subject is physically attached or connected to object"
+    negative: "subject is detached from object"
+  - name: possession
+    positive: "subject possesses or carries object"
+    negative: "subject does not possess or carry object"
+  - name: hand_contact
+    positive: "subject grasps or holds object with a hand or similar part"
+    negative: "subject is not grasping object"
+  - name: body_wear
+    positive: "object is worn on the body of subject"
+    negative: "object is not worn by subject"
+  - name: locomotion
+    positive: "subject moves through or across object or scene"
+    negative: "subject remains stationary"
+  - name: riding
+    positive: "subject rides or is transported by object"
+    negative: "subject is not riding object"
+  - name: looking
+    positive: "subject directs visual attention toward object"
+    negative: "subject looks away from object"
+  - name: eating
+    positive: "subject consumes or bites object"
+    negative: "subject does not consume object"
+  - name: covering
+    positive: "subject covers object or object is covered by subject"
+    negative: "object remains uncovered"
+  - name: material_part
+    positive: "subject is a part or material of object"
+    negative: "subject is independent from object"
+  - name: frontal_position
+    positive: "subject is in front of object"
+    negative: "subject is behind object"
+  - name: proximity
+    positive: "subject is near object"
+    negative: "subject is far from object"
+  - name: direction_to
+    positive: "subject is directed toward object"
+    negative: "subject is directed away from object"
+  - name: road_or_ground
+    positive: "subject is located on a road ground or path"
+    negative: "subject is off the road or ground path"
+  - name: decoration_symbol
+    positive: "subject is printed painted or displayed on object"
+    negative: "subject is not printed painted or displayed on object"
+  - name: natural_growth
+    positive: "subject grows from or on object"
+    negative: "subject does not grow from object"
+  - name: semantic_association
+    positive: "subject and object are semantically associated"
+    negative: "subject and object are unrelated"
+
+predicate_descriptions:
+  __background__:
+    - "no visual relationship between subject and object"
+  above:
+    - "subject is above object"
+    - "subject is located higher than object"
+  across:
+    - "subject extends or moves across object"
+    - "subject crosses from one side of object to another"
+  against:
+    - "subject touches and leans against object"
+    - "subject is pressed against object"
+  along:
+    - "subject follows the length or direction of object"
+    - "subject is positioned along object"
+  and:
+    - "subject appears together with object"
+    - "subject and object are jointly present"
+  at:
+    - "subject is located at object"
+    - "subject is positioned near the place of object"
+  attached to:
+    - "subject is physically attached to object"
+    - "subject is connected to object"
+  behind:
+    - "subject is behind object"
+    - "object is in front of subject"
+  belonging to:
+    - "subject belongs to object"
+    - "subject is owned by object"
+  between:
+    - "subject is between object and another region"
+    - "subject occupies an intermediate position near object"
+  carrying:
+    - "subject carries object"
+    - "subject transports or bears object"
+  covered in:
+    - "subject is covered in object or material"
+    - "object covers the surface of subject"
+  covering:
+    - "subject covers object"
+    - "subject lies over and hides part of object"
+  eating:
+    - "subject eats object"
+    - "subject consumes or bites object"
+  flying in:
+    - "subject flies in object or scene"
+    - "subject moves through the air within object"
+  for:
+    - "subject is for object"
+    - "subject is used for the purpose of object"
+  from:
+    - "subject comes from object"
+    - "subject originates at object"
+  growing on:
+    - "subject grows on object"
+    - "subject is naturally attached to object by growth"
+  hanging from:
+    - "subject hangs from object"
+    - "subject is suspended from object"
+  has:
+    - "subject has object"
+    - "object is an attribute or part of subject"
+  holding:
+    - "subject holds object"
+    - "subject grasps object with a hand or similar part"
+  in:
+    - "subject is inside object"
+    - "subject is enclosed or contained by object"
+  in front of:
+    - "subject is in front of object"
+    - "subject appears before object from the camera view"
+  laying on:
+    - "subject is laying on object"
+    - "subject rests horizontally on object"
+  looking at:
+    - "subject looks at object"
+    - "subject directs visual attention to object"
+  lying on:
+    - "subject is lying on object"
+    - "subject reclines on the surface of object"
+  made of:
+    - "subject is made of object"
+    - "object is the material composing subject"
+  mounted on:
+    - "subject is mounted on object"
+    - "subject is fixed on top of object"
+  near:
+    - "subject is near object"
+    - "subject is close to object"
+  of:
+    - "subject is of object"
+    - "subject is a part attribute or member of object"
+  on:
+    - "subject is on object"
+    - "subject rests or is positioned on the surface of object"
+  on back of:
+    - "subject is on the back of object"
+    - "subject rides or rests on object back"
+  over:
+    - "subject is over object"
+    - "subject is above and possibly covering object"
+  painted on:
+    - "subject is painted on object"
+    - "subject appears as an image on object"
+  parked on:
+    - "subject is parked on object"
+    - "subject vehicle rests on object or ground"
+  part of:
+    - "subject is part of object"
+    - "subject is a component of object"
+  playing:
+    - "subject plays with object"
+    - "subject interacts with object in play"
+  riding:
+    - "subject rides object"
+    - "subject is transported by object"
+  says:
+    - "subject says object"
+    - "object is written or displayed on subject"
+  sitting on:
+    - "subject sits on object"
+    - "subject is seated on the surface of object"
+  standing on:
+    - "subject stands on object"
+    - "subject is upright and supported by object"
+  to:
+    - "subject is directed to object"
+    - "subject moves or points toward object"
+  under:
+    - "subject is under object"
+    - "subject is below object"
+  using:
+    - "subject uses object"
+    - "subject operates object for an action"
+  walking in:
+    - "subject walks in object or scene"
+    - "subject moves by walking within object"
+  walking on:
+    - "subject walks on object"
+    - "subject moves by foot on the surface of object"
+  watching:
+    - "subject watches object"
+    - "subject looks at object attentively"
+  wearing:
+    - "subject wears object"
+    - "object is worn on subject body"
+  wears:
+    - "subject wears object"
+    - "object is on subject body as clothing or accessory"
+  with:
+    - "subject is with object"
+    - "subject and object appear together or interact"
