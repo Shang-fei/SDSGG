@@ -3,81 +3,103 @@ settings:
   tau_cls: 1.0
   sigma_min: 0.06
   sigma_max: 0.35
-  entropy_weight: 0.5
-  uncertainty_weight: 0.3
-  text_variance_weight: 0.2
-  loss_nll_weight: 0.05
-  loss_prior_weight: 0.05
-  loss_clip_raw_weight: 0.05
   object_filter_weight: 0.05
+  ema_momentum: 0.95
+  ema_min_count: 8
+  loss_clip_teacher_weight: 0.02
+  union_teacher_weight: 1.0
+  subobj_teacher_weight: 0.5
+  debug_interval: 100
 
 semantic_bank_axes:
   - name: overlap
-    positive: "two objects partially overlap or occlude each other"
-    negative: "two objects are clearly separated with visible space"
+    prompts:
+      - "a photo where the subject and object overlap or occlude each other"
+      - "a visual relationship where two objects touch or cover the same image region"
   - name: interaction
-    positive: "subject and object have an active interaction"
-    negative: "subject and object have no visible interaction"
+    prompts:
+      - "a photo where the subject is actively interacting with the object"
+      - "a visual relationship where one object acts on another object"
   - name: surface_support
-    positive: "subject is supported by the surface of object"
-    negative: "subject is not supported by object"
+    prompts:
+      - "a photo where the subject is resting on the object"
+      - "a visual relationship where one object is supported by another object"
   - name: vertical_above
-    positive: "subject is spatially above object"
-    negative: "subject is spatially below object"
+    prompts:
+      - "a photo where the subject is visually above the object"
+      - "a scene where one object is higher than another object"
   - name: containment
-    positive: "subject is inside or enclosed by object"
-    negative: "subject is outside object"
+    prompts:
+      - "a photo where the subject is inside the object"
+      - "a visual relationship where one object is enclosed by another object"
   - name: attachment
-    positive: "subject is physically attached or connected to object"
-    negative: "subject is detached from object"
+    prompts:
+      - "a photo where the subject is physically attached to the object"
+      - "a visual relationship where one object is connected to another object"
   - name: possession
-    positive: "subject possesses or carries object"
-    negative: "subject does not possess or carry object"
+    prompts:
+      - "a photo where the subject carries or possesses the object"
+      - "a visual relationship where one object has another object"
   - name: hand_contact
-    positive: "subject grasps or holds object with a hand or similar part"
-    negative: "subject is not grasping object"
+    prompts:
+      - "a photo where the subject is holding the object"
+      - "a visual relationship where the subject grasps or touches the object"
   - name: body_wear
-    positive: "object is worn on the body of subject"
-    negative: "object is not worn by subject"
+    prompts:
+      - "a photo where the object is worn on the subject body"
+      - "a visual relationship where clothing or an accessory is on a person"
   - name: locomotion
-    positive: "subject moves through or across object or scene"
-    negative: "subject remains stationary"
+    prompts:
+      - "a photo where the subject is moving through the scene"
+      - "a visual relationship where one object walks or moves across another area"
   - name: riding
-    positive: "subject rides or is transported by object"
-    negative: "subject is not riding object"
+    prompts:
+      - "a photo where the subject is riding the object"
+      - "a visual relationship where one object is transported by another object"
   - name: looking
-    positive: "subject directs visual attention toward object"
-    negative: "subject looks away from object"
+    prompts:
+      - "a photo where the subject is looking at the object"
+      - "a visual relationship where attention is directed toward another object"
   - name: eating
-    positive: "subject consumes or bites object"
-    negative: "subject does not consume object"
+    prompts:
+      - "a photo where the subject is eating the object"
+      - "a visual relationship where one object bites or consumes another object"
   - name: covering
-    positive: "subject covers object or object is covered by subject"
-    negative: "object remains uncovered"
+    prompts:
+      - "a photo where the subject covers the object"
+      - "a visual relationship where one object hides part of another object"
   - name: material_part
-    positive: "subject is a part or material of object"
-    negative: "subject is independent from object"
+    prompts:
+      - "a photo where the subject is part of the object"
+      - "a visual relationship where one object is made of another object"
   - name: frontal_position
-    positive: "subject is in front of object"
-    negative: "subject is behind object"
+    prompts:
+      - "a photo where the subject is in front of the object"
+      - "a visual relationship where one object appears before another object"
   - name: proximity
-    positive: "subject is near object"
-    negative: "subject is far from object"
+    prompts:
+      - "a photo where the subject is near the object"
+      - "a visual relationship where two objects are close to each other"
   - name: direction_to
-    positive: "subject is directed toward object"
-    negative: "subject is directed away from object"
+    prompts:
+      - "a photo where the subject points or moves toward the object"
+      - "a visual relationship where one object is directed to another object"
   - name: road_or_ground
-    positive: "subject is located on a road ground or path"
-    negative: "subject is off the road or ground path"
+    prompts:
+      - "a photo where the subject is on a road ground or path"
+      - "a visual relationship where an object rests on the ground surface"
   - name: decoration_symbol
-    positive: "subject is printed painted or displayed on object"
-    negative: "subject is not printed painted or displayed on object"
+    prompts:
+      - "a photo where the subject is printed or painted on the object"
+      - "a visual relationship where an image word or symbol appears on an object"
   - name: natural_growth
-    positive: "subject grows from or on object"
-    negative: "subject does not grow from object"
+    prompts:
+      - "a photo where the subject grows on the object"
+      - "a visual relationship where a plant or natural part grows from another object"
   - name: semantic_association
-    positive: "subject and object are semantically associated"
-    negative: "subject and object are unrelated"
+    prompts:
+      - "a photo where the subject and object belong together in the same scene"
+      - "a visual relationship where two objects are meaningfully associated"
 
 predicate_descriptions:
   __background__:

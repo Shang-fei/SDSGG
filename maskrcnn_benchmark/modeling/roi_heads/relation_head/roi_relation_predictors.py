@@ -701,13 +701,19 @@ class SemanticBankGaussianPredictor(nn.Module):
         self.tau_cls = float(getattr(semantic_bank_cfg, "TAU_CLS", bank_settings.get("tau_cls", 1.0)))
         self.sigma_min = float(getattr(semantic_bank_cfg, "SIGMA_MIN", bank_settings.get("sigma_min", 0.06)))
         self.sigma_max = float(getattr(semantic_bank_cfg, "SIGMA_MAX", bank_settings.get("sigma_max", 0.35)))
-        self.loss_nll_weight = float(getattr(semantic_bank_cfg, "LOSS_NLL_WEIGHT", bank_settings.get("loss_nll_weight", 0.2)))
-        self.loss_prior_weight = float(getattr(semantic_bank_cfg, "LOSS_PRIOR_WEIGHT", bank_settings.get("loss_prior_weight", 0.05)))
-        self.loss_clip_raw_weight = float(getattr(semantic_bank_cfg, "LOSS_CLIP_RAW_WEIGHT", bank_settings.get("loss_clip_raw_weight", 0.05)))
-        self.object_filter_weight = float(getattr(semantic_bank_cfg, "OBJECT_FILTER_WEIGHT", bank_settings.get("object_filter_weight", 0.2)))
-        self.entropy_weight = float(bank_settings.get("entropy_weight", 0.5))
-        self.uncertainty_weight = float(bank_settings.get("uncertainty_weight", 0.3))
-        self.text_variance_weight = float(bank_settings.get("text_variance_weight", 0.2))
+        self.object_filter_weight = float(getattr(semantic_bank_cfg, "OBJECT_FILTER_WEIGHT", bank_settings.get("object_filter_weight", 0.05)))
+        self.ema_momentum = float(getattr(semantic_bank_cfg, "EMA_MOMENTUM", bank_settings.get("ema_momentum", 0.95)))
+        self.ema_min_count = int(getattr(semantic_bank_cfg, "EMA_MIN_COUNT", bank_settings.get("ema_min_count", 8)))
+        self.loss_clip_teacher_weight = float(getattr(
+            semantic_bank_cfg, "LOSS_CLIP_TEACHER_WEIGHT", bank_settings.get("loss_clip_teacher_weight", 0.02)
+        ))
+        self.union_teacher_weight = float(getattr(
+            semantic_bank_cfg, "UNION_TEACHER_WEIGHT", bank_settings.get("union_teacher_weight", 1.0)
+        ))
+        self.subobj_teacher_weight = float(getattr(
+            semantic_bank_cfg, "SUBOBJ_TEACHER_WEIGHT", bank_settings.get("subobj_teacher_weight", 0.5)
+        ))
+        self.debug_interval = int(getattr(semantic_bank_cfg, "DEBUG_INTERVAL", bank_settings.get("debug_interval", 100)))
 
         statistics = get_dataset_statistics(config)
         obj_classes = statistics["obj_classes"]
@@ -736,25 +742,27 @@ class SemanticBankGaussianPredictor(nn.Module):
         self.active_mode = "base"
 
         semantic_bank_axes = bank_config["semantic_bank_axes"]
-        positive_axis_prompts = [axis["positive"] for axis in semantic_bank_axes]
-        negative_axis_prompts = [axis["negative"] for axis in semantic_bank_axes]
-        semantic_bank_positive_features = self._encode_text_features(positive_axis_prompts)
-        semantic_bank_negative_features = self._encode_text_features(negative_axis_prompts)
-        self.register_buffer("semantic_bank_positive_features", semantic_bank_positive_features.float())
-        self.register_buffer("semantic_bank_negative_features", semantic_bank_negative_features.float())
+        semantic_bank_features = self._encode_semantic_bank_features(semantic_bank_axes)
+        self.num_bank_axes = semantic_bank_features.shape[0]
+        self.register_buffer("semantic_bank_features", semantic_bank_features.float())
 
         predicate_descriptions = bank_config.get("predicate_descriptions", {})
-        predicate_mean_init, predicate_log_variance_init = self._initialize_predicate_distribution(predicate_descriptions)
-        self.register_buffer("predicate_mean_init", predicate_mean_init.float())
-        self.register_buffer("predicate_log_variance_init", predicate_log_variance_init.float())
-        self.predicate_mean = nn.Parameter(predicate_mean_init.float().clone())
-        self.predicate_log_variance = nn.Parameter(predicate_log_variance_init.float().clone())
+        predicate_text_mean, predicate_text_variance = self._initialize_text_predicate_distribution(predicate_descriptions)
+        self.register_buffer("predicate_text_mean", predicate_text_mean.float())
+        self.register_buffer("predicate_text_variance", predicate_text_variance.float())
+        self.register_buffer("predicate_mean_ema", predicate_text_mean.float().clone())
+        self.register_buffer("predicate_variance_ema", predicate_text_variance.float().clone())
+        self.register_buffer("predicate_count", torch.zeros(self.num_active_predicates - 1, dtype=torch.float32))
+        self.register_buffer("debug_step", torch.zeros((), dtype=torch.long))
 
         subject_role_prompts = ["a photo of subject {}".format(obj_name) for obj_name in self.obj_names]
         object_role_prompts = ["a photo of object {}".format(obj_name) for obj_name in self.obj_names]
         self.register_buffer("subject_role_text_features", self._encode_text_features(subject_role_prompts).float())
         self.register_buffer("object_role_text_features", self._encode_text_features(object_role_prompts).float())
         self.register_buffer("object_filter_text_features", self._encode_object_filter_features().float())
+        print("SemanticBankGaussianPredictor V2: {} bank axes, {} predicates, EMA shape {}, teacher=subject_object+union".format(
+            self.num_bank_axes, self.num_active_predicates, tuple(self.predicate_mean_ema.shape)
+        ))
 
     def _load_semantic_bank_config(self, config_path):
         if yaml is None:
@@ -774,47 +782,48 @@ class SemanticBankGaussianPredictor(nn.Module):
         features = []
         with torch.no_grad():
             for start_idx in range(0, len(prompts), batch_size):
-                prompt_batch = ["a photo of {}".format(prompt) for prompt in prompts[start_idx:start_idx + batch_size]]
+                prompt_batch = prompts[start_idx:start_idx + batch_size]
                 text_tokens = clip.tokenize(prompt_batch).to(self.device)
                 text_features = self.clip_model.encode_text(text_tokens)
                 text_features = F.normalize(text_features.float(), dim=-1)
                 features.append(text_features)
         return torch.cat(features, dim=0)
 
+    def _encode_semantic_bank_features(self, semantic_bank_axes):
+        axis_features = []
+        for axis in semantic_bank_axes:
+            prompts = axis.get("prompts", None)
+            if prompts is None:
+                prompts = [axis.get("positive", axis["name"])]
+            prompt_features = self._encode_text_features(prompts)
+            axis_features.append(F.normalize(prompt_features.mean(dim=0, keepdim=True), dim=-1))
+        return torch.cat(axis_features, dim=0)
+
     def _compute_bank_activation(self, feature):
         normalized_feature = F.normalize(feature.float(), dim=-1)
-        positive_similarity = normalized_feature @ self.semantic_bank_positive_features.t()
-        negative_similarity = normalized_feature @ self.semantic_bank_negative_features.t()
-        return torch.sigmoid((positive_similarity - negative_similarity) / self.tau_bank)
+        return torch.sigmoid((normalized_feature @ self.semantic_bank_features.t()) / self.tau_bank)
 
-    def _initialize_predicate_distribution(self, predicate_descriptions):
-        predicate_mean_init = []
-        predicate_log_variance_init = []
-        log_bank_count = math.log(len(self.semantic_bank_positive_features))
+    def _initialize_text_predicate_distribution(self, predicate_descriptions):
+        predicate_mean = []
+        predicate_variance = []
 
         for predicate_name in self.predicate_names[1:]:
             descriptions = predicate_descriptions.get(predicate_name, None)
             if not descriptions:
-                descriptions = ["subject is {} object".format(predicate_name)]
+                descriptions = [
+                    "a photo where the subject is {} the object".format(predicate_name),
+                    "a visual relationship where the subject is {} the object".format(predicate_name),
+                ]
             description_features = self._encode_text_features(descriptions)
             description_activations = self._compute_bank_activation(description_features)
 
-            predicate_mean = description_activations.mean(dim=0)
-            description_variance = description_activations.var(dim=0, unbiased=False)
-            normalized_mean = predicate_mean / predicate_mean.sum().clamp(min=1e-6)
-            predicate_entropy = -(normalized_mean * torch.log(normalized_mean.clamp(min=1e-6))).sum() / log_bank_count
-            local_uncertainty = 4.0 * predicate_mean * (1.0 - predicate_mean)
-            variance_ratio = (
-                self.entropy_weight * predicate_entropy
-                + self.uncertainty_weight * local_uncertainty
-                + self.text_variance_weight * description_variance
-            ).clamp(min=0.0, max=1.0)
-            predicate_variance = self.sigma_min ** 2 + (self.sigma_max ** 2 - self.sigma_min ** 2) * variance_ratio
+            mean = description_activations.mean(dim=0)
+            variance = description_activations.var(dim=0, unbiased=False)
+            variance = variance.clamp(min=self.sigma_min ** 2, max=self.sigma_max ** 2)
+            predicate_mean.append(mean)
+            predicate_variance.append(variance)
 
-            predicate_mean_init.append(predicate_mean)
-            predicate_log_variance_init.append(torch.log(predicate_variance.clamp(min=1e-6)))
-
-        return torch.stack(predicate_mean_init, dim=0), torch.stack(predicate_log_variance_init, dim=0)
+        return torch.stack(predicate_mean, dim=0), torch.stack(predicate_variance, dim=0)
 
     def _encode_object_filter_features(self):
         filter_table = pd.read_csv(os.path.join(curpath, "filter_total.csv")).iloc[:, 1:]
@@ -844,21 +853,19 @@ class SemanticBankGaussianPredictor(nn.Module):
                 feature_tensor[object_idx, predicate_idx] = feature
         return feature_tensor
 
-    def _compute_gaussian_logits(self, visual_bank_activation, apply_temperature=True, include_log_variance=False):
-        log_variance_min = math.log(self.sigma_min ** 2)
-        log_variance_max = math.log(self.sigma_max ** 2)
-        predicate_mean = self.predicate_mean.float().clamp(min=0.0, max=1.0)
-        predicate_log_variance = self.predicate_log_variance.float().clamp(log_variance_min, log_variance_max)
-        predicate_variance = torch.exp(predicate_log_variance)
+    def _get_predicate_distribution(self):
+        count_mask = (self.predicate_count >= self.ema_min_count).float().unsqueeze(-1)
+        predicate_mean = count_mask * self.predicate_mean_ema + (1.0 - count_mask) * self.predicate_text_mean
+        predicate_variance = count_mask * self.predicate_variance_ema + (1.0 - count_mask) * self.predicate_text_variance
+        predicate_mean = predicate_mean.float().clamp(min=0.0, max=1.0)
+        predicate_variance = predicate_variance.float().clamp(min=self.sigma_min ** 2, max=self.sigma_max ** 2)
+        return predicate_mean, predicate_variance
+
+    def _compute_gaussian_logits(self, visual_bank_activation):
+        predicate_mean, predicate_variance = self._get_predicate_distribution()
         bank_delta = visual_bank_activation.float().unsqueeze(1) - predicate_mean.unsqueeze(0)
         mahalanobis_distance = bank_delta.pow(2) / predicate_variance.unsqueeze(0)
-        if include_log_variance:
-            gaussian_logits = -0.5 * (mahalanobis_distance + predicate_log_variance.unsqueeze(0)).sum(dim=-1)
-        else:
-            gaussian_logits = -0.5 * mahalanobis_distance.mean(dim=-1)
-        if apply_temperature:
-            gaussian_logits = gaussian_logits / self.tau_cls
-        return gaussian_logits
+        return -0.5 * mahalanobis_distance.mean(dim=-1) / self.tau_cls
 
     def _compute_object_filter_logits(self, image_features, relation_indexes, subject_classes, object_classes):
         subject_features = F.normalize(image_features[relation_indexes[:, 0], 0, :].float(), dim=-1)
@@ -871,40 +878,72 @@ class SemanticBankGaussianPredictor(nn.Module):
         object_filter_logits[:, 0] = 0.0
         return object_filter_logits
 
-    def _compute_auxiliary_losses(self, visual_bank_activations, raw_bank_activations, relation_labels):
-        add_losses = {}
-        if not visual_bank_activations:
-            return add_losses
+    def _update_predicate_ema(self, visual_bank_activation, relation_labels):
+        if relation_labels is None:
+            return
+        with torch.no_grad():
+            foreground_mask = relation_labels > 0
+            if not foreground_mask.any():
+                return
+            foreground_activation = visual_bank_activation.detach()[foreground_mask].float()
+            foreground_labels = relation_labels[foreground_mask].long() - 1
+            for predicate_idx in foreground_labels.unique():
+                class_mask = foreground_labels == predicate_idx
+                class_activation = foreground_activation[class_mask]
+                batch_mean = class_activation.mean(dim=0)
+                batch_variance = class_activation.var(dim=0, unbiased=False).clamp(
+                    min=self.sigma_min ** 2, max=self.sigma_max ** 2
+                )
+                idx = int(predicate_idx.item())
+                if self.predicate_count[idx] <= 0:
+                    self.predicate_mean_ema[idx].copy_(batch_mean)
+                    self.predicate_variance_ema[idx].copy_(batch_variance)
+                else:
+                    self.predicate_mean_ema[idx].mul_(self.ema_momentum).add_(batch_mean, alpha=1.0 - self.ema_momentum)
+                    self.predicate_variance_ema[idx].mul_(self.ema_momentum).add_(
+                        batch_variance, alpha=1.0 - self.ema_momentum
+                    )
+                self.predicate_count[idx] += float(class_activation.shape[0])
 
-        visual_bank_activation = torch.cat(visual_bank_activations, dim=0).float()
-        raw_bank_activation = torch.cat(raw_bank_activations, dim=0).float()
-        relation_label = torch.cat(relation_labels, dim=0).long()
-        foreground_mask = relation_label > 0
+    def _encode_clip_image_batch(self, pil_images, batch_size=128):
+        features = []
+        with torch.no_grad():
+            for start_idx in range(0, len(pil_images), batch_size):
+                image_tensor = torch.cat([
+                    self.clip_preprocess(image).unsqueeze(0).to(self.device)
+                    for image in pil_images[start_idx:start_idx + batch_size]
+                ], dim=0)
+                features.append(self.clip_model.encode_image(image_tensor))
+        return torch.cat(features, dim=0)
 
-        if foreground_mask.any():
-            foreground_visual_bank_activation = visual_bank_activation[foreground_mask]
-            foreground_label = relation_label[foreground_mask] - 1
-            log_variance_min = math.log(self.sigma_min ** 2)
-            log_variance_max = math.log(self.sigma_max ** 2)
-            target_mean = self.predicate_mean.float().clamp(min=0.0, max=1.0)[foreground_label]
-            target_log_variance = self.predicate_log_variance.float().clamp(log_variance_min, log_variance_max)[foreground_label]
-            target_variance = torch.exp(target_log_variance)
-            foreground_nll = 0.5 * (
-                (foreground_visual_bank_activation - target_mean).pow(2) / target_variance
-            ).mean(dim=-1).mean()
-            add_losses["loss_gaussian_nll"] = self.loss_nll_weight * foreground_nll
+    def _crop_to_pil(self, image, box_a, box_b):
+        crop = crop_and_resize(image, box_a, box_b)
+        crop_array = crop[0].permute(1, 2, 0).detach().cpu().numpy() * 255
+        return Image.fromarray(np.uint8(crop_array))
 
-        log_variance_min = math.log(self.sigma_min ** 2)
-        log_variance_max = math.log(self.sigma_max ** 2)
-        current_log_variance = self.predicate_log_variance.float().clamp(log_variance_min, log_variance_max)
-        gaussian_prior = (
-            F.mse_loss(self.predicate_mean.float().clamp(min=0.0, max=1.0), self.predicate_mean_init.float())
-            + F.mse_loss(current_log_variance, self.predicate_log_variance_init.float())
+    def _maybe_print_debug(self, student_bank_activation, teacher_bank_activation, gaussian_logits):
+        if self.debug_interval <= 0:
+            return
+        self.debug_step += 1
+        if int(self.debug_step.item()) % self.debug_interval != 0:
+            return
+        _, predicate_variance = self._get_predicate_distribution()
+        print(
+            "SemanticBank debug step {}: student {:.4f}/{:.4f}, teacher {:.4f}/{:.4f}, "
+            "gaussian {:.4f}/{:.4f}, count {:.2f}/{:.2f}, var {:.4f}/{:.4f}".format(
+                int(self.debug_step.item()),
+                float(student_bank_activation.float().mean().detach().cpu()),
+                float(student_bank_activation.float().std(unbiased=False).detach().cpu()),
+                float(teacher_bank_activation.float().mean().detach().cpu()),
+                float(teacher_bank_activation.float().std(unbiased=False).detach().cpu()),
+                float(gaussian_logits.float().mean().detach().cpu()),
+                float(gaussian_logits.float().std(unbiased=False).detach().cpu()),
+                float(self.predicate_count.float().mean().detach().cpu()),
+                float(self.predicate_count.float().min().detach().cpu()),
+                float(predicate_variance.float().mean().detach().cpu()),
+                float(predicate_variance.float().min().detach().cpu()),
+            )
         )
-        clip_raw_regularizer = F.mse_loss(visual_bank_activation, raw_bank_activation)
-        add_losses["loss_gaussian_prior"] = self.loss_prior_weight * gaussian_prior
-        add_losses["loss_clip_raw_reg"] = self.loss_clip_raw_weight * clip_raw_regularizer
-        return add_losses
 
     def updata(self, mode):
         if mode != self.active_mode:
@@ -927,25 +966,15 @@ class SemanticBankGaussianPredictor(nn.Module):
         obj_preds = obj_preds.split(num_objs, dim=0)
 
         rel_dists = []
-        visual_bank_activations = []
-        raw_bank_activations = []
-        relation_labels = []
+        clip_teacher_losses = []
 
         for image_idx in range(len(num_rels)):
-            image_tensor = []
-            with torch.no_grad():
-                for box_idx in range(len(proposals[image_idx].bbox)):
-                    object_crop = crop_and_resize(
-                        img[image_idx].unsqueeze(0),
-                        proposals[image_idx].bbox[box_idx],
-                        proposals[image_idx].bbox[box_idx]
-                    )
-                    object_array = object_crop[0].permute(1, 2, 0).detach().cpu().numpy() * 255
-                    object_image = Image.fromarray(np.uint8(object_array))
-                    image_tensor.append(self.clip_preprocess(object_image).unsqueeze(0).to(self.device))
-
-                image_tensor = torch.cat(image_tensor, dim=0)
-                image_features = self.clip_model.encode_image(image_tensor)
+            image = img[image_idx].unsqueeze(0)
+            object_crops = [
+                self._crop_to_pil(image, proposals[image_idx].bbox[box_idx], proposals[image_idx].bbox[box_idx])
+                for box_idx in range(len(proposals[image_idx].bbox))
+            ]
+            image_features = self._encode_clip_image_batch(object_crops)
 
             image_features = F.normalize(image_features, dim=-1)
             relation_indexes = rel_pair_idxs[image_idx]
@@ -969,11 +998,13 @@ class SemanticBankGaussianPredictor(nn.Module):
                     image_features[subject_box_indexes],
                     object_text_features
                 )
-                relation_clip_features = F.normalize((subject_relation_features + object_relation_features) / 2.0, dim=-1)
-                visual_bank_activation = self._compute_bank_activation(relation_clip_features)
-                foreground_logits = self._compute_gaussian_logits(visual_bank_activation)
+                student_relation_features = F.normalize(
+                    (subject_relation_features + object_relation_features) / 2.0, dim=-1
+                )
+                student_bank_activation = self._compute_bank_activation(student_relation_features)
+                foreground_logits = self._compute_gaussian_logits(student_bank_activation)
                 background_logit = self.background_classifier(
-                    relation_clip_features.to(self.background_classifier.weight.dtype)
+                    student_relation_features.to(self.background_classifier.weight.dtype)
                 ).float()
                 relation_logits = torch.cat([background_logit, foreground_logits], dim=-1)
 
@@ -984,23 +1015,45 @@ class SemanticBankGaussianPredictor(nn.Module):
                 rel_dists.append(relation_logits)
 
                 if self.training:
-                    raw_relation_features = F.normalize(
+                    union_crops = [
+                        self._crop_to_pil(
+                            image,
+                            proposals[image_idx].bbox[int(subject_idx.item())],
+                            proposals[image_idx].bbox[int(object_idx.item())]
+                        )
+                        for subject_idx, object_idx in relation_indexes
+                    ]
+                    union_features = F.normalize(self._encode_clip_image_batch(union_crops), dim=-1)
+                    subobj_teacher_features = F.normalize(
                         (image_features[subject_box_indexes, 0, :] + image_features[object_box_indexes, 0, :]).float() / 2.0,
                         dim=-1
                     )
-                    raw_bank_activation = self._compute_bank_activation(raw_relation_features)
-                    visual_bank_activations.append(visual_bank_activation)
-                    raw_bank_activations.append(raw_bank_activation)
-
-            if self.training and rel_labels is not None:
-                relation_labels.append(rel_labels[image_idx].to(self.device))
+                    union_teacher_features = F.normalize(union_features[:, 0, :].float(), dim=-1)
+                    teacher_relation_features = F.normalize(
+                        self.union_teacher_weight * union_teacher_features
+                        + self.subobj_teacher_weight * subobj_teacher_features,
+                        dim=-1
+                    )
+                    teacher_bank_activation = self._compute_bank_activation(teacher_relation_features)
+                    clip_teacher_loss = F.mse_loss(
+                        student_bank_activation.float(),
+                        teacher_bank_activation.detach().float()
+                    )
+                    clip_teacher_losses.append(clip_teacher_loss)
+                    self._update_predicate_ema(student_bank_activation, rel_labels[image_idx].to(self.device))
+                    self._maybe_print_debug(
+                        student_bank_activation,
+                        teacher_bank_activation,
+                        foreground_logits
+                    )
 
         obj_dists = obj_dists.split(num_objs, dim=0)
         rel_dists = tuple(rel_dists)
 
         add_losses = {}
         if self.training:
-            add_losses.update(self._compute_auxiliary_losses(visual_bank_activations, raw_bank_activations, relation_labels))
+            if clip_teacher_losses:
+                add_losses["loss_clip_teacher"] = self.loss_clip_teacher_weight * torch.stack(clip_teacher_losses).mean()
         return obj_dists, rel_dists, add_losses
 
 

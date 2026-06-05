@@ -59,7 +59,7 @@ class RelationLossComputation(object):
             self.criterion_loss = nn.CrossEntropyLoss()
         if self.predictor_name == "SemanticBankGaussianPredictor":
             self.loss = None
-            self.relation_criterion_loss = nn.CrossEntropyLoss(weight=self.pred_weight)
+            self.relation_criterion_loss = nn.CrossEntropyLoss()
         else:
             self.loss=Loss(gamma=0.0, alpha=1, size_average=True,device=device)
             self.relation_criterion_loss = self.criterion_loss
