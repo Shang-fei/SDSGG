@@ -801,7 +801,9 @@ class SemanticBankGaussianPredictor(nn.Module):
 
     def _compute_bank_activation(self, feature):
         normalized_feature = F.normalize(feature.float(), dim=-1)
-        return torch.sigmoid((normalized_feature @ self.semantic_bank_features.t()) / self.tau_bank)
+        bank_similarity = normalized_feature @ self.semantic_bank_features.t()
+        bank_similarity = bank_similarity - bank_similarity.mean(dim=-1, keepdim=True)
+        return torch.sigmoid(bank_similarity / self.tau_bank)
 
     def _initialize_text_predicate_distribution(self, predicate_descriptions):
         predicate_mean = []

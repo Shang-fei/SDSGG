@@ -1,12 +1,12 @@
 settings:
   tau_bank: 0.07
   tau_cls: 1.0
-  sigma_min: 0.06
-  sigma_max: 0.35
+  sigma_min: 0.15
+  sigma_max: 0.45
   object_filter_weight: 0.05
   ema_momentum: 0.95
   ema_min_count: 8
-  loss_clip_teacher_weight: 0.02
+  loss_clip_teacher_weight: 0.005
   union_teacher_weight: 1.0
   subobj_teacher_weight: 0.5
   debug_interval: 100
