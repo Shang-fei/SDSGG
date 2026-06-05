@@ -844,16 +844,18 @@ class SemanticBankGaussianPredictor(nn.Module):
                 feature_tensor[object_idx, predicate_idx] = feature
         return feature_tensor
 
-    def _compute_gaussian_logits(self, visual_bank_activation, apply_temperature=True):
+    def _compute_gaussian_logits(self, visual_bank_activation, apply_temperature=True, include_log_variance=False):
         log_variance_min = math.log(self.sigma_min ** 2)
         log_variance_max = math.log(self.sigma_max ** 2)
-        predicate_mean = self.predicate_mean.float()
+        predicate_mean = self.predicate_mean.float().clamp(min=0.0, max=1.0)
         predicate_log_variance = self.predicate_log_variance.float().clamp(log_variance_min, log_variance_max)
         predicate_variance = torch.exp(predicate_log_variance)
         bank_delta = visual_bank_activation.float().unsqueeze(1) - predicate_mean.unsqueeze(0)
-        gaussian_logits = -0.5 * (
-            (bank_delta.pow(2) / predicate_variance.unsqueeze(0)) + predicate_log_variance.unsqueeze(0)
-        ).sum(dim=-1)
+        mahalanobis_distance = bank_delta.pow(2) / predicate_variance.unsqueeze(0)
+        if include_log_variance:
+            gaussian_logits = -0.5 * (mahalanobis_distance + predicate_log_variance.unsqueeze(0)).sum(dim=-1)
+        else:
+            gaussian_logits = -0.5 * mahalanobis_distance.mean(dim=-1)
         if apply_temperature:
             gaussian_logits = gaussian_logits / self.tau_cls
         return gaussian_logits
@@ -882,16 +884,21 @@ class SemanticBankGaussianPredictor(nn.Module):
         if foreground_mask.any():
             foreground_visual_bank_activation = visual_bank_activation[foreground_mask]
             foreground_label = relation_label[foreground_mask] - 1
-            foreground_logit = self._compute_gaussian_logits(foreground_visual_bank_activation, apply_temperature=False)
-            normalizing_constant = 0.5 * foreground_visual_bank_activation.shape[1] * math.log(2.0 * math.pi)
-            foreground_nll = (normalizing_constant - foreground_logit.gather(1, foreground_label.view(-1, 1))).mean()
+            log_variance_min = math.log(self.sigma_min ** 2)
+            log_variance_max = math.log(self.sigma_max ** 2)
+            target_mean = self.predicate_mean.float().clamp(min=0.0, max=1.0)[foreground_label]
+            target_log_variance = self.predicate_log_variance.float().clamp(log_variance_min, log_variance_max)[foreground_label]
+            target_variance = torch.exp(target_log_variance)
+            foreground_nll = 0.5 * (
+                (foreground_visual_bank_activation - target_mean).pow(2) / target_variance
+            ).mean(dim=-1).mean()
             add_losses["loss_gaussian_nll"] = self.loss_nll_weight * foreground_nll
 
         log_variance_min = math.log(self.sigma_min ** 2)
         log_variance_max = math.log(self.sigma_max ** 2)
         current_log_variance = self.predicate_log_variance.float().clamp(log_variance_min, log_variance_max)
         gaussian_prior = (
-            F.mse_loss(self.predicate_mean.float(), self.predicate_mean_init.float())
+            F.mse_loss(self.predicate_mean.float().clamp(min=0.0, max=1.0), self.predicate_mean_init.float())
             + F.mse_loss(current_log_variance, self.predicate_log_variance_init.float())
         )
         clip_raw_regularizer = F.mse_loss(visual_bank_activation, raw_bank_activation)

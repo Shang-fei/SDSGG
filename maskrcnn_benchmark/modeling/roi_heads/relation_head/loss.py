@@ -59,8 +59,10 @@ class RelationLossComputation(object):
             self.criterion_loss = nn.CrossEntropyLoss()
         if self.predictor_name == "SemanticBankGaussianPredictor":
             self.loss = None
+            self.relation_criterion_loss = nn.CrossEntropyLoss(weight=self.pred_weight)
         else:
             self.loss=Loss(gamma=0.0, alpha=1, size_average=True,device=device)
+            self.relation_criterion_loss = self.criterion_loss
         #self.focal_loss=MultiCEFocalLoss(class_num=25,device=device)
 
     def __call__(self, proposals, rel_labels, relation_logits, refine_logits):
@@ -93,7 +95,7 @@ class RelationLossComputation(object):
         rel_labels = cat(rel_labels, dim=0)
         
         if self.predictor_name == "SemanticBankGaussianPredictor":
-            loss_relation = self.criterion_loss(relation_logits, rel_labels.long())
+            loss_relation = self.relation_criterion_loss(relation_logits, rel_labels.long())
         else:
             loss_relation = self.loss(relation_logits, rel_labels.long())
         #loss_relation = self.criterion_loss(relation_logits, rel_labels.long())

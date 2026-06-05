@@ -6,10 +6,10 @@ settings:
   entropy_weight: 0.5
   uncertainty_weight: 0.3
   text_variance_weight: 0.2
-  loss_nll_weight: 0.2
+  loss_nll_weight: 0.05
   loss_prior_weight: 0.05
   loss_clip_raw_weight: 0.05
-  object_filter_weight: 0.2
+  object_filter_weight: 0.05
 
 semantic_bank_axes:
   - name: overlap
