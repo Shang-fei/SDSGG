@@ -751,7 +751,7 @@ class SemanticBankGaussianPredictor(nn.Module):
         self.register_buffer("predicate_text_mean", predicate_text_mean.float())
         self.register_buffer("predicate_text_variance", predicate_text_variance.float())
         self.register_buffer("predicate_mean_ema", predicate_text_mean.float().clone())
-        self.register_buffer("predicate_variance_ema", predicate_text_variance.float().clone())
+        self.register_buffer("predicate_second_moment_ema", (predicate_text_variance + predicate_text_mean.pow(2)).float())
         self.register_buffer("predicate_count", torch.zeros(self.num_active_predicates - 1, dtype=torch.float32))
         self.register_buffer("debug_step", torch.zeros((), dtype=torch.long))
 
@@ -857,8 +857,10 @@ class SemanticBankGaussianPredictor(nn.Module):
 
     def _get_predicate_distribution(self):
         count_mask = (self.predicate_count >= self.ema_min_count).float().unsqueeze(-1)
+        predicate_variance_ema = self.predicate_second_moment_ema - self.predicate_mean_ema.pow(2)
+        predicate_variance_ema = predicate_variance_ema.float().clamp(min=self.sigma_min ** 2, max=self.sigma_max ** 2)
         predicate_mean = count_mask * self.predicate_mean_ema + (1.0 - count_mask) * self.predicate_text_mean
-        predicate_variance = count_mask * self.predicate_variance_ema + (1.0 - count_mask) * self.predicate_text_variance
+        predicate_variance = count_mask * predicate_variance_ema + (1.0 - count_mask) * self.predicate_text_variance
         predicate_mean = predicate_mean.float().clamp(min=0.0, max=1.0)
         predicate_variance = predicate_variance.float().clamp(min=self.sigma_min ** 2, max=self.sigma_max ** 2)
         return predicate_mean, predicate_variance
@@ -893,17 +895,15 @@ class SemanticBankGaussianPredictor(nn.Module):
                 class_mask = foreground_labels == predicate_idx
                 class_activation = foreground_activation[class_mask]
                 batch_mean = class_activation.mean(dim=0)
-                batch_variance = class_activation.var(dim=0, unbiased=False).clamp(
-                    min=self.sigma_min ** 2, max=self.sigma_max ** 2
-                )
+                batch_second_moment = class_activation.pow(2).mean(dim=0)
                 idx = int(predicate_idx.item())
                 if self.predicate_count[idx] <= 0:
                     self.predicate_mean_ema[idx].copy_(batch_mean)
-                    self.predicate_variance_ema[idx].copy_(batch_variance)
+                    self.predicate_second_moment_ema[idx].copy_(batch_second_moment)
                 else:
                     self.predicate_mean_ema[idx].mul_(self.ema_momentum).add_(batch_mean, alpha=1.0 - self.ema_momentum)
-                    self.predicate_variance_ema[idx].mul_(self.ema_momentum).add_(
-                        batch_variance, alpha=1.0 - self.ema_momentum
+                    self.predicate_second_moment_ema[idx].mul_(self.ema_momentum).add_(
+                        batch_second_moment, alpha=1.0 - self.ema_momentum
                     )
                 self.predicate_count[idx] += float(class_activation.shape[0])
 
