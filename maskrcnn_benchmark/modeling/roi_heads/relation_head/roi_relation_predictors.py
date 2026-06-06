@@ -1050,7 +1050,13 @@ class SemanticBankGaussianPredictor(nn.Module):
         crop_array = crop[0].permute(1, 2, 0).detach().cpu().numpy() * 255
         return Image.fromarray(np.uint8(crop_array))
 
+    def _pool_clip_features(self, clip_features):
+        if clip_features.dim() == 3:
+            return clip_features[:, 0, :]
+        return clip_features
+
     def _compute_origin_activation(self, raw_relation_features):
+        raw_relation_features = self._pool_clip_features(raw_relation_features)
         primitive_basis = F.normalize(self.primitive_basis.float(), dim=-1)
         origin_similarity = raw_relation_features.float() @ primitive_basis.t()
         return ((origin_similarity + 1.0) * 0.5).clamp(0.0, 1.0)
@@ -1058,7 +1064,7 @@ class SemanticBankGaussianPredictor(nn.Module):
     def _build_object_filter_text_features(self, resources):
         if "object_filter_csv" not in resources:
             return torch.zeros(
-                len(self.obj_names), len(self.foreground_predicate_names), 512,
+                len(self.obj_names), len(self.foreground_predicate_names), self.primitive_basis.shape[-1],
                 device=self.device,
                 dtype=torch.float32,
             )
@@ -1096,9 +1102,18 @@ class SemanticBankGaussianPredictor(nn.Module):
     def _compute_object_filter_logits(self, subject_features, object_features, object_classes):
         if not self.use_object_filter or self.object_filter_weight == 0.0:
             return None
+        subject_features = self._pool_clip_features(subject_features)
+        object_features = self._pool_clip_features(object_features)
         text_features = self.object_filter_text_features[object_classes].to(subject_features.dtype)
-        subject_similarity = torch.sum(subject_features.unsqueeze(1) * text_features, dim=-1)
-        object_similarity = torch.sum(object_features.unsqueeze(1) * text_features, dim=-1)
+        if text_features.shape[-1] != subject_features.shape[-1]:
+            raise ValueError(
+                "Object filter feature dim mismatch: text dim {} vs image dim {}.".format(
+                    text_features.shape[-1],
+                    subject_features.shape[-1],
+                )
+            )
+        subject_similarity = torch.bmm(text_features, subject_features.unsqueeze(-1)).squeeze(-1)
+        object_similarity = torch.bmm(text_features, object_features.unsqueeze(-1)).squeeze(-1)
         return (subject_similarity + object_similarity).float() * 0.5
 
     def _maybe_print_debug(self, primitive_activation, origin_activation, gaussian_logits, object_filter_logits):
@@ -1198,13 +1213,15 @@ class SemanticBankGaussianPredictor(nn.Module):
                 relation_features = F.normalize(
                     (subject_relation_features + object_relation_features) / 2.0, dim=-1
                 )
-                raw_relation_features = F.normalize((subject_raw_features + object_raw_features) / 2.0, dim=-1)
+                pooled_subject_features = self._pool_clip_features(subject_raw_features)
+                pooled_object_features = self._pool_clip_features(object_raw_features)
+                raw_relation_features = F.normalize((pooled_subject_features + pooled_object_features) / 2.0, dim=-1)
                 primitive_activation = self.primitive_activation_head(relation_features.float())
                 origin_activation = self._compute_origin_activation(raw_relation_features)
                 foreground_logits = self._compute_gaussian_logits(primitive_activation)
                 object_filter_logits = self._compute_object_filter_logits(
-                    subject_raw_features,
-                    object_raw_features,
+                    pooled_subject_features,
+                    pooled_object_features,
                     object_classes,
                 )
                 if object_filter_logits is not None and not self.training:
