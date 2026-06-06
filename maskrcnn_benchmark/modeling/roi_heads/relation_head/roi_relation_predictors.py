@@ -708,6 +708,9 @@ class SemanticBankGaussianPredictor(nn.Module):
         self.text_recon_tau = float(self._cfg_value(
             primitive_cfg, primitive_settings, "TEXT_RECON_TAU", "text_recon_tau", 0.20
         ))
+        self.text_recon_debug_interval = int(self._cfg_value(
+            primitive_cfg, primitive_settings, "TEXT_RECON_DEBUG_INTERVAL", "text_recon_debug_interval", 50
+        ))
         self.text_recon_weight = float(self._cfg_value(
             primitive_cfg, primitive_settings, "TEXT_RECON_WEIGHT", "text_recon_weight", 1.0
         ))
@@ -733,6 +736,12 @@ class SemanticBankGaussianPredictor(nn.Module):
         ))
         self.visual_sparse_weight = float(self._cfg_value(
             primitive_cfg, primitive_settings, "VISUAL_SPARSE_WEIGHT", "visual_sparse_weight", 0.001
+        ))
+        self.visual_activation_tau = float(self._cfg_value(
+            primitive_cfg, primitive_settings, "VISUAL_ACTIVATION_TAU", "visual_activation_tau", 0.20
+        ))
+        self.origin_activation_tau = float(self._cfg_value(
+            primitive_cfg, primitive_settings, "ORIGIN_ACTIVATION_TAU", "origin_activation_tau", 0.20
         ))
         self.object_filter_weight = float(self._cfg_value(
             primitive_cfg, primitive_settings, "OBJECT_FILTER_WEIGHT", "object_filter_weight", 0.05
@@ -814,7 +823,6 @@ class SemanticBankGaussianPredictor(nn.Module):
 
         self.primitive_activation_head = nn.Sequential(
             nn.Linear(512, self.num_primitives),
-            nn.Sigmoid(),
         ).to(self.device)
 
         subject_role_prompts = ["a photo of subject {}".format(obj_name) for obj_name in self.obj_names]
@@ -918,6 +926,7 @@ class SemanticBankGaussianPredictor(nn.Module):
             similarity = predicate_features.float() @ primitive_basis_init.float().t()
             weights = F.softmax(similarity / max(self.text_recon_tau, 1e-6), dim=-1)
             losses = self._compute_text_anchor_losses(predicate_features, primitive_basis_init, weights)
+            self._print_text_recon_summary(losses, weights)
             return weights.detach(), primitive_basis_init.detach(), losses
         else:
             raise ValueError("Unsupported W_SOURCE: {}".format(self.w_source))
@@ -937,7 +946,7 @@ class SemanticBankGaussianPredictor(nn.Module):
         optimizer = torch.optim.Adam(optim_params, lr=self.text_recon_lr)
         steps = max(self.text_recon_steps, 0)
         losses = None
-        for _ in range(steps):
+        for step_idx in range(steps):
             weights = F.softmax(weight_logits / max(self.text_recon_tau, 1e-6), dim=-1)
             losses = self._compute_text_anchor_losses(predicate_features, primitive_basis_param, weights)
             loss = (
@@ -948,11 +957,54 @@ class SemanticBankGaussianPredictor(nn.Module):
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            self._maybe_print_text_recon_debug(step_idx + 1, steps, loss, losses, weights)
 
         weights = F.softmax(weight_logits / max(self.text_recon_tau, 1e-6), dim=-1).detach()
         primitive_basis = F.normalize(primitive_basis_param.detach().float(), dim=-1)
         losses = self._compute_text_anchor_losses(predicate_features, primitive_basis, weights)
+        self._print_text_recon_summary(losses, weights)
         return weights.float(), primitive_basis.float(), losses
+
+    def _maybe_print_text_recon_debug(self, step_idx, total_steps, loss, losses, weights):
+        if self.text_recon_debug_interval <= 0:
+            return
+        if step_idx != 1 and step_idx != total_steps and step_idx % self.text_recon_debug_interval != 0:
+            return
+        with torch.no_grad():
+            entropy = self._compute_weight_entropy(weights.float())
+            max_weight = weights.float().max(dim=-1)[0]
+            print(
+                "TextRecon step {}/{}: loss {:.4f}, recon {:.4f}, sparse {:.4f}, orth {:.4f}, "
+                "W_entropy {:.4f}/{:.4f}, W_max {:.4f}/{:.4f}".format(
+                    step_idx,
+                    total_steps,
+                    float(loss.detach().cpu()),
+                    float(losses["recon"].detach().cpu()),
+                    float(losses["sparse"].detach().cpu()),
+                    float(losses["orth"].detach().cpu()),
+                    float(entropy.mean().detach().cpu()),
+                    float(entropy.std(unbiased=False).detach().cpu()),
+                    float(max_weight.mean().detach().cpu()),
+                    float(max_weight.max().detach().cpu()),
+                )
+            )
+
+    def _print_text_recon_summary(self, losses, weights):
+        with torch.no_grad():
+            entropy = self._compute_weight_entropy(weights.float())
+            max_weight = weights.float().max(dim=-1)[0]
+            print(
+                "TextRecon final: recon {:.4f}, sparse {:.4f}, orth {:.4f}, "
+                "W_entropy {:.4f}/{:.4f}, W_max {:.4f}/{:.4f}".format(
+                    float(losses["recon"].detach().cpu()),
+                    float(losses["sparse"].detach().cpu()),
+                    float(losses["orth"].detach().cpu()),
+                    float(entropy.mean().detach().cpu()),
+                    float(entropy.std(unbiased=False).detach().cpu()),
+                    float(max_weight.mean().detach().cpu()),
+                    float(max_weight.max().detach().cpu()),
+                )
+            )
 
     def _compute_text_anchor_losses(self, predicate_features, primitive_basis, weights):
         normalized_basis = F.normalize(primitive_basis.float(), dim=-1)
@@ -1059,7 +1111,7 @@ class SemanticBankGaussianPredictor(nn.Module):
         raw_relation_features = self._pool_clip_features(raw_relation_features)
         primitive_basis = F.normalize(self.primitive_basis.float(), dim=-1)
         origin_similarity = raw_relation_features.float() @ primitive_basis.t()
-        return ((origin_similarity + 1.0) * 0.5).clamp(0.0, 1.0)
+        return F.softmax(origin_similarity / max(self.origin_activation_tau, 1e-6), dim=-1)
 
     def _build_object_filter_text_features(self, resources):
         if "object_filter_csv" not in resources:
@@ -1132,7 +1184,7 @@ class SemanticBankGaussianPredictor(nn.Module):
         print(
             "PrimitiveGaussian debug step {}: W0_entropy {:.4f}/{:.4f}, a_vis {:.4f}/{:.4f}, "
             "a_origin {:.4f}/{:.4f}, gaussian {:.4f}/{:.4f}, object_filter {:.4f}/{:.4f}, "
-            "sigma_text {:.4f}/{:.4f}, visual_var {:.4f}/{:.4f}, count {:.2f}/{:.2f}".format(
+            "sigma_text {:.4f}/{:.4f}, visual_var {:.4f}/{:.4f}, count {:.2f}/{:.2f}, tau {:.3f}/{:.3f}".format(
                 int(self.debug_step.item()),
                 float(self.predicate_entropy.float().mean().detach().cpu()),
                 float(self.predicate_entropy.float().std(unbiased=False).detach().cpu()),
@@ -1150,6 +1202,8 @@ class SemanticBankGaussianPredictor(nn.Module):
                 float(visual_variance.float().max().detach().cpu()),
                 float(self.predicate_count.float().mean().detach().cpu()),
                 float(self.predicate_count.float().min().detach().cpu()),
+                self.visual_activation_tau,
+                self.origin_activation_tau,
             )
         )
 
@@ -1220,7 +1274,11 @@ class SemanticBankGaussianPredictor(nn.Module):
                 pooled_subject_features = self._pool_clip_features(subject_raw_features)
                 pooled_object_features = self._pool_clip_features(object_raw_features)
                 raw_relation_features = F.normalize((pooled_subject_features + pooled_object_features) / 2.0, dim=-1)
-                primitive_activation = self.primitive_activation_head(relation_features.float())
+                primitive_activation_logits = self.primitive_activation_head(relation_features.float())
+                primitive_activation = F.softmax(
+                    primitive_activation_logits / max(self.visual_activation_tau, 1e-6),
+                    dim=-1,
+                )
                 origin_activation = self._compute_origin_activation(raw_relation_features)
                 foreground_logits = self._compute_gaussian_logits(primitive_activation)
                 object_filter_logits = self._compute_object_filter_logits(
@@ -1250,7 +1308,7 @@ class SemanticBankGaussianPredictor(nn.Module):
                             F.mse_loss(primitive_activation[foreground_mask].float(), target_weights.detach().float())
                         )
                     origin_losses.append(F.mse_loss(primitive_activation.float(), origin_activation.detach().float()))
-                    sparse_losses.append(primitive_activation.float().mean())
+                    sparse_losses.append(self._compute_weight_entropy(primitive_activation.float()).mean())
                     self._update_visual_statistics(primitive_activation, relation_labels)
 
         obj_dists = obj_dists.split(num_objs, dim=0)
@@ -1273,10 +1331,6 @@ class SemanticBankGaussianPredictor(nn.Module):
                 add_losses["loss_origin_reg"] = self.origin_reg_weight * torch.stack(origin_losses).mean()
             if sparse_losses:
                 add_losses["loss_visual_sparse"] = self.visual_sparse_weight * torch.stack(sparse_losses).mean()
-            diagnostic_anchor = roi_features.sum() * 0.0
-            add_losses["loss_text_recon_stat"] = diagnostic_anchor + self.text_recon_loss.to(roi_features.device)
-            add_losses["loss_text_sparse_stat"] = diagnostic_anchor + self.text_sparse_loss.to(roi_features.device)
-            add_losses["loss_text_orth_stat"] = diagnostic_anchor + self.text_orth_loss.to(roi_features.device)
         return obj_dists, rel_dists, add_losses
 
 

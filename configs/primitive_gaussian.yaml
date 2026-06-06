@@ -3,6 +3,7 @@ settings:
   text_recon_steps: 300
   text_recon_lr: 0.05
   text_recon_tau: 0.20
+  text_recon_debug_interval: 50
   text_recon_weight: 1.0
   text_sparse_weight: 0.02
   text_orth_weight: 0.05
@@ -13,6 +14,8 @@ settings:
   visual_align_weight: 0.10
   origin_reg_weight: 0.02
   visual_sparse_weight: 0.001
+  visual_activation_tau: 0.20
+  origin_activation_tau: 0.20
   object_filter_weight: 0.05
   use_object_filter: true
   use_log_variance: false
