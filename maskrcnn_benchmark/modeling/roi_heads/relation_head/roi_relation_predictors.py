@@ -1177,6 +1177,10 @@ class SemanticBankGaussianPredictor(nn.Module):
         align_losses = []
         origin_losses = []
         sparse_losses = []
+        debug_primitive_activations = []
+        debug_origin_activations = []
+        debug_gaussian_logits = []
+        debug_object_filter_logits = []
 
         for image_idx in range(len(num_rels)):
             image = img[image_idx].unsqueeze(0)
@@ -1226,6 +1230,11 @@ class SemanticBankGaussianPredictor(nn.Module):
                 )
                 if object_filter_logits is not None and not self.training:
                     foreground_logits = foreground_logits + self.object_filter_weight * object_filter_logits
+                debug_primitive_activations.append(primitive_activation.detach())
+                debug_origin_activations.append(origin_activation.detach())
+                debug_gaussian_logits.append(foreground_logits.detach())
+                if object_filter_logits is not None:
+                    debug_object_filter_logits.append(object_filter_logits.detach())
                 background_logit = self.background_classifier(
                     relation_features.float()
                 ).float()
@@ -1243,15 +1252,18 @@ class SemanticBankGaussianPredictor(nn.Module):
                     origin_losses.append(F.mse_loss(primitive_activation.float(), origin_activation.detach().float()))
                     sparse_losses.append(primitive_activation.float().mean())
                     self._update_visual_statistics(primitive_activation, relation_labels)
-                    self._maybe_print_debug(
-                        primitive_activation,
-                        origin_activation,
-                        foreground_logits,
-                        object_filter_logits,
-                    )
 
         obj_dists = obj_dists.split(num_objs, dim=0)
         rel_dists = tuple(rel_dists)
+
+        if self.training and debug_primitive_activations:
+            debug_object_filter = torch.cat(debug_object_filter_logits, dim=0) if debug_object_filter_logits else None
+            self._maybe_print_debug(
+                torch.cat(debug_primitive_activations, dim=0),
+                torch.cat(debug_origin_activations, dim=0),
+                torch.cat(debug_gaussian_logits, dim=0),
+                debug_object_filter,
+            )
 
         add_losses = {}
         if self.training:
@@ -1261,6 +1273,10 @@ class SemanticBankGaussianPredictor(nn.Module):
                 add_losses["loss_origin_reg"] = self.origin_reg_weight * torch.stack(origin_losses).mean()
             if sparse_losses:
                 add_losses["loss_visual_sparse"] = self.visual_sparse_weight * torch.stack(sparse_losses).mean()
+            diagnostic_anchor = roi_features.sum() * 0.0
+            add_losses["loss_text_recon_stat"] = diagnostic_anchor + self.text_recon_loss.to(roi_features.device)
+            add_losses["loss_text_sparse_stat"] = diagnostic_anchor + self.text_sparse_loss.to(roi_features.device)
+            add_losses["loss_text_orth_stat"] = diagnostic_anchor + self.text_orth_loss.to(roi_features.device)
         return obj_dists, rel_dists, add_losses
 
 
