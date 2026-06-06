@@ -1,0 +1,21 @@
+primitive,prompt_1,prompt_2
+overlap_contact,a photo where the subject physically overlaps or contacts the object,a visual relationship where the subject touches or overlaps the object
+support_from_below,a photo where the object supports the subject from below,a visual relationship where the subject is supported by the object
+subject_above_object,a photo where the subject is above the object,a visual relationship where the subject is higher than the object
+subject_below_object,a photo where the subject is below the object,a visual relationship where the subject is lower than the object
+subject_in_front_of_object,a photo where the subject is in front of the object,a visual relationship where the subject appears before the object
+subject_behind_object,a photo where the subject is behind the object,a visual relationship where the subject appears behind the object
+containment_enclosure,a photo where the subject is inside the object,a visual relationship where the subject is enclosed by the object
+attachment_fixed,a photo where the subject is attached to the object,a visual relationship where the subject is fixed to the object
+part_whole,a photo where the subject is part of the object,a visual relationship where the subject belongs to the object as a component
+hand_contact_manipulation,a photo where the subject is held or manipulated by hand,a visual relationship where the subject is grasped or used by hand
+carrying_transport,a photo where the subject is carried or transported by the object,a visual relationship where the subject moves together with the object
+wearing_covering_body,a photo where the object is worn on the body,a visual relationship where the object covers or is worn by a person
+riding_support_posture,a photo where the subject is riding on the object,a visual relationship where the subject is supported in a riding or seated posture
+gaze_attention,a photo where the subject is being looked at,a visual relationship where attention is directed to the object
+consumption_eating,a photo where the subject is eaten or consumed,a visual relationship where the subject is bitten or consumed
+motion_path,a photo where the subject moves along or across the object,a visual relationship where the subject follows a motion path around the object
+directional_target,a photo where the subject moves or points toward the object,a visual relationship where the subject is directed to the object
+material_surface,a photo where the subject is made of or formed by the object material,a visual relationship where the object defines the surface or material of the subject
+text_symbolic_display,a photo where text or a symbol appears on the object,a visual relationship where a word sign or symbol is displayed on the object
+near_cooccurrence,a photo where the subject is near the object,a visual relationship where the subject is close to the object without strong interaction

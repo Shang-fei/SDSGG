@@ -38,6 +38,9 @@ datasets/
 logs/
 *.txt
 *.csv
+!maskrcnn_benchmark/modeling/roi_heads/relation_head/primitive_prototypes.csv
+!maskrcnn_benchmark/modeling/roi_heads/relation_head/predicate_descriptions.csv
+!maskrcnn_benchmark/modeling/roi_heads/relation_head/predicate_primitive_signatures.csv
 *.log
 *.out
 *.err

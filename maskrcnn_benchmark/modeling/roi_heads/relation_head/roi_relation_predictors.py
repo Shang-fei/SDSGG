@@ -694,32 +694,59 @@ class SemanticBankGaussianPredictor(nn.Module):
 
         self.device = config.MODEL.DEVICE
 
-        semantic_bank_cfg = config.MODEL.ROI_RELATION_HEAD.SEMANTIC_BANK
-        bank_config = self._load_semantic_bank_config(semantic_bank_cfg.CONFIG_PATH)
-        bank_settings = bank_config.get("settings", {})
-        self.tau_bank = float(getattr(semantic_bank_cfg, "TAU_BANK", bank_settings.get("tau_bank", 0.07)))
-        self.tau_cls = float(getattr(semantic_bank_cfg, "TAU_CLS", bank_settings.get("tau_cls", 1.0)))
-        self.sigma_min = float(getattr(semantic_bank_cfg, "SIGMA_MIN", bank_settings.get("sigma_min", 0.06)))
-        self.sigma_max = float(getattr(semantic_bank_cfg, "SIGMA_MAX", bank_settings.get("sigma_max", 0.35)))
-        self.object_filter_weight = float(getattr(semantic_bank_cfg, "OBJECT_FILTER_WEIGHT", bank_settings.get("object_filter_weight", 0.05)))
-        self.ema_momentum = float(getattr(semantic_bank_cfg, "EMA_MOMENTUM", bank_settings.get("ema_momentum", 0.95)))
-        self.ema_min_count = int(getattr(semantic_bank_cfg, "EMA_MIN_COUNT", bank_settings.get("ema_min_count", 8)))
-        self.loss_clip_teacher_weight = float(getattr(
-            semantic_bank_cfg, "LOSS_CLIP_TEACHER_WEIGHT", bank_settings.get("loss_clip_teacher_weight", 0.02)
+        primitive_cfg = config.MODEL.ROI_RELATION_HEAD.PRIMITIVE_BANK
+        primitive_config = self._load_primitive_config(primitive_cfg.CONFIG_PATH)
+        primitive_settings = primitive_config.get("settings", {})
+
+        self.w_source = str(getattr(primitive_cfg, "W_SOURCE", primitive_settings.get("w_source", "llm_assignment")))
+        self.b_trainable = bool(getattr(primitive_cfg, "B_TRAINABLE", primitive_settings.get("b_trainable", False)))
+        self.num_topk = int(getattr(primitive_cfg, "NUM_TOPK", primitive_settings.get("num_topk", 5)))
+        self.sigma_min = float(getattr(primitive_cfg, "SIGMA_MIN", primitive_settings.get("sigma_min", 0.08)))
+        self.sigma_max = float(getattr(primitive_cfg, "SIGMA_MAX", primitive_settings.get("sigma_max", 0.35)))
+        self.sigma_pos_init_low = float(getattr(
+            primitive_cfg, "SIGMA_POS_INIT_LOW", primitive_settings.get("sigma_pos_init_low", 0.08)
         ))
-        self.union_teacher_weight = float(getattr(
-            semantic_bank_cfg, "UNION_TEACHER_WEIGHT", bank_settings.get("union_teacher_weight", 1.0)
+        self.sigma_pos_init_high = float(getattr(
+            primitive_cfg, "SIGMA_POS_INIT_HIGH", primitive_settings.get("sigma_pos_init_high", 0.15)
         ))
-        self.subobj_teacher_weight = float(getattr(
-            semantic_bank_cfg, "SUBOBJ_TEACHER_WEIGHT", bank_settings.get("subobj_teacher_weight", 0.5)
+        self.sigma_zero_init_low = float(getattr(
+            primitive_cfg, "SIGMA_ZERO_INIT_LOW", primitive_settings.get("sigma_zero_init_low", 0.18)
         ))
-        self.debug_interval = int(getattr(semantic_bank_cfg, "DEBUG_INTERVAL", bank_settings.get("debug_interval", 100)))
+        self.sigma_zero_init_high = float(getattr(
+            primitive_cfg, "SIGMA_ZERO_INIT_HIGH", primitive_settings.get("sigma_zero_init_high", 0.30)
+        ))
+        self.sigma_neg_init_low = float(getattr(
+            primitive_cfg, "SIGMA_NEG_INIT_LOW", primitive_settings.get("sigma_neg_init_low", 0.08)
+        ))
+        self.sigma_neg_init_high = float(getattr(
+            primitive_cfg, "SIGMA_NEG_INIT_HIGH", primitive_settings.get("sigma_neg_init_high", 0.15)
+        ))
+        self.prior_posterior_alpha = float(getattr(
+            primitive_cfg, "PRIOR_POSTERIOR_ALPHA", primitive_settings.get("prior_posterior_alpha", 0.3)
+        ))
+        self.ema_momentum = float(getattr(primitive_cfg, "EMA_MOMENTUM", primitive_settings.get("ema_momentum", 0.95)))
+        self.loss_proto_align_weight = float(getattr(
+            primitive_cfg, "LOSS_PROTO_ALIGN_WEIGHT", primitive_settings.get("loss_proto_align_weight", 0.10)
+        ))
+        self.loss_topk_sparse_weight = float(getattr(
+            primitive_cfg, "LOSS_TOPK_SPARSE_WEIGHT", primitive_settings.get("loss_topk_sparse_weight", 0.02)
+        ))
+        self.use_novel_transfer = bool(getattr(
+            primitive_cfg, "USE_NOVEL_TRANSFER", primitive_settings.get("use_novel_transfer", True)
+        ))
+        self.novel_topk = int(getattr(primitive_cfg, "NOVEL_TOPK", primitive_settings.get("novel_topk", 3)))
+        self.novel_tau = float(getattr(primitive_cfg, "NOVEL_TAU", primitive_settings.get("novel_tau", 0.2)))
+        self.novel_signature_weight = float(getattr(
+            primitive_cfg, "NOVEL_SIGNATURE_WEIGHT", primitive_settings.get("novel_signature_weight", 0.5)
+        ))
+        self.debug_interval = int(getattr(primitive_cfg, "DEBUG_INTERVAL", primitive_settings.get("debug_interval", 100)))
 
         statistics = get_dataset_statistics(config)
         obj_classes = statistics["obj_classes"]
         rel_classes = statistics["rel_classes"]
         self.obj_names = list(obj_classes)
         self.predicate_names = list(rel_classes)
+        self.foreground_predicate_names = self.predicate_names[1:]
         self.num_active_predicates = len(self.predicate_names)
 
         self.clip_model, self.clip_preprocess = clip.load("ViT-B/32", device=self.device)
@@ -727,56 +754,79 @@ class SemanticBankGaussianPredictor(nn.Module):
         self.subject_adapter = MVA()
         self.object_adapter = MVA()
         self.background_classifier = nn.Linear(512, 1).to(self.device)
-
-        self.predicate_id_by_name = {
-            "__background__": 0, "above": 1, "across": 2, "against": 3, "along": 4, "and": 5, "at": 6,
-            "attached to": 7, "behind": 8, "belonging to": 9, "between": 10, "carrying": 11,
-            "covered in": 12, "covering": 13, "eating": 14, "flying in": 15, "for": 16, "from": 17,
-            "growing on": 18, "hanging from": 19, "has": 20, "holding": 21, "in": 22, "in front of": 23,
-            "laying on": 24, "looking at": 25, "lying on": 26, "made of": 27, "mounted on": 28, "near": 29,
-            "of": 30, "on": 31, "on back of": 32, "over": 33, "painted on": 34, "parked on": 35,
-            "part of": 36, "playing": 37, "riding": 38, "says": 39, "sitting on": 40, "standing on": 41,
-            "to": 42, "under": 43, "using": 44, "walking in": 45, "walking on": 46, "watching": 47,
-            "wearing": 48, "wears": 49, "with": 50
-        }
         self.active_mode = "base"
 
-        semantic_bank_axes = bank_config["semantic_bank_axes"]
-        semantic_bank_features = self._encode_semantic_bank_features(semantic_bank_axes)
-        self.num_bank_axes = semantic_bank_features.shape[0]
-        self.register_buffer("semantic_bank_features", semantic_bank_features.float())
+        resources = primitive_config.get("resources", {})
+        primitive_prompts, predicate_descriptions, predicate_signatures = self._load_primitive_resources(resources)
+        primitive_basis_init = self._encode_prompt_groups(primitive_prompts)
+        if self.b_trainable:
+            self.primitive_basis = nn.Parameter(primitive_basis_init.clone())
+        else:
+            self.register_buffer("primitive_basis", primitive_basis_init.clone())
 
-        predicate_descriptions = bank_config.get("predicate_descriptions", {})
-        predicate_text_mean, predicate_text_variance = self._initialize_text_predicate_distribution(predicate_descriptions)
-        self.register_buffer("predicate_text_mean", predicate_text_mean.float())
-        self.register_buffer("predicate_text_variance", predicate_text_variance.float())
-        self.register_buffer("predicate_mean_ema", predicate_text_mean.float().clone())
-        self.register_buffer("predicate_second_moment_ema", (predicate_text_variance + predicate_text_mean.pow(2)).float())
+        self.num_primitives = primitive_basis_init.shape[0]
+        if self.num_topk > self.num_primitives:
+            raise ValueError("NUM_TOPK must be <= number of primitives.")
+
+        predicate_description_features = self._encode_prompt_groups(predicate_descriptions)
+        self.register_buffer("predicate_description_features", predicate_description_features.float())
+        self.register_buffer("predicate_signatures", predicate_signatures.float())
+
+        mu_prior, sigma_prior = self._initialize_prior_distribution(predicate_signatures)
+        self.register_buffer("mu_prior", mu_prior.float())
+        self.register_buffer("sigma_prior", sigma_prior.float())
+        self.register_buffer("mu_post", mu_prior.float().clone())
+        self.register_buffer("second_moment_post", (sigma_prior + mu_prior.pow(2)).float().clone())
         self.register_buffer("predicate_count", torch.zeros(self.num_active_predicates - 1, dtype=torch.float32))
         self.register_buffer("debug_step", torch.zeros((), dtype=torch.long))
+
+        self.primitive_activation_head = nn.Sequential(
+            nn.Linear(512, self.num_primitives),
+            nn.Tanh(),
+        ).to(self.device)
 
         subject_role_prompts = ["a photo of subject {}".format(obj_name) for obj_name in self.obj_names]
         object_role_prompts = ["a photo of object {}".format(obj_name) for obj_name in self.obj_names]
         self.register_buffer("subject_role_text_features", self._encode_text_features(subject_role_prompts).float())
         self.register_buffer("object_role_text_features", self._encode_text_features(object_role_prompts).float())
-        self.register_buffer("object_filter_text_features", self._encode_object_filter_features().float())
-        print("SemanticBankGaussianPredictor V2: {} bank axes, {} predicates, EMA shape {}, teacher=subject_object+union".format(
-            self.num_bank_axes, self.num_active_predicates, tuple(self.predicate_mean_ema.shape)
-        ))
+        self.register_buffer(
+            "base_predicate_mask",
+            torch.tensor([predicate_name in set(config.OV_SETTING.PRDCS_BASE) for predicate_name in self.foreground_predicate_names],
+                         dtype=torch.bool),
+        )
+        self.register_buffer(
+            "novel_predicate_mask",
+            torch.tensor([predicate_name in set(config.OV_SETTING.PRDCS_NOVEL) for predicate_name in self.foreground_predicate_names],
+                         dtype=torch.bool),
+        )
+        print(
+            "SemanticBankGaussianPredictor primitive mode: {} primitives, {} predicates, w_source={}, b_trainable={}".format(
+                self.num_primitives,
+                self.num_active_predicates,
+                self.w_source,
+                self.b_trainable,
+            )
+        )
 
-    def _load_semantic_bank_config(self, config_path):
+    def _load_primitive_config(self, config_path):
         if yaml is None:
-            raise ImportError("PyYAML is required to load SemanticBankGaussianPredictor YAML config.")
+            raise ImportError("PyYAML is required to load primitive predictor YAML config.")
         if os.path.isabs(config_path):
             resolved_path = config_path
         else:
             repo_root = os.path.abspath(os.path.join(curpath, "../../../../"))
             resolved_path = os.path.join(repo_root, config_path)
         with open(resolved_path, "r") as config_file:
-            bank_config = yaml.safe_load(config_file)
-        if not bank_config or "semantic_bank_axes" not in bank_config:
-            raise ValueError("semantic bank config must define semantic_bank_axes")
-        return bank_config
+            primitive_config = yaml.safe_load(config_file)
+        if not primitive_config or "resources" not in primitive_config:
+            raise ValueError("primitive config must define resources")
+        return primitive_config
+
+    def _resolve_resource_path(self, resource_path):
+        if os.path.isabs(resource_path):
+            return resource_path
+        repo_root = os.path.abspath(os.path.join(curpath, "../../../../"))
+        return os.path.join(repo_root, resource_path)
 
     def _encode_text_features(self, prompts, batch_size=256):
         features = []
@@ -789,107 +839,156 @@ class SemanticBankGaussianPredictor(nn.Module):
                 features.append(text_features)
         return torch.cat(features, dim=0)
 
-    def _encode_semantic_bank_features(self, semantic_bank_axes):
-        axis_features = []
-        for axis in semantic_bank_axes:
-            prompts = axis.get("prompts", None)
-            if prompts is None:
-                prompts = [axis.get("positive", axis["name"])]
+    def _encode_prompt_groups(self, prompt_groups):
+        group_features = []
+        for prompts in prompt_groups:
             prompt_features = self._encode_text_features(prompts)
-            axis_features.append(F.normalize(prompt_features.mean(dim=0, keepdim=True), dim=-1))
-        return torch.cat(axis_features, dim=0)
+            group_features.append(F.normalize(prompt_features.mean(dim=0, keepdim=True), dim=-1))
+        return torch.cat(group_features, dim=0)
 
-    def _compute_bank_activation(self, feature):
-        normalized_feature = F.normalize(feature.float(), dim=-1)
-        bank_similarity = normalized_feature @ self.semantic_bank_features.t()
-        bank_similarity = bank_similarity - bank_similarity.mean(dim=-1, keepdim=True)
-        return torch.sigmoid(bank_similarity / self.tau_bank)
+    def _load_primitive_resources(self, resources):
+        primitive_csv = pd.read_csv(self._resolve_resource_path(resources["primitive_prototypes_csv"])).fillna("")
+        predicate_desc_csv = pd.read_csv(self._resolve_resource_path(resources["predicate_descriptions_csv"])).fillna("")
+        predicate_sign_csv = pd.read_csv(self._resolve_resource_path(resources["predicate_signatures_csv"])).fillna(0)
 
-    def _initialize_text_predicate_distribution(self, predicate_descriptions):
-        predicate_mean = []
-        predicate_variance = []
+        primitive_names = primitive_csv["primitive"].tolist()
+        primitive_prompts = []
+        for _, row in primitive_csv.iterrows():
+            prompts = [str(row[col]).strip() for col in primitive_csv.columns if col != "primitive" and str(row[col]).strip()]
+            primitive_prompts.append(prompts)
 
-        for predicate_name in self.predicate_names[1:]:
-            descriptions = predicate_descriptions.get(predicate_name, None)
-            if not descriptions:
-                descriptions = [
-                    "a photo where the subject is {} the object".format(predicate_name),
-                    "a visual relationship where the subject is {} the object".format(predicate_name),
-                ]
-            description_features = self._encode_text_features(descriptions)
-            description_activations = self._compute_bank_activation(description_features)
+        predicate_description_map = {
+            str(row["predicate"]).strip(): [
+                str(row[col]).strip() for col in predicate_desc_csv.columns if col != "predicate" and str(row[col]).strip()
+            ]
+            for _, row in predicate_desc_csv.iterrows()
+        }
+        predicate_signature_map = {
+            str(row["predicate"]).strip(): row[primitive_names].to_numpy(dtype=np.int64)
+            for _, row in predicate_sign_csv.iterrows()
+        }
 
-            mean = description_activations.mean(dim=0)
-            variance = description_activations.var(dim=0, unbiased=False)
-            variance = variance.clamp(min=self.sigma_min ** 2, max=self.sigma_max ** 2)
-            predicate_mean.append(mean)
-            predicate_variance.append(variance)
+        predicate_descriptions = []
+        predicate_signatures = []
+        for predicate_name in self.foreground_predicate_names:
+            if predicate_name not in predicate_description_map:
+                raise ValueError("Missing predicate description for {}".format(predicate_name))
+            if predicate_name not in predicate_signature_map:
+                raise ValueError("Missing primitive signature for {}".format(predicate_name))
+            predicate_descriptions.append(predicate_description_map[predicate_name])
+            signature = predicate_signature_map[predicate_name]
+            if not np.isin(signature, [-1, 0, 1]).all():
+                raise ValueError("Primitive signature for {} must be in {-1, 0, 1}".format(predicate_name))
+            predicate_signatures.append(signature)
 
-        return torch.stack(predicate_mean, dim=0), torch.stack(predicate_variance, dim=0)
+        return primitive_prompts, predicate_descriptions, torch.tensor(np.stack(predicate_signatures), dtype=torch.float32)
 
-    def _encode_object_filter_features(self):
-        filter_table = pd.read_csv(os.path.join(curpath, "filter_total.csv")).iloc[:, 1:]
-        feature_tensor = torch.zeros(
-            len(self.obj_names), self.num_active_predicates, 512, device=self.device, dtype=torch.float32
-        )
-        prompts = []
-        locations = []
-        for object_idx, object_name in enumerate(self.obj_names):
-            if object_name not in filter_table.columns:
-                continue
-            for predicate_idx, predicate_name in enumerate(self.predicate_names):
-                if predicate_idx == 0:
-                    continue
-                predicate_row = self.predicate_id_by_name.get(predicate_name, None)
-                if predicate_row is None or predicate_row >= len(filter_table):
-                    continue
-                prompt = str(filter_table[object_name].iloc[predicate_row]).strip()
-                if not prompt or prompt == "__background__" or prompt.lower() == "nan":
-                    continue
-                prompts.append(prompt)
-                locations.append((object_idx, predicate_idx))
+    def _initialize_prior_distribution(self, predicate_signatures):
+        if self.w_source == "llm_assignment":
+            mu_prior = predicate_signatures.float()
+        elif self.w_source == "text_similarity":
+            raise NotImplementedError("W_SOURCE=text_similarity is reserved but not implemented yet.")
+        elif self.w_source == "reconstruction":
+            raise NotImplementedError("W_SOURCE=reconstruction is reserved but not implemented yet.")
+        else:
+            raise ValueError("Unsupported W_SOURCE: {}".format(self.w_source))
 
-        if prompts:
-            encoded_features = self._encode_text_features(prompts)
-            for feature, (object_idx, predicate_idx) in zip(encoded_features, locations):
-                feature_tensor[object_idx, predicate_idx] = feature
-        return feature_tensor
+        sigma_prior = torch.empty_like(mu_prior)
+        pos_mask = predicate_signatures > 0
+        zero_mask = predicate_signatures == 0
+        neg_mask = predicate_signatures < 0
+        if pos_mask.any():
+            sigma_prior[pos_mask] = torch.empty_like(sigma_prior[pos_mask]).uniform_(
+                self.sigma_pos_init_low, self.sigma_pos_init_high
+            )
+        if zero_mask.any():
+            sigma_prior[zero_mask] = torch.empty_like(sigma_prior[zero_mask]).uniform_(
+                self.sigma_zero_init_low, self.sigma_zero_init_high
+            )
+        if neg_mask.any():
+            sigma_prior[neg_mask] = torch.empty_like(sigma_prior[neg_mask]).uniform_(
+                self.sigma_neg_init_low, self.sigma_neg_init_high
+            )
+        return mu_prior.float(), sigma_prior.float().clamp(min=self.sigma_min, max=self.sigma_max)
 
-    def _get_predicate_distribution(self):
-        count_mask = (self.predicate_count >= self.ema_min_count).float().unsqueeze(-1)
-        predicate_variance_ema = self.predicate_second_moment_ema - self.predicate_mean_ema.pow(2)
-        predicate_variance_ema = predicate_variance_ema.float().clamp(min=self.sigma_min ** 2, max=self.sigma_max ** 2)
-        predicate_mean = count_mask * self.predicate_mean_ema + (1.0 - count_mask) * self.predicate_text_mean
-        predicate_variance = count_mask * predicate_variance_ema + (1.0 - count_mask) * self.predicate_text_variance
-        predicate_mean = predicate_mean.float().clamp(min=0.0, max=1.0)
-        predicate_variance = predicate_variance.float().clamp(min=self.sigma_min ** 2, max=self.sigma_max ** 2)
-        return predicate_mean, predicate_variance
+    def _compute_topk_mask(self, primitive_activation):
+        topk = min(self.num_topk, primitive_activation.shape[-1])
+        if topk <= 0:
+            return torch.zeros_like(primitive_activation)
+        _, topk_indices = torch.topk(primitive_activation.abs(), topk, dim=-1)
+        topk_mask = torch.zeros_like(primitive_activation)
+        topk_mask.scatter_(1, topk_indices, 1.0)
+        return topk_mask
 
-    def _compute_gaussian_logits(self, visual_bank_activation):
-        predicate_mean, predicate_variance = self._get_predicate_distribution()
-        bank_delta = visual_bank_activation.float().unsqueeze(1) - predicate_mean.unsqueeze(0)
-        mahalanobis_distance = bank_delta.pow(2) / predicate_variance.unsqueeze(0)
-        return -0.5 * mahalanobis_distance.mean(dim=-1) / self.tau_cls
+    def _compute_visual_posterior(self):
+        sigma_post = self.second_moment_post - self.mu_post.pow(2)
+        sigma_post = sigma_post.float().clamp(min=self.sigma_min, max=self.sigma_max)
+        return self.mu_post.float(), sigma_post
 
-    def _compute_object_filter_logits(self, image_features, relation_indexes, subject_classes, object_classes):
-        subject_features = F.normalize(image_features[relation_indexes[:, 0], 0, :].float(), dim=-1)
-        object_features = F.normalize(image_features[relation_indexes[:, 1], 0, :].float(), dim=-1)
-        subject_filter_features = self.object_filter_text_features[subject_classes]
-        object_filter_features = self.object_filter_text_features[object_classes]
-        subject_logits = torch.bmm(subject_filter_features, subject_features.unsqueeze(-1)).squeeze(-1)
-        object_logits = torch.bmm(object_filter_features, object_features.unsqueeze(-1)).squeeze(-1)
-        object_filter_logits = (subject_logits + object_logits) / (2.0 * self.tau_bank)
-        object_filter_logits[:, 0] = 0.0
-        return object_filter_logits
+    def _apply_novel_transfer(self, mu_post, sigma_post):
+        if not self.use_novel_transfer:
+            return mu_post, sigma_post
 
-    def _update_predicate_ema(self, visual_bank_activation, relation_labels):
+        base_indices = torch.nonzero(self.base_predicate_mask, as_tuple=False).squeeze(1)
+        novel_indices = torch.nonzero(self.novel_predicate_mask, as_tuple=False).squeeze(1)
+        if base_indices.numel() == 0 or novel_indices.numel() == 0:
+            return mu_post, sigma_post
+
+        valid_base_mask = self.predicate_count[base_indices] > 0
+        if not valid_base_mask.any():
+            return mu_post, sigma_post
+
+        valid_base_indices = base_indices[valid_base_mask]
+        base_desc = self.predicate_description_features[valid_base_indices]
+        base_sig = F.normalize(self.predicate_signatures[valid_base_indices], dim=-1)
+        transferred_mu = mu_post.clone()
+        transferred_sigma = sigma_post.clone()
+
+        for novel_idx in novel_indices.tolist():
+            novel_desc = self.predicate_description_features[novel_idx].unsqueeze(0)
+            novel_sig = F.normalize(self.predicate_signatures[novel_idx].unsqueeze(0), dim=-1)
+            desc_similarity = (novel_desc @ base_desc.t()).squeeze(0)
+            signature_similarity = (novel_sig @ base_sig.t()).squeeze(0)
+            combined_similarity = desc_similarity + self.novel_signature_weight * signature_similarity
+
+            topk = min(self.novel_topk, valid_base_indices.numel())
+            topk_similarity, topk_pos = torch.topk(combined_similarity, topk, dim=0)
+            transfer_indices = valid_base_indices[topk_pos]
+            transfer_weights = F.softmax(topk_similarity / self.novel_tau, dim=0)
+
+            transfer_mu = torch.sum(transfer_weights.unsqueeze(-1) * mu_post[transfer_indices], dim=0)
+            transfer_second_moment = torch.sum(
+                transfer_weights.unsqueeze(-1) * (sigma_post[transfer_indices] + mu_post[transfer_indices].pow(2)),
+                dim=0,
+            )
+            transfer_sigma = (transfer_second_moment - transfer_mu.pow(2)).clamp(min=self.sigma_min, max=self.sigma_max)
+            transferred_mu[novel_idx] = transfer_mu
+            transferred_sigma[novel_idx] = transfer_sigma
+
+        return transferred_mu, transferred_sigma
+
+    def _get_predicate_distribution(self, use_transfer=False):
+        mu_post, sigma_post = self._compute_visual_posterior()
+        if use_transfer:
+            mu_post, sigma_post = self._apply_novel_transfer(mu_post, sigma_post)
+        mu = (1.0 - self.prior_posterior_alpha) * self.mu_prior + self.prior_posterior_alpha * mu_post
+        sigma = (1.0 - self.prior_posterior_alpha) * self.sigma_prior + self.prior_posterior_alpha * sigma_post
+        return mu.float(), sigma.float().clamp(min=self.sigma_min, max=self.sigma_max)
+
+    def _compute_gaussian_logits(self, primitive_activation, use_transfer=False):
+        predicate_mean, predicate_variance = self._get_predicate_distribution(use_transfer=use_transfer)
+        activation_delta = primitive_activation.float().unsqueeze(1) - predicate_mean.unsqueeze(0)
+        mahalanobis_distance = activation_delta.pow(2) / predicate_variance.unsqueeze(0)
+        return -0.5 * mahalanobis_distance.mean(dim=-1)
+
+    def _update_predicate_posterior(self, primitive_activation, relation_labels):
         if relation_labels is None:
             return
         with torch.no_grad():
             foreground_mask = relation_labels > 0
             if not foreground_mask.any():
                 return
-            foreground_activation = visual_bank_activation.detach()[foreground_mask].float()
+            foreground_activation = primitive_activation.detach()[foreground_mask].float()
             foreground_labels = relation_labels[foreground_mask].long() - 1
             for predicate_idx in foreground_labels.unique():
                 class_mask = foreground_labels == predicate_idx
@@ -897,14 +996,10 @@ class SemanticBankGaussianPredictor(nn.Module):
                 batch_mean = class_activation.mean(dim=0)
                 batch_second_moment = class_activation.pow(2).mean(dim=0)
                 idx = int(predicate_idx.item())
-                if self.predicate_count[idx] <= 0:
-                    self.predicate_mean_ema[idx].copy_(batch_mean)
-                    self.predicate_second_moment_ema[idx].copy_(batch_second_moment)
-                else:
-                    self.predicate_mean_ema[idx].mul_(self.ema_momentum).add_(batch_mean, alpha=1.0 - self.ema_momentum)
-                    self.predicate_second_moment_ema[idx].mul_(self.ema_momentum).add_(
-                        batch_second_moment, alpha=1.0 - self.ema_momentum
-                    )
+                self.mu_post[idx].mul_(self.ema_momentum).add_(batch_mean, alpha=1.0 - self.ema_momentum)
+                self.second_moment_post[idx].mul_(self.ema_momentum).add_(
+                    batch_second_moment, alpha=1.0 - self.ema_momentum
+                )
                 self.predicate_count[idx] += float(class_activation.shape[0])
 
     def _encode_clip_image_batch(self, pil_images, batch_size=128):
@@ -923,33 +1018,36 @@ class SemanticBankGaussianPredictor(nn.Module):
         crop_array = crop[0].permute(1, 2, 0).detach().cpu().numpy() * 255
         return Image.fromarray(np.uint8(crop_array))
 
-    def _maybe_print_debug(self, student_bank_activation, teacher_bank_activation, gaussian_logits):
+    def _maybe_print_debug(self, primitive_activation, topk_mask, gaussian_logits):
         if self.debug_interval <= 0:
             return
         self.debug_step += 1
         if int(self.debug_step.item()) % self.debug_interval != 0:
             return
-        _, predicate_variance = self._get_predicate_distribution()
+        mu_post, sigma_post = self._compute_visual_posterior()
         print(
-            "SemanticBank debug step {}: student {:.4f}/{:.4f}, teacher {:.4f}/{:.4f}, "
-            "gaussian {:.4f}/{:.4f}, count {:.2f}/{:.2f}, var {:.4f}/{:.4f}".format(
+            "PrimitiveGaussian debug step {}: act {:.4f}/{:.4f}, topk {:.2f}, gaussian {:.4f}/{:.4f}, "
+            "mu_prior {:.4f}/{:.4f}, mu_post {:.4f}/{:.4f}, sigma {:.4f}/{:.4f}, count {:.2f}/{:.2f}".format(
                 int(self.debug_step.item()),
-                float(student_bank_activation.float().mean().detach().cpu()),
-                float(student_bank_activation.float().std(unbiased=False).detach().cpu()),
-                float(teacher_bank_activation.float().mean().detach().cpu()),
-                float(teacher_bank_activation.float().std(unbiased=False).detach().cpu()),
+                float(primitive_activation.float().mean().detach().cpu()),
+                float(primitive_activation.float().std(unbiased=False).detach().cpu()),
+                float(topk_mask.float().sum(dim=-1).mean().detach().cpu()),
                 float(gaussian_logits.float().mean().detach().cpu()),
                 float(gaussian_logits.float().std(unbiased=False).detach().cpu()),
+                float(self.mu_prior.float().mean().detach().cpu()),
+                float(self.mu_prior.float().std(unbiased=False).detach().cpu()),
+                float(mu_post.float().mean().detach().cpu()),
+                float(mu_post.float().std(unbiased=False).detach().cpu()),
+                float(sigma_post.float().mean().detach().cpu()),
+                float(sigma_post.float().min().detach().cpu()),
                 float(self.predicate_count.float().mean().detach().cpu()),
                 float(self.predicate_count.float().min().detach().cpu()),
-                float(predicate_variance.float().mean().detach().cpu()),
-                float(predicate_variance.float().min().detach().cpu()),
             )
         )
 
     def updata(self, mode):
         if mode != self.active_mode:
-            print("SemanticBankGaussianPredictor is initialized for {} predicates; requested mode {} is ignored.".format(
+            print("SemanticBankGaussianPredictor primitive mode is initialized for {} predicates; requested mode {} is ignored.".format(
                 self.active_mode, mode
             ))
 
@@ -968,7 +1066,8 @@ class SemanticBankGaussianPredictor(nn.Module):
         obj_preds = obj_preds.split(num_objs, dim=0)
 
         rel_dists = []
-        clip_teacher_losses = []
+        proto_align_losses = []
+        topk_sparse_losses = []
 
         for image_idx in range(len(num_rels)):
             image = img[image_idx].unsqueeze(0)
@@ -1000,52 +1099,35 @@ class SemanticBankGaussianPredictor(nn.Module):
                     image_features[subject_box_indexes],
                     object_text_features
                 )
-                student_relation_features = F.normalize(
+                relation_features = F.normalize(
                     (subject_relation_features + object_relation_features) / 2.0, dim=-1
                 )
-                student_bank_activation = self._compute_bank_activation(student_relation_features)
-                foreground_logits = self._compute_gaussian_logits(student_bank_activation)
+                primitive_activation = self.primitive_activation_head(relation_features.float())
+                foreground_logits = self._compute_gaussian_logits(
+                    primitive_activation,
+                    use_transfer=(not self.training),
+                )
                 background_logit = self.background_classifier(
-                    student_relation_features.to(self.background_classifier.weight.dtype)
+                    relation_features.float()
                 ).float()
                 relation_logits = torch.cat([background_logit, foreground_logits], dim=-1)
-
-                object_filter_logits = self._compute_object_filter_logits(
-                    image_features, relation_indexes, subject_classes, object_classes
-                )
-                relation_logits = relation_logits + self.object_filter_weight * object_filter_logits
                 rel_dists.append(relation_logits)
 
                 if self.training:
-                    union_crops = [
-                        self._crop_to_pil(
-                            image,
-                            proposals[image_idx].bbox[int(subject_idx.item())],
-                            proposals[image_idx].bbox[int(object_idx.item())]
+                    topk_mask = self._compute_topk_mask(primitive_activation.float())
+                    topk_activation = primitive_activation.float() * topk_mask
+                    relation_labels = rel_labels[image_idx].to(self.device)
+                    foreground_mask = relation_labels > 0
+                    if foreground_mask.any():
+                        target_mu = self.mu_prior[relation_labels[foreground_mask].long() - 1]
+                        proto_align_losses.append(
+                            F.mse_loss(primitive_activation[foreground_mask].float(), target_mu.float())
                         )
-                        for subject_idx, object_idx in relation_indexes
-                    ]
-                    union_features = F.normalize(self._encode_clip_image_batch(union_crops), dim=-1)
-                    subobj_teacher_features = F.normalize(
-                        (image_features[subject_box_indexes, 0, :] + image_features[object_box_indexes, 0, :]).float() / 2.0,
-                        dim=-1
-                    )
-                    union_teacher_features = F.normalize(union_features[:, 0, :].float(), dim=-1)
-                    teacher_relation_features = F.normalize(
-                        self.union_teacher_weight * union_teacher_features
-                        + self.subobj_teacher_weight * subobj_teacher_features,
-                        dim=-1
-                    )
-                    teacher_bank_activation = self._compute_bank_activation(teacher_relation_features)
-                    clip_teacher_loss = F.mse_loss(
-                        student_bank_activation.float(),
-                        teacher_bank_activation.detach().float()
-                    )
-                    clip_teacher_losses.append(clip_teacher_loss)
-                    self._update_predicate_ema(student_bank_activation, rel_labels[image_idx].to(self.device))
+                    topk_sparse_losses.append(((primitive_activation.float() * (1.0 - topk_mask)) ** 2).mean())
+                    self._update_predicate_posterior(topk_activation, relation_labels)
                     self._maybe_print_debug(
-                        student_bank_activation,
-                        teacher_bank_activation,
+                        primitive_activation,
+                        topk_mask,
                         foreground_logits
                     )
 
@@ -1054,8 +1136,10 @@ class SemanticBankGaussianPredictor(nn.Module):
 
         add_losses = {}
         if self.training:
-            if clip_teacher_losses:
-                add_losses["loss_clip_teacher"] = self.loss_clip_teacher_weight * torch.stack(clip_teacher_losses).mean()
+            if proto_align_losses:
+                add_losses["loss_proto_align"] = self.loss_proto_align_weight * torch.stack(proto_align_losses).mean()
+            if topk_sparse_losses:
+                add_losses["loss_topk_sparse"] = self.loss_topk_sparse_weight * torch.stack(topk_sparse_losses).mean()
         return obj_dists, rel_dists, add_losses
 
 

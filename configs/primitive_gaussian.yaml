@@ -1,0 +1,26 @@
+settings:
+  w_source: llm_assignment
+  b_trainable: false
+  num_topk: 5
+  sigma_min: 0.08
+  sigma_max: 0.35
+  sigma_pos_init_low: 0.08
+  sigma_pos_init_high: 0.15
+  sigma_zero_init_low: 0.18
+  sigma_zero_init_high: 0.30
+  sigma_neg_init_low: 0.08
+  sigma_neg_init_high: 0.15
+  prior_posterior_alpha: 0.3
+  ema_momentum: 0.95
+  loss_proto_align_weight: 0.10
+  loss_topk_sparse_weight: 0.02
+  use_novel_transfer: true
+  novel_topk: 3
+  novel_tau: 0.20
+  novel_signature_weight: 0.5
+  debug_interval: 100
+
+resources:
+  primitive_prototypes_csv: "maskrcnn_benchmark/modeling/roi_heads/relation_head/primitive_prototypes.csv"
+  predicate_descriptions_csv: "maskrcnn_benchmark/modeling/roi_heads/relation_head/predicate_descriptions.csv"
+  predicate_signatures_csv: "maskrcnn_benchmark/modeling/roi_heads/relation_head/predicate_primitive_signatures.csv"

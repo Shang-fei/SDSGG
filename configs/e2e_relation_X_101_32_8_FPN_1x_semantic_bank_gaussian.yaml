@@ -70,18 +70,27 @@ MODEL:
     PREDICTOR: "SemanticBankGaussianPredictor"
     CONTEXT_OBJ_LAYER: 1
     CONTEXT_REL_LAYER: 1
-    SEMANTIC_BANK:
-      CONFIG_PATH: "configs/semantic_bank_gaussian.yaml"
-      TAU_BANK: 0.07
-      TAU_CLS: 1.0
-      SIGMA_MIN: 0.15
-      SIGMA_MAX: 0.45
-      OBJECT_FILTER_WEIGHT: 0.05
+    PRIMITIVE_BANK:
+      CONFIG_PATH: "configs/primitive_gaussian.yaml"
+      W_SOURCE: "llm_assignment"
+      B_TRAINABLE: False
+      NUM_TOPK: 5
+      SIGMA_MIN: 0.08
+      SIGMA_MAX: 0.35
+      SIGMA_POS_INIT_LOW: 0.08
+      SIGMA_POS_INIT_HIGH: 0.15
+      SIGMA_ZERO_INIT_LOW: 0.18
+      SIGMA_ZERO_INIT_HIGH: 0.30
+      SIGMA_NEG_INIT_LOW: 0.08
+      SIGMA_NEG_INIT_HIGH: 0.15
+      PRIOR_POSTERIOR_ALPHA: 0.3
       EMA_MOMENTUM: 0.95
-      EMA_MIN_COUNT: 8
-      LOSS_CLIP_TEACHER_WEIGHT: 0.005
-      UNION_TEACHER_WEIGHT: 1.0
-      SUBOBJ_TEACHER_WEIGHT: 0.5
+      LOSS_PROTO_ALIGN_WEIGHT: 0.10
+      LOSS_TOPK_SPARSE_WEIGHT: 0.02
+      USE_NOVEL_TRANSFER: True
+      NOVEL_TOPK: 3
+      NOVEL_TAU: 0.20
+      NOVEL_SIGNATURE_WEIGHT: 0.5
       DEBUG_INTERVAL: 100
     CAUSAL:
       EFFECT_TYPE: 'none'
