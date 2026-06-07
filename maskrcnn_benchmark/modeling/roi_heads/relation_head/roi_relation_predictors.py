@@ -738,17 +738,8 @@ class SemanticBankGaussianPredictor(nn.Module):
         primitive_settings = primitive_config.get("settings", {})
 
         self.w_source = str(self._cfg_value(primitive_cfg, primitive_settings, "W_SOURCE", "w_source", "text_similarity"))
-        self.text_recon_steps = int(self._cfg_value(
-            primitive_cfg, primitive_settings, "TEXT_RECON_STEPS", "text_recon_steps", 300
-        ))
-        self.text_recon_lr = float(self._cfg_value(
-            primitive_cfg, primitive_settings, "TEXT_RECON_LR", "text_recon_lr", 0.05
-        ))
-        self.text_recon_tau = float(self._cfg_value(
-            primitive_cfg, primitive_settings, "TEXT_RECON_TAU", "text_recon_tau", 0.20
-        ))
-        self.text_recon_debug_interval = int(self._cfg_value(
-            primitive_cfg, primitive_settings, "TEXT_RECON_DEBUG_INTERVAL", "text_recon_debug_interval", 50
+        self.text_similarity_tau = float(self._cfg_value(
+            primitive_cfg, primitive_settings, "TEXT_SIMILARITY_TAU", "text_similarity_tau", 0.20
         ))
         self.text_similarity_topk = int(self._cfg_value(
             primitive_cfg, primitive_settings, "TEXT_SIMILARITY_TOPK", "text_similarity_topk", 5
@@ -756,61 +747,15 @@ class SemanticBankGaussianPredictor(nn.Module):
         self.text_similarity_threshold = float(self._cfg_value(
             primitive_cfg, primitive_settings, "TEXT_SIMILARITY_THRESHOLD", "text_similarity_threshold", -1.0
         ))
-        self.text_recon_weight = float(self._cfg_value(
-            primitive_cfg, primitive_settings, "TEXT_RECON_WEIGHT", "text_recon_weight", 1.0
-        ))
-        self.text_sparse_weight = float(self._cfg_value(
-            primitive_cfg, primitive_settings, "TEXT_SPARSE_WEIGHT", "text_sparse_weight", 0.02
-        ))
-        self.text_orth_weight = float(self._cfg_value(
-            primitive_cfg, primitive_settings, "TEXT_ORTH_WEIGHT", "text_orth_weight", 0.05
-        ))
-        self.b_trainable_text_stage = bool(self._cfg_value(
-            primitive_cfg, primitive_settings, "B_TRAINABLE_TEXT_STAGE", "b_trainable_text_stage", True
-        ))
-        self.b_trainable_visual_stage = bool(self._cfg_value(
-            primitive_cfg, primitive_settings, "B_TRAINABLE_VISUAL_STAGE", "b_trainable_visual_stage", False
-        ))
-        self.sigma_min = float(self._cfg_value(primitive_cfg, primitive_settings, "SIGMA_MIN", "sigma_min", 0.05))
-        self.sigma_max = float(self._cfg_value(primitive_cfg, primitive_settings, "SIGMA_MAX", "sigma_max", 0.30))
-        self.visual_align_weight = float(self._cfg_value(
-            primitive_cfg, primitive_settings, "VISUAL_ALIGN_WEIGHT", "visual_align_weight", 0.10
-        ))
-        self.origin_reg_weight = float(self._cfg_value(
-            primitive_cfg, primitive_settings, "ORIGIN_REG_WEIGHT", "origin_reg_weight", 0.02
-        ))
-        self.visual_sparse_weight = float(self._cfg_value(
-            primitive_cfg, primitive_settings, "VISUAL_SPARSE_WEIGHT", "visual_sparse_weight", 0.001
-        ))
         self.visual_activation_tau = float(self._cfg_value(
             primitive_cfg, primitive_settings, "VISUAL_ACTIVATION_TAU", "visual_activation_tau", 0.20
-        ))
-        self.origin_activation_tau = float(self._cfg_value(
-            primitive_cfg, primitive_settings, "ORIGIN_ACTIVATION_TAU", "origin_activation_tau", 0.20
         ))
         self.composition_logit_scale = float(self._cfg_value(
             primitive_cfg, primitive_settings, "COMPOSITION_LOGIT_SCALE", "composition_logit_scale", 10.0
         ))
-        self.object_filter_weight = float(self._cfg_value(
-            primitive_cfg, primitive_settings, "OBJECT_FILTER_WEIGHT", "object_filter_weight", 0.05
+        self.foreground_only_loss = bool(self._cfg_value(
+            primitive_cfg, primitive_settings, "FOREGROUND_ONLY_LOSS", "foreground_only_loss", True
         ))
-        self.use_object_filter = bool(self._cfg_value(
-            primitive_cfg, primitive_settings, "USE_OBJECT_FILTER", "use_object_filter", True
-        ))
-        self.use_log_variance = bool(self._cfg_value(
-            primitive_cfg, primitive_settings, "USE_LOG_VARIANCE", "use_log_variance", False
-        ))
-        self.use_composition_logits = bool(self._cfg_value(
-            primitive_cfg, primitive_settings, "USE_COMPOSITION_LOGITS", "use_composition_logits", False
-        ))
-        self.use_visual_variance_in_logits = bool(self._cfg_value(
-            primitive_cfg, primitive_settings, "USE_VISUAL_VARIANCE_IN_LOGITS", "use_visual_variance_in_logits", False
-        ))
-        self.use_novel_variance_transfer = bool(self._cfg_value(
-            primitive_cfg, primitive_settings, "USE_NOVEL_VARIANCE_TRANSFER", "use_novel_variance_transfer", False
-        ))
-        self.novel_topk = int(self._cfg_value(primitive_cfg, primitive_settings, "NOVEL_TOPK", "novel_topk", 3))
-        self.novel_tau = float(self._cfg_value(primitive_cfg, primitive_settings, "NOVEL_TAU", "novel_tau", 0.2))
         self.debug_interval = int(self._cfg_value(
             primitive_cfg, primitive_settings, "DEBUG_INTERVAL", "debug_interval", 100
         ))
@@ -849,22 +794,12 @@ class SemanticBankGaussianPredictor(nn.Module):
             primitive_basis_init,
         )
 
-        if self.b_trainable_visual_stage:
-            self.primitive_basis = nn.Parameter(primitive_basis.clone())
-        else:
-            self.register_buffer("primitive_basis", primitive_basis.clone())
+        self.register_buffer("primitive_basis", primitive_basis.clone())
 
         self.num_primitives = primitive_basis.shape[0]
         predicate_entropy = self._compute_weight_entropy(predicate_weights)
-        predicate_variance = self.sigma_min + (self.sigma_max - self.sigma_min) * predicate_entropy.unsqueeze(-1)
-        predicate_variance = predicate_variance.expand_as(predicate_weights).contiguous()
         self.register_buffer("predicate_primitive_weights", predicate_weights.float())
-        self.register_buffer("predicate_variance", predicate_variance.float())
         self.register_buffer("predicate_entropy", predicate_entropy.float())
-        self.register_buffer("predicate_description_features", predicate_description_features.float())
-        self.register_buffer("text_recon_loss", text_losses["recon"].detach().float())
-        self.register_buffer("text_sparse_loss", text_losses["sparse"].detach().float())
-        self.register_buffer("text_orth_loss", text_losses["orth"].detach().float())
         self.register_buffer("visual_mean_stat", torch.zeros_like(predicate_weights.float()))
         self.register_buffer("visual_second_moment_stat", torch.zeros_like(predicate_weights.float()))
         self.register_buffer("predicate_count", torch.zeros(self.num_active_predicates - 1, dtype=torch.float32))
@@ -876,36 +811,17 @@ class SemanticBankGaussianPredictor(nn.Module):
         object_role_prompts = ["a photo of object {}".format(obj_name) for obj_name in self.obj_names]
         self.register_buffer("subject_role_text_features", self._encode_text_features(subject_role_prompts).float())
         self.register_buffer("object_role_text_features", self._encode_text_features(object_role_prompts).float())
-        self.register_buffer(
-            "base_predicate_mask",
-            torch.tensor([predicate_name in set(config.OV_SETTING.PRDCS_BASE) for predicate_name in self.foreground_predicate_names],
-                         dtype=torch.bool),
-        )
-        self.register_buffer(
-            "novel_predicate_mask",
-            torch.tensor([predicate_name in set(config.OV_SETTING.PRDCS_NOVEL) for predicate_name in self.foreground_predicate_names],
-                         dtype=torch.bool),
-        )
-        if self.use_object_filter:
-            object_filter_text_features = self._build_object_filter_text_features(resources)
-        else:
-            object_filter_text_features = torch.empty(
-                0,
-                len(self.foreground_predicate_names),
-                primitive_basis.shape[-1],
-                device=self.device,
-                dtype=torch.float32,
-            )
-        self.register_buffer("object_filter_text_features", object_filter_text_features.float())
         print(
-            "SemanticBankGaussianPredictor frozen W0 mode: {} primitives, {} predicates, w_source={}, "
-            "text semantic recovery/sparse/orth={:.4f}/{:.4f}/{:.4f}".format(
+            "SemanticBankGaussianPredictor primitive-query mode: {} primitives, {} predicates, "
+            "w_source={}, text_tau={}, topk={}, visual_tau={}, scale={}, foreground_only_loss={}".format(
                 self.num_primitives,
                 self.num_active_predicates,
                 self.w_source,
-                float(self.text_recon_loss.cpu()),
-                float(self.text_sparse_loss.cpu()),
-                float(self.text_orth_loss.cpu()),
+                self.text_similarity_tau,
+                self.text_similarity_topk,
+                self.visual_activation_tau,
+                self.composition_logit_scale,
+                self.foreground_only_loss,
             )
         )
 
@@ -977,16 +893,13 @@ class SemanticBankGaussianPredictor(nn.Module):
         return primitive_names, primitive_prompts, predicate_descriptions
 
     def _build_text_anchor(self, predicate_features, primitive_basis_init):
-        if self.w_source == "reconstruction":
-            return self._reconstruct_predicate_weights(predicate_features, primitive_basis_init)
         if self.w_source == "text_similarity":
             similarity = predicate_features.float() @ primitive_basis_init.float().t()
             weights = self._compute_sparse_similarity_weights(similarity)
             losses = self._compute_text_anchor_losses(predicate_features, primitive_basis_init, weights)
-            self._print_text_recon_summary(losses, weights)
+            self._print_text_similarity_summary(losses, weights)
             return weights.detach(), primitive_basis_init.detach(), losses
-        else:
-            raise ValueError("Unsupported W_SOURCE: {}".format(self.w_source))
+        raise ValueError("Primitive-query minimal predictor only supports W_SOURCE=text_similarity.")
 
     def _compute_sparse_similarity_weights(self, similarity):
         mask = torch.ones_like(similarity, dtype=torch.bool)
@@ -1002,67 +915,9 @@ class SemanticBankGaussianPredictor(nn.Module):
             mask[empty_mask] = False
             mask[empty_mask].scatter_(1, fallback_indices, True)
         masked_similarity = similarity.masked_fill(~mask, -1e4)
-        return F.softmax(masked_similarity / max(self.text_recon_tau, 1e-6), dim=-1)
+        return F.softmax(masked_similarity / max(self.text_similarity_tau, 1e-6), dim=-1)
 
-    def _reconstruct_predicate_weights(self, predicate_features, primitive_basis_init):
-        predicate_features = predicate_features.detach().float()
-        primitive_basis_init = primitive_basis_init.detach().float()
-        init_similarity = predicate_features @ primitive_basis_init.t()
-        weight_logits = nn.Parameter(init_similarity.clone())
-        if self.b_trainable_text_stage:
-            primitive_basis_param = nn.Parameter(primitive_basis_init.clone())
-            optim_params = [weight_logits, primitive_basis_param]
-        else:
-            primitive_basis_param = primitive_basis_init
-            optim_params = [weight_logits]
-
-        optimizer = torch.optim.Adam(optim_params, lr=self.text_recon_lr)
-        steps = max(self.text_recon_steps, 0)
-        losses = None
-        for step_idx in range(steps):
-            weights = F.softmax(weight_logits / max(self.text_recon_tau, 1e-6), dim=-1)
-            losses = self._compute_text_anchor_losses(predicate_features, primitive_basis_param, weights)
-            loss = (
-                self.text_recon_weight * losses["recon"]
-                + self.text_sparse_weight * losses["sparse"]
-                + self.text_orth_weight * losses["orth"]
-            )
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            self._maybe_print_text_recon_debug(step_idx + 1, steps, loss, losses, weights)
-
-        weights = F.softmax(weight_logits / max(self.text_recon_tau, 1e-6), dim=-1).detach()
-        primitive_basis = F.normalize(primitive_basis_param.detach().float(), dim=-1)
-        losses = self._compute_text_anchor_losses(predicate_features, primitive_basis, weights)
-        self._print_text_recon_summary(losses, weights)
-        return weights.float(), primitive_basis.float(), losses
-
-    def _maybe_print_text_recon_debug(self, step_idx, total_steps, loss, losses, weights):
-        if self.text_recon_debug_interval <= 0:
-            return
-        if step_idx != 1 and step_idx != total_steps and step_idx % self.text_recon_debug_interval != 0:
-            return
-        with torch.no_grad():
-            entropy = self._compute_weight_entropy(weights.float())
-            max_weight = weights.float().max(dim=-1)[0]
-            print(
-                "TextRecon step {}/{}: loss {:.4f}, recon {:.4f}, sparse {:.4f}, orth {:.4f}, "
-                "W_entropy {:.4f}/{:.4f}, W_max {:.4f}/{:.4f}".format(
-                    step_idx,
-                    total_steps,
-                    float(loss.detach().cpu()),
-                    float(losses["recon"].detach().cpu()),
-                    float(losses["sparse"].detach().cpu()),
-                    float(losses["orth"].detach().cpu()),
-                    float(entropy.mean().detach().cpu()),
-                    float(entropy.std(unbiased=False).detach().cpu()),
-                    float(max_weight.mean().detach().cpu()),
-                    float(max_weight.max().detach().cpu()),
-                )
-            )
-
-    def _print_text_recon_summary(self, losses, weights):
+    def _print_text_similarity_summary(self, losses, weights):
         with torch.no_grad():
             entropy = self._compute_weight_entropy(weights.float())
             max_weight = weights.float().max(dim=-1)[0]
@@ -1119,33 +974,6 @@ class SemanticBankGaussianPredictor(nn.Module):
         visual_variance = (visual_second - visual_mean.pow(2)).clamp(min=0.0)
         return visual_mean, visual_variance
 
-    def _get_predicate_distribution(self):
-        predicate_mean = self.predicate_primitive_weights.float()
-        predicate_variance = self.predicate_variance.float()
-        if self.use_novel_variance_transfer:
-            predicate_variance = self._transfer_novel_variance(predicate_variance)
-        return predicate_mean, predicate_variance.clamp(min=self.sigma_min, max=self.sigma_max)
-
-    def _transfer_novel_variance(self, predicate_variance):
-        base_indices = torch.nonzero(self.base_predicate_mask, as_tuple=False).squeeze(1)
-        novel_indices = torch.nonzero(self.novel_predicate_mask, as_tuple=False).squeeze(1)
-        if base_indices.numel() == 0 or novel_indices.numel() == 0:
-            return predicate_variance
-        transferred_variance = predicate_variance.clone()
-        normalized_weights = F.normalize(self.predicate_primitive_weights.float(), dim=-1)
-        base_weights = normalized_weights[base_indices]
-        for novel_idx in novel_indices.tolist():
-            similarity = normalized_weights[novel_idx].unsqueeze(0) @ base_weights.t()
-            topk = min(self.novel_topk, base_indices.numel())
-            topk_similarity, topk_pos = torch.topk(similarity.squeeze(0), topk, dim=0)
-            transfer_indices = base_indices[topk_pos]
-            transfer_weights = F.softmax(topk_similarity / max(self.novel_tau, 1e-6), dim=0)
-            transferred_variance[novel_idx] = torch.sum(
-                transfer_weights.unsqueeze(-1) * predicate_variance[transfer_indices],
-                dim=0,
-            )
-        return transferred_variance
-
     def _compute_composition_logits(self, primitive_activation):
         return self.composition_logit_scale * (
             primitive_activation.float() @ self.predicate_primitive_weights.float().t()
@@ -1188,67 +1016,6 @@ class SemanticBankGaussianPredictor(nn.Module):
         if clip_features.dim() == 3:
             return clip_features[:, 0, :]
         return clip_features
-
-    def _compute_origin_activation(self, raw_relation_features):
-        raw_relation_features = self._pool_clip_features(raw_relation_features)
-        primitive_basis = F.normalize(self.primitive_basis.float(), dim=-1)
-        origin_similarity = raw_relation_features.float() @ primitive_basis.t()
-        return F.softmax(origin_similarity / max(self.origin_activation_tau, 1e-6), dim=-1)
-
-    def _build_object_filter_text_features(self, resources):
-        if "object_filter_csv" not in resources:
-            return torch.zeros(
-                len(self.obj_names), len(self.foreground_predicate_names), self.primitive_basis.shape[-1],
-                device=self.device,
-                dtype=torch.float32,
-            )
-        filter_csv = pd.read_csv(self._resolve_resource_path(resources["object_filter_csv"])).fillna("__background__")
-        object_columns = list(filter_csv.columns[1:])
-        predicate_to_row = {}
-        for row_idx in range(len(filter_csv)):
-            if row_idx < len(self.predicate_names):
-                predicate_to_row[self.predicate_names[row_idx]] = row_idx
-        id_dict = {
-            "__background__": 0, "above": 1, "across": 2, "against": 3, "along": 4, "and": 5, "at": 6,
-            "attached to": 7, "behind": 8, "belonging to": 9, "between": 10, "carrying": 11,
-            "covered in": 12, "covering": 13, "eating": 14, "flying in": 15, "for": 16, "from": 17,
-            "growing on": 18, "hanging from": 19, "has": 20, "holding": 21, "in": 22, "in front of": 23,
-            "laying on": 24, "looking at": 25, "lying on": 26, "made of": 27, "mounted on": 28, "near": 29,
-            "of": 30, "on": 31, "on back of": 32, "over": 33, "painted on": 34, "parked on": 35,
-            "part of": 36, "playing": 37, "riding": 38, "says": 39, "sitting on": 40, "standing on": 41,
-            "to": 42, "under": 43, "using": 44, "walking in": 45, "walking on": 46, "watching": 47,
-            "wearing": 48, "wears": 49, "with": 50,
-        }
-        prompts = []
-        for obj_name in self.obj_names:
-            column_name = obj_name if obj_name in object_columns else "__background__"
-            for predicate_name in self.foreground_predicate_names:
-                row_idx = id_dict.get(predicate_name, predicate_to_row.get(predicate_name, 0))
-                filter_text = str(filter_csv.iloc[row_idx][column_name]).strip()
-                prompts.append("a photo of {}".format(filter_text if filter_text else "__background__"))
-        object_filter_features = self._encode_text_features(prompts, batch_size=256)
-        return object_filter_features.view(
-            len(self.obj_names),
-            len(self.foreground_predicate_names),
-            -1,
-        )
-
-    def _compute_object_filter_logits(self, subject_features, object_features, object_classes):
-        if not self.use_object_filter or self.object_filter_weight == 0.0:
-            return None
-        subject_features = self._pool_clip_features(subject_features)
-        object_features = self._pool_clip_features(object_features)
-        text_features = self.object_filter_text_features[object_classes].to(subject_features.dtype)
-        if text_features.shape[-1] != subject_features.shape[-1]:
-            raise ValueError(
-                "Object filter feature dim mismatch: text dim {} vs image dim {}.".format(
-                    text_features.shape[-1],
-                    subject_features.shape[-1],
-                )
-            )
-        subject_similarity = torch.bmm(text_features, subject_features.unsqueeze(-1)).squeeze(-1)
-        object_similarity = torch.bmm(text_features, object_features.unsqueeze(-1)).squeeze(-1)
-        return (subject_similarity + object_similarity).float() * 0.5
 
     def _maybe_print_debug(self, primitive_activation, primitive_logits, relation_scores):
         if self.debug_interval <= 0:
@@ -1312,7 +1079,7 @@ class SemanticBankGaussianPredictor(nn.Module):
 
     def updata(self, mode):
         if mode != self.active_mode:
-            print("SemanticBankGaussianPredictor frozen W0 mode is initialized for {} predicates; requested mode {} is ignored.".format(
+            print("SemanticBankGaussianPredictor primitive-query mode is initialized for {} predicates; requested mode {} is ignored.".format(
                 self.active_mode, mode
             ))
 

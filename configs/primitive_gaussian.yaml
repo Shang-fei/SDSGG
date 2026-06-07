@@ -1,35 +1,13 @@
 settings:
   w_source: text_similarity
-  text_recon_steps: 0
-  text_recon_lr: 0.05
-  text_recon_tau: 0.20
-  text_recon_debug_interval: 50
+  text_similarity_tau: 0.20
   text_similarity_topk: 3
   text_similarity_threshold: -1.0
-  text_recon_weight: 1.0
-  text_sparse_weight: 0.02
-  text_orth_weight: 0.05
-  b_trainable_text_stage: true
-  b_trainable_visual_stage: false
-  sigma_min: 0.05
-  sigma_max: 0.30
-  visual_align_weight: 0.0
-  origin_reg_weight: 0.0
-  visual_sparse_weight: 0.0
   visual_activation_tau: 1.0
-  origin_activation_tau: 0.20
   composition_logit_scale: 10.0
-  object_filter_weight: 0.0
-  use_object_filter: false
-  use_log_variance: false
-  use_composition_logits: false
-  use_visual_variance_in_logits: false
-  use_novel_variance_transfer: false
-  novel_topk: 3
-  novel_tau: 0.20
+  foreground_only_loss: true
   debug_interval: 100
 
 resources:
   primitive_prototypes_csv: "maskrcnn_benchmark/modeling/roi_heads/relation_head/primitive_prototypes.csv"
   predicate_descriptions_csv: "maskrcnn_benchmark/modeling/roi_heads/relation_head/predicate_descriptions.csv"
-  object_filter_csv: "maskrcnn_benchmark/modeling/roi_heads/relation_head/filter_total.csv"

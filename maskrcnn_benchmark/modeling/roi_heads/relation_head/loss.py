@@ -37,7 +37,8 @@ class RelationLossComputation(object):
         use_label_smoothing,
         predicate_proportion,
         device,
-        predictor_name
+        predictor_name,
+        foreground_only_loss=False,
     ):
         """
         Arguments:
@@ -51,6 +52,7 @@ class RelationLossComputation(object):
         self.attribute_bgfg_ratio = attribute_bgfg_ratio
         self.use_label_smoothing = use_label_smoothing
         self.predictor_name = predictor_name
+        self.foreground_only_loss = foreground_only_loss
         self.pred_weight = (1.0 / torch.FloatTensor([0.5,] + predicate_proportion)).cuda()
 
         if self.use_label_smoothing:
@@ -94,7 +96,16 @@ class RelationLossComputation(object):
         fg_labels = cat([proposal.get_field("labels") for proposal in proposals], dim=0)
         rel_labels = cat(rel_labels, dim=0)
         
-        if self.predictor_name == "SemanticBankGaussianPredictor":
+        if self.predictor_name == "SemanticBankGaussianPredictor" and self.foreground_only_loss:
+            foreground_mask = rel_labels > 0
+            if foreground_mask.any():
+                loss_relation = self.relation_criterion_loss(
+                    relation_logits[foreground_mask, 1:],
+                    rel_labels[foreground_mask].long() - 1,
+                )
+            else:
+                loss_relation = relation_logits.sum() * 0.0
+        elif self.predictor_name == "SemanticBankGaussianPredictor":
             loss_relation = self.relation_criterion_loss(relation_logits, rel_labels.long())
         else:
             loss_relation = self.loss(relation_logits, rel_labels.long())
@@ -262,7 +273,8 @@ def make_roi_relation_loss_evaluator(cfg):
         cfg.MODEL.ROI_RELATION_HEAD.LABEL_SMOOTHING_LOSS,
         cfg.MODEL.ROI_RELATION_HEAD.REL_PROP,
         cfg.MODEL.DEVICE,
-        cfg.MODEL.ROI_RELATION_HEAD.PREDICTOR
+        cfg.MODEL.ROI_RELATION_HEAD.PREDICTOR,
+        cfg.MODEL.ROI_RELATION_HEAD.PRIMITIVE_BANK.FOREGROUND_ONLY_LOSS
     )
 
     return loss_evaluator
