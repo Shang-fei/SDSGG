@@ -1,6 +1,6 @@
 settings:
-  w_source: reconstruction
-  text_recon_steps: 300
+  w_source: text_similarity
+  text_recon_steps: 0
   text_recon_lr: 0.05
   text_recon_tau: 0.20
   text_recon_debug_interval: 50
@@ -11,13 +11,13 @@ settings:
   b_trainable_visual_stage: false
   sigma_min: 0.05
   sigma_max: 0.30
-  visual_align_weight: 0.10
-  origin_reg_weight: 0.02
-  visual_sparse_weight: 0.001
+  visual_align_weight: 0.0
+  origin_reg_weight: 0.0
+  visual_sparse_weight: 0.0
   visual_activation_tau: 0.20
   origin_activation_tau: 0.20
-  object_filter_weight: 0.05
-  use_object_filter: true
+  object_filter_weight: 0.0
+  use_object_filter: false
   use_log_variance: false
   use_composition_logits: false
   use_visual_variance_in_logits: false
