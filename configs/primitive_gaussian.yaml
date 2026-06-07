@@ -4,6 +4,8 @@ settings:
   text_recon_lr: 0.05
   text_recon_tau: 0.20
   text_recon_debug_interval: 50
+  text_similarity_topk: 5
+  text_similarity_threshold: -1.0
   text_recon_weight: 1.0
   text_sparse_weight: 0.02
   text_orth_weight: 0.05
@@ -16,6 +18,7 @@ settings:
   visual_sparse_weight: 0.0
   visual_activation_tau: 0.20
   origin_activation_tau: 0.20
+  composition_logit_scale: 10.0
   object_filter_weight: 0.0
   use_object_filter: false
   use_log_variance: false

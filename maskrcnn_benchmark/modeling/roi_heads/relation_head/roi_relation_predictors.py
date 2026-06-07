@@ -747,6 +747,12 @@ class SemanticBankGaussianPredictor(nn.Module):
         self.text_recon_debug_interval = int(self._cfg_value(
             primitive_cfg, primitive_settings, "TEXT_RECON_DEBUG_INTERVAL", "text_recon_debug_interval", 50
         ))
+        self.text_similarity_topk = int(self._cfg_value(
+            primitive_cfg, primitive_settings, "TEXT_SIMILARITY_TOPK", "text_similarity_topk", 5
+        ))
+        self.text_similarity_threshold = float(self._cfg_value(
+            primitive_cfg, primitive_settings, "TEXT_SIMILARITY_THRESHOLD", "text_similarity_threshold", -1.0
+        ))
         self.text_recon_weight = float(self._cfg_value(
             primitive_cfg, primitive_settings, "TEXT_RECON_WEIGHT", "text_recon_weight", 1.0
         ))
@@ -778,6 +784,9 @@ class SemanticBankGaussianPredictor(nn.Module):
         ))
         self.origin_activation_tau = float(self._cfg_value(
             primitive_cfg, primitive_settings, "ORIGIN_ACTIVATION_TAU", "origin_activation_tau", 0.20
+        ))
+        self.composition_logit_scale = float(self._cfg_value(
+            primitive_cfg, primitive_settings, "COMPOSITION_LOGIT_SCALE", "composition_logit_scale", 10.0
         ))
         self.object_filter_weight = float(self._cfg_value(
             primitive_cfg, primitive_settings, "OBJECT_FILTER_WEIGHT", "object_filter_weight", 0.05
@@ -969,12 +978,28 @@ class SemanticBankGaussianPredictor(nn.Module):
             return self._reconstruct_predicate_weights(predicate_features, primitive_basis_init)
         if self.w_source == "text_similarity":
             similarity = predicate_features.float() @ primitive_basis_init.float().t()
-            weights = F.softmax(similarity / max(self.text_recon_tau, 1e-6), dim=-1)
+            weights = self._compute_sparse_similarity_weights(similarity)
             losses = self._compute_text_anchor_losses(predicate_features, primitive_basis_init, weights)
             self._print_text_recon_summary(losses, weights)
             return weights.detach(), primitive_basis_init.detach(), losses
         else:
             raise ValueError("Unsupported W_SOURCE: {}".format(self.w_source))
+
+    def _compute_sparse_similarity_weights(self, similarity):
+        mask = torch.ones_like(similarity, dtype=torch.bool)
+        if self.text_similarity_topk > 0 and self.text_similarity_topk < similarity.shape[-1]:
+            _, topk_indices = torch.topk(similarity, self.text_similarity_topk, dim=-1)
+            mask = torch.zeros_like(similarity, dtype=torch.bool)
+            mask.scatter_(1, topk_indices, True)
+        if self.text_similarity_threshold > -1.0:
+            mask = mask & (similarity >= self.text_similarity_threshold)
+        empty_mask = ~mask.any(dim=-1)
+        if empty_mask.any():
+            fallback_indices = similarity[empty_mask].argmax(dim=-1, keepdim=True)
+            mask[empty_mask] = False
+            mask[empty_mask].scatter_(1, fallback_indices, True)
+        masked_similarity = similarity.masked_fill(~mask, -1e4)
+        return F.softmax(masked_similarity / max(self.text_recon_tau, 1e-6), dim=-1)
 
     def _reconstruct_predicate_weights(self, predicate_features, primitive_basis_init):
         predicate_features = predicate_features.detach().float()
@@ -1038,11 +1063,13 @@ class SemanticBankGaussianPredictor(nn.Module):
         with torch.no_grad():
             entropy = self._compute_weight_entropy(weights.float())
             max_weight = weights.float().max(dim=-1)[0]
+            active_count = (weights.float() > 1e-6).float().sum(dim=-1)
             semantic_recovery = 1.0 - losses["recon"]
             print(
                 "TextSemantic final: recovery {:.4f}, recovery_min {:.4f}, recovery_max {:.4f}, "
                 "recovery_mean {:.4f}, recovery_std {:.4f}, W_min {:.4f}, W_max_global {:.4f}, "
-                "W_mean {:.4f}, W_entropy {:.4f}/{:.4f}, W_max {:.4f}/{:.4f}, orth {:.4f}".format(
+                "W_mean {:.4f}, W_active {:.2f}/{:.2f}/{:.2f}, W_entropy {:.4f}/{:.4f}, "
+                "W_max {:.4f}/{:.4f}, orth {:.4f}".format(
                     float(semantic_recovery.mean().detach().cpu()) if semantic_recovery.dim() > 0 else float(semantic_recovery.detach().cpu()),
                     float(losses["recovery_per_predicate"].min().detach().cpu()),
                     float(losses["recovery_per_predicate"].max().detach().cpu()),
@@ -1051,6 +1078,9 @@ class SemanticBankGaussianPredictor(nn.Module):
                     float(weights.float().min().detach().cpu()),
                     float(weights.float().max().detach().cpu()),
                     float(weights.float().mean().detach().cpu()),
+                    float(active_count.mean().detach().cpu()),
+                    float(active_count.min().detach().cpu()),
+                    float(active_count.max().detach().cpu()),
                     float(entropy.mean().detach().cpu()),
                     float(entropy.std(unbiased=False).detach().cpu()),
                     float(max_weight.mean().detach().cpu()),
@@ -1114,7 +1144,9 @@ class SemanticBankGaussianPredictor(nn.Module):
         return transferred_variance
 
     def _compute_composition_logits(self, primitive_activation):
-        return primitive_activation.float() @ self.predicate_primitive_weights.float().t()
+        return self.composition_logit_scale * (
+            primitive_activation.float() @ self.predicate_primitive_weights.float().t()
+        )
 
     def _update_visual_statistics(self, primitive_activation, relation_labels):
         if relation_labels is None:
@@ -1234,7 +1266,7 @@ class SemanticBankGaussianPredictor(nn.Module):
         print(
             "PrimitiveQuery debug step {}: W_entropy {:.4f}/{:.4f}, a_vis {:.4f}/{:.4f}/{:.4f}/{:.4f}, "
             "score {:.4f}/{:.4f}/{:.4f}/{:.4f}, visual_var {:.4f}/{:.4f}, count {:.2f}/{:.2f}, "
-            "tau {:.3f}, top_a [{}], top_W [{}]".format(
+            "tau {:.3f}, scale {:.2f}, top_a [{}], top_W [{}]".format(
                 int(self.debug_step.item()),
                 float(self.predicate_entropy.float().mean().detach().cpu()),
                 float(self.predicate_entropy.float().std(unbiased=False).detach().cpu()),
@@ -1251,6 +1283,7 @@ class SemanticBankGaussianPredictor(nn.Module):
                 float(self.predicate_count.float().mean().detach().cpu()),
                 float(self.predicate_count.float().min().detach().cpu()),
                 self.visual_activation_tau,
+                self.composition_logit_scale,
                 top_activation_text,
                 top_predicate_text,
             )
