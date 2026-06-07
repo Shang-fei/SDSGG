@@ -157,6 +157,8 @@ class PrimitiveQueryActivationHead(nn.Module):
         )
         self.output_norm = nn.LayerNorm(hidden_dim)
         self.activation_score = nn.Linear(hidden_dim, 1)
+        nn.init.normal_(self.activation_score.weight, std=0.01)
+        nn.init.constant_(self.activation_score.bias, 0.0)
 
     def forward(self, relation_tokens, tau):
         batch_size = relation_tokens.shape[0]
@@ -170,7 +172,8 @@ class PrimitiveQueryActivationHead(nn.Module):
         primitive_features = self.query_norm(primitive_queries + attended_features)
         primitive_features = self.output_norm(primitive_features + self.ffn(primitive_features))
         primitive_logits = self.activation_score(primitive_features).squeeze(-1)
-        return torch.sigmoid(primitive_logits / max(tau, 1e-6))
+        primitive_activation = torch.sigmoid(primitive_logits / max(tau, 1e-6))
+        return primitive_activation, primitive_logits
 
 
 @registry.ROI_RELATION_PREDICTOR.register("GQAClipPredictor")
@@ -1247,7 +1250,7 @@ class SemanticBankGaussianPredictor(nn.Module):
         object_similarity = torch.bmm(text_features, object_features.unsqueeze(-1)).squeeze(-1)
         return (subject_similarity + object_similarity).float() * 0.5
 
-    def _maybe_print_debug(self, primitive_activation, relation_scores):
+    def _maybe_print_debug(self, primitive_activation, primitive_logits, relation_scores):
         if self.debug_interval <= 0:
             return
         self.debug_step += 1
@@ -1265,7 +1268,8 @@ class SemanticBankGaussianPredictor(nn.Module):
         top_predicate_text = self._format_predicate_top_primitives()
         print(
             "PrimitiveQuery debug step {}: W_entropy {:.4f}/{:.4f}, a_vis {:.4f}/{:.4f}/{:.4f}/{:.4f}, "
-            "score {:.4f}/{:.4f}/{:.4f}/{:.4f}, visual_var {:.4f}/{:.4f}, count {:.2f}/{:.2f}, "
+            "logit {:.4f}/{:.4f}/{:.4f}/{:.4f}, score {:.4f}/{:.4f}/{:.4f}/{:.4f}, "
+            "visual_var {:.4f}/{:.4f}, count {:.2f}/{:.2f}, "
             "tau {:.3f}, scale {:.2f}, top_a [{}], top_W [{}]".format(
                 int(self.debug_step.item()),
                 float(self.predicate_entropy.float().mean().detach().cpu()),
@@ -1274,6 +1278,10 @@ class SemanticBankGaussianPredictor(nn.Module):
                 float(primitive_activation.float().mean().detach().cpu()),
                 float(primitive_activation.float().max().detach().cpu()),
                 float(primitive_activation.float().std(unbiased=False).detach().cpu()),
+                float(primitive_logits.float().min().detach().cpu()),
+                float(primitive_logits.float().mean().detach().cpu()),
+                float(primitive_logits.float().max().detach().cpu()),
+                float(primitive_logits.float().std(unbiased=False).detach().cpu()),
                 float(relation_scores.float().min().detach().cpu()),
                 float(relation_scores.float().mean().detach().cpu()),
                 float(relation_scores.float().max().detach().cpu()),
@@ -1324,6 +1332,7 @@ class SemanticBankGaussianPredictor(nn.Module):
 
         rel_dists = []
         debug_primitive_activations = []
+        debug_primitive_logits = []
         debug_relation_scores = []
 
         for image_idx in range(len(num_rels)):
@@ -1375,12 +1384,13 @@ class SemanticBankGaussianPredictor(nn.Module):
                     ],
                     dim=1,
                 )
-                primitive_activation = self.primitive_activation_head(
+                primitive_activation, primitive_logits = self.primitive_activation_head(
                     relation_tokens,
                     tau=self.visual_activation_tau,
                 )
                 foreground_logits = self._compute_composition_logits(primitive_activation)
                 debug_primitive_activations.append(primitive_activation.detach())
+                debug_primitive_logits.append(primitive_logits.detach())
                 debug_relation_scores.append(foreground_logits.detach())
                 background_logit = self.background_classifier(
                     relation_features.float()
@@ -1398,6 +1408,7 @@ class SemanticBankGaussianPredictor(nn.Module):
         if self.training and debug_primitive_activations:
             self._maybe_print_debug(
                 torch.cat(debug_primitive_activations, dim=0),
+                torch.cat(debug_primitive_logits, dim=0),
                 torch.cat(debug_relation_scores, dim=0),
             )
 
