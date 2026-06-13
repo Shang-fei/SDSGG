@@ -96,7 +96,11 @@ class RelationLossComputation(object):
         fg_labels = cat([proposal.get_field("labels") for proposal in proposals], dim=0)
         rel_labels = cat(rel_labels, dim=0)
         
-        if self.predictor_name == "SemanticBankGaussianPredictor" and self.foreground_only_loss:
+        if self.predictor_name == "RelationFeatureVAEPredictor":
+            loss_relation = relation_logits.sum() * 0.0
+            loss_refine_obj = refine_obj_logits.sum() * 0.0
+            return loss_relation, loss_refine_obj
+        elif self.predictor_name == "SemanticBankGaussianPredictor" and self.foreground_only_loss:
             foreground_mask = rel_labels > 0
             if foreground_mask.any():
                 loss_relation = self.relation_criterion_loss(
