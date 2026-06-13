@@ -176,6 +176,368 @@ class PrimitiveQueryActivationHead(nn.Module):
         return primitive_activation, primitive_logits
 
 
+class RelationFeatureVAE(nn.Module):
+    def __init__(self, input_dim, hidden_dim, latent_dim):
+        super(RelationFeatureVAE, self).__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+        )
+        self.mu = nn.Linear(hidden_dim, latent_dim)
+        self.logvar = nn.Linear(hidden_dim, latent_dim)
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, input_dim),
+        )
+        self._init_weights()
+
+    def _init_weights(self):
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                nn.init.constant_(module.bias, 0.0)
+
+    def encode(self, x):
+        hidden = self.encoder(x.float())
+        mu = self.mu(hidden)
+        logvar = self.logvar(hidden).clamp(min=-10.0, max=10.0)
+        return mu, logvar
+
+    def reparameterize(self, mu, logvar):
+        if not self.training:
+            return mu
+        std = torch.exp(0.5 * logvar)
+        return mu + torch.randn_like(std) * std
+
+    def forward(self, x):
+        target = x.float()
+        mu, logvar = self.encode(target)
+        z = self.reparameterize(mu, logvar)
+        recon = self.decoder(z)
+        return recon, mu, logvar
+
+    def loss(self, x):
+        target = x.float()
+        recon, mu, logvar = self.forward(target)
+        recon_cos = 1.0 - F.cosine_similarity(
+            F.normalize(recon, dim=-1),
+            F.normalize(target, dim=-1),
+            dim=-1,
+        ).mean()
+        recon_mse = F.mse_loss(recon, target)
+        kl = -0.5 * (1.0 + logvar - mu.pow(2) - logvar.exp()).sum(dim=-1).mean()
+        return recon_cos + recon_mse, kl, mu, logvar, recon_cos.detach(), recon_mse.detach()
+
+
+@registry.ROI_RELATION_PREDICTOR.register("RelationFeatureVAEPredictor")
+class RelationFeatureVAEPredictor(nn.Module):
+    def __init__(self, config, in_channels):
+        super(RelationFeatureVAEPredictor, self).__init__()
+        self.attribute_on = config.MODEL.ATTRIBUTE_ON
+        self.num_obj_cls = config.MODEL.ROI_BOX_HEAD.NUM_CLASSES
+        self.num_att_cls = config.MODEL.ROI_ATTRIBUTE_HEAD.NUM_ATTRIBUTES
+        self.num_rel_cls = config.MODEL.ROI_RELATION_HEAD.NUM_CLASSES
+        self.device = config.MODEL.DEVICE
+
+        statistics = get_dataset_statistics(config)
+        obj_classes = statistics["obj_classes"]
+        rel_classes = statistics["rel_classes"]
+        self.predicate_names = list(rel_classes)
+        self.foreground_predicate_names = self.predicate_names[1:self.num_rel_cls]
+
+        self.context_layer = TransformerContext(config, obj_classes, rel_classes, in_channels)
+
+        probe_cfg = config.MODEL.ROI_RELATION_HEAD.VAE_PROBE
+        self.relation_dim = int(probe_cfg.RELATION_DIM)
+        self.recon_loss_weight = float(probe_cfg.RECON_LOSS_WEIGHT)
+        self.kl_loss_weight = float(probe_cfg.KL_LOSS_WEIGHT)
+        self.foreground_only = bool(probe_cfg.FOREGROUND_ONLY)
+        self.debug_interval = int(probe_cfg.DEBUG_INTERVAL)
+        self.stats_csv = str(probe_cfg.STATS_CSV)
+        latent_dim = int(probe_cfg.LATENT_DIM)
+        geometry_dim = int(probe_cfg.GEOMETRY_DIM)
+
+        self.clip_model, self.clip_preprocess = clip.load("ViT-B/32", device=self.device)
+        self.clip_model.eval()
+        for clip_parameter in self.clip_model.parameters():
+            clip_parameter.requires_grad = False
+        self.geometry_encoder = nn.Sequential(
+            nn.Linear(geometry_dim, int(probe_cfg.HIDDEN_DIM)),
+            nn.ReLU(inplace=True),
+            nn.Linear(int(probe_cfg.HIDDEN_DIM), int(probe_cfg.HIDDEN_DIM)),
+            nn.ReLU(inplace=True),
+        )
+
+        self.pair_projector = nn.Sequential(
+            nn.Linear(512 * 3 + int(probe_cfg.HIDDEN_DIM), int(probe_cfg.HIDDEN_DIM)),
+            nn.ReLU(inplace=True),
+            nn.Linear(int(probe_cfg.HIDDEN_DIM), self.relation_dim),
+        )
+        self.vae = RelationFeatureVAE(
+            input_dim=self.relation_dim,
+            hidden_dim=int(probe_cfg.HIDDEN_DIM),
+            latent_dim=latent_dim,
+        )
+
+        self.register_buffer("debug_step", torch.zeros((), dtype=torch.long))
+        self.register_buffer("predicate_count", torch.zeros(self.num_rel_cls - 1, dtype=torch.float32))
+        self.register_buffer("mu_sum", torch.zeros(self.num_rel_cls - 1, latent_dim, dtype=torch.float32))
+        self.register_buffer("logvar_sum", torch.zeros(self.num_rel_cls - 1, latent_dim, dtype=torch.float32))
+        self.register_buffer("mu_second_sum", torch.zeros(self.num_rel_cls - 1, latent_dim, dtype=torch.float32))
+        print(
+            "RelationFeatureVAEPredictor: CLIP+geometry x_rel, relation_dim={}, latent_dim={}, "
+            "geometry_dim={}, recon_weight={}, kl_weight={}, foreground_only={}".format(
+                self.relation_dim,
+                latent_dim,
+                geometry_dim,
+                self.recon_loss_weight,
+                self.kl_loss_weight,
+                self.foreground_only,
+            )
+        )
+
+    def updata(self, mode):
+        return
+
+    def _crop_to_pil(self, image, box_a, box_b):
+        crop = crop_and_resize(image, box_a, box_b)
+        crop_array = crop[0].permute(1, 2, 0).detach().cpu().numpy() * 255
+        return Image.fromarray(np.uint8(crop_array))
+
+    def _encode_clip_image_batch(self, pil_images, batch_size=128):
+        if len(pil_images) == 0:
+            return None
+        features = []
+        with torch.no_grad():
+            for start_idx in range(0, len(pil_images), batch_size):
+                image_tensor = torch.cat([
+                    self.clip_preprocess(image).unsqueeze(0).to(self.device)
+                    for image in pil_images[start_idx:start_idx + batch_size]
+                ], dim=0)
+                image_features = self.clip_model.encode_image(image_tensor)
+                if image_features.dim() == 3:
+                    image_features = image_features[:, 0, :]
+                features.append(image_features.float())
+        return F.normalize(torch.cat(features, dim=0), dim=-1)
+
+    def _geometry_features(self, proposal, pair_idx):
+        boxes = proposal.bbox.float()
+        subject_boxes = boxes[pair_idx[:, 0]]
+        object_boxes = boxes[pair_idx[:, 1]]
+        image_width, image_height = proposal.size
+        eps = 1e-6
+        width = float(image_width)
+        height = float(image_height)
+        image_area = max(width * height, eps)
+
+        sx1, sy1, sx2, sy2 = subject_boxes.unbind(dim=-1)
+        ox1, oy1, ox2, oy2 = object_boxes.unbind(dim=-1)
+        sw = (sx2 - sx1).clamp_min(eps)
+        sh = (sy2 - sy1).clamp_min(eps)
+        ow = (ox2 - ox1).clamp_min(eps)
+        oh = (oy2 - oy1).clamp_min(eps)
+        scx = (sx1 + sx2) * 0.5
+        scy = (sy1 + sy2) * 0.5
+        ocx = (ox1 + ox2) * 0.5
+        ocy = (oy1 + oy2) * 0.5
+
+        inter_x1 = torch.max(sx1, ox1)
+        inter_y1 = torch.max(sy1, oy1)
+        inter_x2 = torch.min(sx2, ox2)
+        inter_y2 = torch.min(sy2, oy2)
+        inter_area = (inter_x2 - inter_x1).clamp_min(0.0) * (inter_y2 - inter_y1).clamp_min(0.0)
+        subject_area = sw * sh
+        object_area = ow * oh
+        union_area = subject_area + object_area - inter_area
+
+        return torch.stack([
+            sx1 / width, sy1 / height, sx2 / width, sy2 / height,
+            ox1 / width, oy1 / height, ox2 / width, oy2 / height,
+            (scx - ocx) / width, (scy - ocy) / height,
+            torch.log(sw / ow), torch.log(sh / oh),
+            inter_area / union_area.clamp_min(eps),
+            subject_area / image_area,
+            object_area / image_area,
+            union_area / image_area,
+            subject_area / object_area.clamp_min(eps),
+            (scy < ocy).float(),
+            (scy > ocy).float(),
+            (scx < ocx).float(),
+            (scx > ocx).float(),
+        ], dim=-1)
+
+    def _build_relation_features(self, proposals, rel_pair_idxs, img):
+        relation_inputs = []
+        for image_idx, pair_idx in enumerate(rel_pair_idxs):
+            num_rel = pair_idx.shape[0]
+            if num_rel == 0:
+                continue
+            image = img[image_idx].unsqueeze(0)
+            object_crops = [
+                self._crop_to_pil(image, proposals[image_idx].bbox[box_idx], proposals[image_idx].bbox[box_idx])
+                for box_idx in range(len(proposals[image_idx].bbox))
+            ]
+            union_crops = [
+                self._crop_to_pil(image, proposals[image_idx].bbox[int(pair[0])], proposals[image_idx].bbox[int(pair[1])])
+                for pair in pair_idx.detach().cpu().tolist()
+            ]
+            object_features = self._encode_clip_image_batch(object_crops)
+            union_features = self._encode_clip_image_batch(union_crops)
+            subject_features = object_features[pair_idx[:, 0]]
+            object_pair_features = object_features[pair_idx[:, 1]]
+            geometry_features = self._geometry_features(proposals[image_idx], pair_idx).to(
+                device=subject_features.device,
+                dtype=subject_features.dtype,
+            )
+            geometry_features = self.geometry_encoder(geometry_features.float())
+            relation_inputs.append(torch.cat([
+                subject_features.float(),
+                object_pair_features.float(),
+                union_features.float(),
+                geometry_features.float(),
+            ], dim=-1))
+        if not relation_inputs:
+            return self.mu_sum.new_zeros((0, self.relation_dim))
+        relation_inputs = torch.cat(relation_inputs, dim=0)
+        return F.normalize(self.pair_projector(relation_inputs.float()), dim=-1)
+
+    def _update_latent_statistics(self, mu, logvar, labels):
+        with torch.no_grad():
+            foreground_mask = labels > 0
+            if not foreground_mask.any():
+                return
+            foreground_mu = mu.detach()[foreground_mask].float()
+            foreground_logvar = logvar.detach()[foreground_mask].float()
+            foreground_labels = labels[foreground_mask].long() - 1
+            for predicate_idx in foreground_labels.unique():
+                class_mask = foreground_labels == predicate_idx
+                class_mu = foreground_mu[class_mask]
+                class_logvar = foreground_logvar[class_mask]
+                idx = int(predicate_idx.item())
+                self.mu_sum[idx] += class_mu.sum(dim=0)
+                self.logvar_sum[idx] += class_logvar.sum(dim=0)
+                self.mu_second_sum[idx] += class_mu.pow(2).sum(dim=0)
+                self.predicate_count[idx] += float(class_mu.shape[0])
+
+    def _format_latent_statistics(self, topk=8):
+        valid_mask = self.predicate_count > 0
+        if not valid_mask.any():
+            return "no foreground predicate stats yet"
+        mu_mean, logvar_mean, mu_var = self._compute_latent_statistics()
+        predicate_mu_norm = mu_mean.norm(dim=-1)
+        predicate_mu_var = mu_var.mean(dim=-1)
+        masked_var = predicate_mu_var.masked_fill(~valid_mask, -1.0)
+        top_values, top_indices = masked_var.topk(min(topk, int(valid_mask.sum().item())), dim=0)
+        fragments = []
+        for value, idx in zip(top_values, top_indices):
+            pred_idx = int(idx.item())
+            fragments.append(
+                "{}:mu_norm={:.4f},mu_var={:.4f},logvar={:.4f},n={:.0f}".format(
+                    self.foreground_predicate_names[pred_idx],
+                    float(predicate_mu_norm[pred_idx].detach().cpu()),
+                    float(value.detach().cpu()),
+                    float(logvar_mean[pred_idx].mean().detach().cpu()),
+                    float(self.predicate_count[pred_idx].detach().cpu()),
+                )
+            )
+        return "; ".join(fragments)
+
+    def _compute_latent_statistics(self):
+        count = self.predicate_count.clamp_min(1.0).unsqueeze(-1)
+        mu_mean = self.mu_sum / count
+        logvar_mean = self.logvar_sum / count
+        mu_second = self.mu_second_sum / count
+        mu_var = (mu_second - mu_mean.pow(2)).clamp_min(0.0)
+        return mu_mean, logvar_mean, mu_var
+
+    def _save_latent_statistics(self):
+        if not self.stats_csv:
+            return
+        valid_mask = self.predicate_count > 0
+        if not valid_mask.any():
+            return
+        mu_mean, logvar_mean, mu_var = self._compute_latent_statistics()
+        rows = []
+        for predicate_idx, predicate_name in enumerate(self.foreground_predicate_names):
+            if not bool(valid_mask[predicate_idx].item()):
+                continue
+            rows.append({
+                "predicate": predicate_name,
+                "count": float(self.predicate_count[predicate_idx].detach().cpu()),
+                "mu_norm": float(mu_mean[predicate_idx].norm().detach().cpu()),
+                "mu_var_mean": float(mu_var[predicate_idx].mean().detach().cpu()),
+                "logvar_mean": float(logvar_mean[predicate_idx].mean().detach().cpu()),
+            })
+        stats_dir = os.path.dirname(self.stats_csv)
+        if stats_dir:
+            os.makedirs(stats_dir, exist_ok=True)
+        pd.DataFrame(rows).to_csv(self.stats_csv, index=False)
+
+    def _maybe_print_debug(self, rec_cos, rec_mse, kl):
+        if self.debug_interval <= 0:
+            return
+        self.debug_step += 1
+        if int(self.debug_step.item()) % self.debug_interval != 0:
+            return
+        self._save_latent_statistics()
+        print(
+            "RelationFeatureVAEProbe step {}: rec_cos={:.4f}, rec_mse={:.4f}, kl={:.4f}, stats=[{}]".format(
+                int(self.debug_step.item()),
+                float(rec_cos.detach().cpu()),
+                float(rec_mse.detach().cpu()),
+                float(kl.detach().cpu()),
+                self._format_latent_statistics(),
+            )
+        )
+
+    def forward(self, proposals, rel_pair_idxs, rel_labels, rel_binarys, roi_features, union_features, logger=None, img=None):
+        if img is None:
+            raise ValueError("RelationFeatureVAEPredictor requires images to build CLIP relation features.")
+        if self.attribute_on:
+            obj_dists, obj_preds, att_dists, edge_ctx = self.context_layer(roi_features, proposals, logger)
+        else:
+            obj_dists, obj_preds, edge_ctx = self.context_layer(roi_features, proposals, logger)
+
+        num_rels = [r.shape[0] for r in rel_pair_idxs]
+        num_objs = [len(b) for b in proposals]
+        relation_features = self._build_relation_features(proposals, rel_pair_idxs, img)
+        add_losses = {}
+
+        if self.training and relation_features.shape[0] > 0:
+            labels = cat(rel_labels, dim=0).to(relation_features.device).long()
+            if self.foreground_only:
+                train_mask = labels > 0
+            else:
+                train_mask = torch.ones_like(labels, dtype=torch.bool)
+            if train_mask.any():
+                rec_loss, kl_loss, mu, logvar, rec_cos, rec_mse = self.vae.loss(relation_features[train_mask])
+                add_losses["loss_vae_rec"] = self.recon_loss_weight * rec_loss
+                add_losses["loss_vae_kl"] = self.kl_loss_weight * kl_loss
+                self._update_latent_statistics(mu, logvar, labels[train_mask])
+                self._maybe_print_debug(rec_cos, rec_mse, kl_loss.detach())
+            else:
+                zero = relation_features.sum() * 0.0
+                add_losses["loss_vae_rec"] = zero
+                add_losses["loss_vae_kl"] = zero
+
+        relation_logits = []
+        start = 0
+        for num_rel in num_rels:
+            if num_rel == 0:
+                relation_logits.append(roi_features.new_zeros((0, self.num_rel_cls)))
+                continue
+            placeholder = relation_features[start:start + num_rel].sum(dim=-1, keepdim=True) * 0.0
+            relation_logits.append(placeholder.expand(-1, self.num_rel_cls))
+            start += num_rel
+
+        obj_dists = obj_dists.detach().split(num_objs, dim=0)
+        return obj_dists, tuple(relation_logits), add_losses
+
 @registry.ROI_RELATION_PREDICTOR.register("GQAClipPredictor")
 class GQAClipPredictor(nn.Module):
     def __init__(self, config, in_channels):
