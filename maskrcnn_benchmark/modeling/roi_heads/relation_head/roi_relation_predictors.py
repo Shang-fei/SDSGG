@@ -321,6 +321,81 @@ class PrimitiveGuidedRelationAdapter(nn.Module):
         return h_prim
 
 
+class PrimitiveSemanticVAE(nn.Module):
+    """
+    Encodes primitive-conditioned relation evidence into a K-dimensional
+    primitive latent distribution and reconstructs the predicate primitive
+    composition from the sampled latent.
+
+    Args:
+        num_primitives: Number of primitive dimensions K.
+        hidden_dim: Feature dimension of each primitive evidence token.
+        decoder_hidden_dim: Hidden width of the primitive semantic decoder.
+        min_logvar/max_logvar: Bounds used to keep the posterior variance
+            numerically stable.
+
+    Inputs:
+        h_prim: Tensor [num_rel, K, hidden_dim] from
+            PrimitiveGuidedRelationAdapter.
+
+    Returns:
+        A dict with:
+            mu: [num_rel, K]
+            logvar: [num_rel, K]
+            z: [num_rel, K]
+            recon_logits: [num_rel, K]
+    """
+
+    def __init__(
+        self,
+        num_primitives,
+        hidden_dim=512,
+        decoder_hidden_dim=512,
+        min_logvar=-8.0,
+        max_logvar=4.0,
+    ):
+        super(PrimitiveSemanticVAE, self).__init__()
+        self.num_primitives = num_primitives
+        self.min_logvar = min_logvar
+        self.max_logvar = max_logvar
+
+        self.mu_head = nn.Linear(hidden_dim, 1)
+        self.logvar_head = nn.Linear(hidden_dim, 1)
+        self.decoder = nn.Sequential(
+            nn.Linear(num_primitives, decoder_hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.LayerNorm(decoder_hidden_dim),
+            nn.Linear(decoder_hidden_dim, num_primitives),
+        )
+
+    def reparameterize(self, mu, logvar):
+        if self.training:
+            std = torch.exp(0.5 * logvar)
+            eps = torch.randn_like(std)
+            return mu + eps * std
+        return mu
+
+    def forward(self, h_prim):
+        if h_prim.size(1) != self.num_primitives:
+            raise ValueError(
+                "PrimitiveSemanticVAE expected {} primitives, got {}".format(
+                    self.num_primitives, h_prim.size(1)
+                )
+            )
+
+        mu = self.mu_head(h_prim).squeeze(-1)
+        logvar = self.logvar_head(h_prim).squeeze(-1)
+        logvar = logvar.clamp(min=self.min_logvar, max=self.max_logvar)
+        z = self.reparameterize(mu, logvar)
+        recon_logits = self.decoder(z)
+        return {
+            "mu": mu,
+            "logvar": logvar,
+            "z": z,
+            "recon_logits": recon_logits,
+        }
+
+
 @registry.ROI_RELATION_PREDICTOR.register("GQAClipPredictor")
 class GQAClipPredictor(nn.Module):
     def __init__(self, config, in_channels):
