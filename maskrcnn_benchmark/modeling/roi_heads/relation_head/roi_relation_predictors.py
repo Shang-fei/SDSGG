@@ -189,21 +189,11 @@ class PrimitiveGuidedRelationAdapter(nn.Module):
         )
         self.token_type = nn.Parameter(torch.zeros(4, hidden_dim))
         self.query_norm = nn.LayerNorm(hidden_dim)
-        self.subject_attn = PrimitiveCrossAttentionBlock(hidden_dim, num_heads, dropout)
-        self.object_attn = PrimitiveCrossAttentionBlock(hidden_dim, num_heads, dropout)
-        self.sub_to_obj_attn = PrimitiveCrossAttentionBlock(hidden_dim, num_heads, dropout)
-        self.obj_to_sub_attn = PrimitiveCrossAttentionBlock(hidden_dim, num_heads, dropout)
         self.pair_attn = PrimitiveCrossAttentionBlock(hidden_dim, num_heads, dropout)
 
         self.geometry_dim = 37
         self.geometry_encoder = nn.Sequential(
             nn.Linear(self.geometry_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
-        self.fusion = nn.Sequential(
-            nn.Linear(hidden_dim * 5, hidden_dim),
             nn.ReLU(inplace=True),
             nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, hidden_dim),
@@ -357,22 +347,8 @@ class PrimitiveGuidedRelationAdapter(nn.Module):
             geometry
         )
 
-        sub_evidence = self.subject_attn(q_prim, sub_tokens)
-        obj_evidence = self.object_attn(q_prim, obj_tokens)
-        sub_obj_evidence = self.sub_to_obj_attn(sub_evidence, obj_evidence)
-        obj_sub_evidence = self.obj_to_sub_attn(obj_evidence, sub_evidence)
         visual_memory = self._build_visual_memory(sub_tokens, obj_tokens)
-        pair_evidence = self.pair_attn(q_prim, visual_memory)
-
-        geometry = geometry.expand(-1, num_primitives, -1)
-        h_prim = self.fusion(torch.cat((
-            sub_obj_evidence,
-            obj_sub_evidence,
-            pair_evidence,
-            torch.abs(sub_obj_evidence - obj_sub_evidence),
-            geometry,
-        ), dim=-1))
-        return h_prim
+        return self.pair_attn(q_prim, visual_memory)
 
 
 class PrimitiveSelfAttentionLayer(nn.Module):
