@@ -131,6 +131,196 @@ class MVA(nn.Module):
 
         return sub_features
 
+
+class PrimitiveCrossAttentionBlock(nn.Module):
+    def __init__(self, hidden_dim=512, num_heads=8, dropout=0.1):
+        super(PrimitiveCrossAttentionBlock, self).__init__()
+        self.attn = nn.MultiheadAttention(hidden_dim, num_heads, dropout=dropout, batch_first=True)
+        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.norm2 = nn.LayerNorm(hidden_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * 4),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim * 4, hidden_dim),
+        )
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, query, key_value):
+        attn_out, _ = self.attn(query, key_value, key_value, need_weights=False)
+        query = self.norm1(query + self.dropout(attn_out))
+        ffn_out = self.ffn(query)
+        return self.norm2(query + self.dropout(ffn_out))
+
+
+class PrimitiveGuidedRelationAdapter(nn.Module):
+    """
+    Builds primitive-conditioned relation evidence for subject-object pairs.
+
+    The output h_prim keeps the primitive axis, so it can be used directly as
+    the visual input to a later primitive-space VAE.
+    """
+
+    def __init__(self, visual_dim=512, text_dim=512, hidden_dim=512, num_heads=8, dropout=0.1):
+        super(PrimitiveGuidedRelationAdapter, self).__init__()
+        self.hidden_dim = hidden_dim
+        self.text_proj = nn.Sequential(
+            nn.Linear(text_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(inplace=True),
+        )
+        self.visual_proj = nn.Sequential(
+            nn.Linear(visual_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(inplace=True),
+        )
+        self.subject_attn = PrimitiveCrossAttentionBlock(hidden_dim, num_heads, dropout)
+        self.object_attn = PrimitiveCrossAttentionBlock(hidden_dim, num_heads, dropout)
+        self.sub_to_obj_attn = PrimitiveCrossAttentionBlock(hidden_dim, num_heads, dropout)
+        self.obj_to_sub_attn = PrimitiveCrossAttentionBlock(hidden_dim, num_heads, dropout)
+
+        self.geometry_dim = 37
+        self.geometry_encoder = nn.Sequential(
+            nn.Linear(self.geometry_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.fusion = nn.Sequential(
+            nn.Linear(hidden_dim * 5, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+    def _box_info(self, boxes, image_size):
+        width, height = image_size
+        scale = boxes.new_tensor([width, height, width, height]).clamp(min=1.0)
+        norm_boxes = boxes / scale
+        wh = (boxes[:, 2:] - boxes[:, :2] + 1.0).clamp(min=1.0)
+        centers = boxes[:, :2] + 0.5 * wh
+        center_scale = boxes.new_tensor([width, height]).clamp(min=1.0)
+        size_scale = boxes.new_tensor([width, height]).clamp(min=1.0)
+        return torch.cat((norm_boxes, centers / center_scale, wh / size_scale), dim=1)
+
+    def _pair_geometry(self, sub_boxes, obj_boxes, image_size):
+        eps = 1e-6
+        union_boxes = sub_boxes.clone()
+        union_boxes[:, 0] = torch.min(sub_boxes[:, 0], obj_boxes[:, 0])
+        union_boxes[:, 1] = torch.min(sub_boxes[:, 1], obj_boxes[:, 1])
+        union_boxes[:, 2] = torch.max(sub_boxes[:, 2], obj_boxes[:, 2])
+        union_boxes[:, 3] = torch.max(sub_boxes[:, 3], obj_boxes[:, 3])
+
+        inter_boxes = sub_boxes.clone()
+        inter_boxes[:, 0] = torch.max(sub_boxes[:, 0], obj_boxes[:, 0])
+        inter_boxes[:, 1] = torch.max(sub_boxes[:, 1], obj_boxes[:, 1])
+        inter_boxes[:, 2] = torch.min(sub_boxes[:, 2], obj_boxes[:, 2])
+        inter_boxes[:, 3] = torch.min(sub_boxes[:, 3], obj_boxes[:, 3])
+        valid_inter = (inter_boxes[:, 2] >= inter_boxes[:, 0]) & (inter_boxes[:, 3] >= inter_boxes[:, 1])
+        inter_boxes = inter_boxes * valid_inter.float().unsqueeze(1)
+
+        sub_wh = (sub_boxes[:, 2:] - sub_boxes[:, :2] + 1.0).clamp(min=1.0)
+        obj_wh = (obj_boxes[:, 2:] - obj_boxes[:, :2] + 1.0).clamp(min=1.0)
+        union_wh = (union_boxes[:, 2:] - union_boxes[:, :2] + 1.0).clamp(min=1.0)
+        sub_ctr = sub_boxes[:, :2] + 0.5 * sub_wh
+        obj_ctr = obj_boxes[:, :2] + 0.5 * obj_wh
+        center_offset = (sub_ctr - obj_ctr) / union_wh
+        log_scale = torch.log(sub_wh / obj_wh.clamp(min=eps))
+
+        inter_wh = (torch.min(sub_boxes[:, 2:], obj_boxes[:, 2:]) -
+                    torch.max(sub_boxes[:, :2], obj_boxes[:, :2]) + 1.0).clamp(min=0.0)
+        inter_area = inter_wh[:, 0] * inter_wh[:, 1]
+        sub_area = sub_wh[:, 0] * sub_wh[:, 1]
+        obj_area = obj_wh[:, 0] * obj_wh[:, 1]
+        iou = inter_area / (sub_area + obj_area - inter_area + eps)
+
+        return torch.cat((
+            self._box_info(sub_boxes, image_size),
+            self._box_info(obj_boxes, image_size),
+            self._box_info(union_boxes, image_size),
+            self._box_info(inter_boxes, image_size),
+            center_offset,
+            log_scale,
+            iou.unsqueeze(1),
+        ), dim=1)
+
+    def _split_object_features(self, obj_visual_features, proposals):
+        if isinstance(obj_visual_features, (list, tuple)):
+            return list(obj_visual_features)
+        num_objs = [len(proposal) for proposal in proposals]
+        return list(obj_visual_features.split(num_objs, dim=0))
+
+    def _collect_pair_inputs(self, obj_visual_features, proposals, rel_pair_idxs):
+        obj_features_per_image = self._split_object_features(obj_visual_features, proposals)
+        sub_features = []
+        obj_features = []
+        geometry_features = []
+
+        for per_image_features, proposal, pair_idx in zip(obj_features_per_image, proposals, rel_pair_idxs):
+            if pair_idx.numel() == 0:
+                continue
+            sub_idx = pair_idx[:, 0]
+            obj_idx = pair_idx[:, 1]
+            sub_features.append(per_image_features[sub_idx])
+            obj_features.append(per_image_features[obj_idx])
+            sub_boxes = proposal.bbox[sub_idx]
+            obj_boxes = proposal.bbox[obj_idx]
+            geometry_features.append(self._pair_geometry(sub_boxes, obj_boxes, proposal.size))
+
+        if len(sub_features) == 0:
+            return None, None, None
+
+        return (
+            torch.cat(sub_features, dim=0),
+            torch.cat(obj_features, dim=0),
+            torch.cat(geometry_features, dim=0),
+        )
+
+    def forward(self, obj_visual_features, proposals, rel_pair_idxs, primitive_text_features):
+        """
+        Args:
+            obj_visual_features: Tensor [sum_obj, Dv] or list of per-image tensors.
+            proposals: list[BoxList], aligned with rel_pair_idxs.
+            rel_pair_idxs: list[Tensor], each [num_rel_i, 2] with local object indices.
+            primitive_text_features: Tensor [K, Dt].
+
+        Returns:
+            h_prim: Tensor [sum_rel, K, hidden_dim].
+        """
+        dtype = self.text_proj[0].weight.dtype
+        device = self.text_proj[0].weight.device
+        obj_visual_features = obj_visual_features.to(device=device, dtype=dtype) \
+            if torch.is_tensor(obj_visual_features) else [x.to(device=device, dtype=dtype) for x in obj_visual_features]
+        primitive_text_features = primitive_text_features.to(device=device, dtype=dtype)
+
+        sub_features, obj_features, geometry_features = self._collect_pair_inputs(
+            obj_visual_features, proposals, rel_pair_idxs
+        )
+        num_primitives = primitive_text_features.size(0)
+        if sub_features is None:
+            return primitive_text_features.new_zeros((0, num_primitives, self.hidden_dim))
+
+        q_prim = self.text_proj(primitive_text_features).unsqueeze(0).expand(sub_features.size(0), -1, -1)
+        sub_tokens = self.visual_proj(sub_features).unsqueeze(1)
+        obj_tokens = self.visual_proj(obj_features).unsqueeze(1)
+        geometry = self.geometry_encoder(geometry_features.to(device=device, dtype=dtype)).unsqueeze(1)
+
+        sub_evidence = self.subject_attn(q_prim, sub_tokens)
+        obj_evidence = self.object_attn(q_prim, obj_tokens)
+        sub_obj_evidence = self.sub_to_obj_attn(sub_evidence, obj_evidence)
+        obj_sub_evidence = self.obj_to_sub_attn(obj_evidence, sub_evidence)
+
+        geometry = geometry.expand(-1, num_primitives, -1)
+        h_prim = self.fusion(torch.cat((
+            sub_obj_evidence,
+            obj_sub_evidence,
+            sub_obj_evidence * obj_sub_evidence,
+            torch.abs(sub_obj_evidence - obj_sub_evidence),
+            geometry,
+        ), dim=-1))
+        return h_prim
+
+
 @registry.ROI_RELATION_PREDICTOR.register("GQAClipPredictor")
 class GQAClipPredictor(nn.Module):
     def __init__(self, config, in_channels):
