@@ -25,6 +25,7 @@ from PIL import Image
 import pandas as pd
 import torch.nn.functional as F
 import os, sys
+import csv
 curpath=os.path.dirname(__file__)
 PRDCS_BASE = ['has', 'hanging from', 'from', 'in', 'walking on', 'watching', 'with', 'behind', 'for', 'to', 'belonging to', 'at', 'wearing', 'standing on', 'holding', 'riding', 'near', 'looking at', 'sitting on', 'on', 'over', 'in front of', 'between', 'made of', 'of', 'carrying', 'parked on', 'against', 'attached to', 'playing', 'covering', 'covered in', 'wears', 'above', 'under']
 PRDCS_NOVEL = ['mounted on', 'says', 'part of', 'across', 'flying in', 'using', 'on back of', 'lying on', 'growing on', 'walking in', 'laying on', 'along', 'eating', 'and', 'painted on']
@@ -1025,9 +1026,8 @@ class ClipPredictor(nn.Module):
 @registry.ROI_RELATION_PREDICTOR.register("SFClipPredictor")
 class SFClipPredictor(nn.Module):
     def __init__(self, config, in_channels):
-        super(ClipPredictor, self).__init__()
+        super(SFClipPredictor, self).__init__()
         self.attribute_on = config.MODEL.ATTRIBUTE_ON
-        # load parameters
         self.num_obj_cls = config.MODEL.ROI_BOX_HEAD.NUM_CLASSES
         self.num_att_cls = config.MODEL.ROI_ATTRIBUTE_HEAD.NUM_ATTRIBUTES
         self.num_rel_cls = config.MODEL.ROI_RELATION_HEAD.NUM_CLASSES
@@ -1037,13 +1037,13 @@ class SFClipPredictor(nn.Module):
         self.use_vision = config.MODEL.ROI_RELATION_HEAD.PREDICT_USE_VISION
         self.use_bias = config.MODEL.ROI_RELATION_HEAD.PREDICT_USE_BIAS
 
-        # load class dict
         statistics = get_dataset_statistics(config)
         obj_classes, rel_classes, att_classes = statistics['obj_classes'], statistics['rel_classes'], statistics['att_classes']
         self.obj_names = obj_classes
+        self.rel_names = rel_classes
 
         self.device=config.MODEL.DEVICE
-        self.clip_model, self.clip_preprocess = clip.load("ViT-B/32", device=self.device)
+        self.clip_model, _ = clip.load("ViT-B/32", device=self.device)
 
         a=time.time()
         self.context_layer = TransformerContext(config, obj_classes, rel_classes, in_channels)
@@ -1054,58 +1054,102 @@ class SFClipPredictor(nn.Module):
         self.novel=[0]+[self.id_dict[x] for x in sorted(config.OV_SETTING.PRDCS_NOVEL)]
 
         self.semantic = [0]+[self.id_dict[x] for x in sorted(config.OV_SETTING.SEMAN)]
-        mode="base"
+        primitive_rows = self._load_primitive_descriptions()
+        self.primitive_names = [row[1] for row in primitive_rows]
+        self.primitive_descriptions = [row[2] for row in primitive_rows]
+        self.num_primitives = len(self.primitive_descriptions)
 
-        if mode=="base":
-            pass
-        elif mode=="novel":
-            pass
-        elif mode=="total":
-            pass
-            
-        elif mode=="semantic":
-            pass
-           
         with torch.no_grad():
-            text_sub=clip.tokenize(["a photo of subject " for x in self.obj_names]).to(self.device)
-            text_features_sub = self.clip_model.encode_text(text_sub)
-            self.text_features_sub = text_features_sub
+            primitive_tokens = clip.tokenize([
+                "a photo of a relation where " + desc for desc in self.primitive_descriptions
+            ]).to(self.device)
+            primitive_text_features = self.clip_model.encode_text(primitive_tokens).float()
+        self.register_buffer("primitive_text_features", primitive_text_features)
 
-            text_obj=clip.tokenize(["a photo of object "  for x in self.obj_names]).to(self.device)
-            text_features_obj = self.clip_model.encode_text(text_obj)
-            self.text_features_obj = text_features_obj
+        predicate_prior = self._load_predicate_primitive_prior().to(self.device)
+        self.register_buffer("predicate_primitive_prior", predicate_prior)
+        self.register_buffer("predicate_primitive_logvar", torch.zeros_like(predicate_prior))
 
-            self.texts_rel=[]
-            for obj in self.obj_names:
-                obj_rel_text = clip.tokenize(["a photo of " + tex for tex in list(self.sub_filter_novel[obj])]).to(
-                    self.device)
-                obj_rel_text_features = self.clip_model.encode_text(obj_rel_text)
-                self.texts_rel.append(obj_rel_text_features.detach().cpu().numpy())
+        self.primitive_adapter = PrimitiveGuidedRelationAdapter(
+            visual_dim=in_channels,
+            text_dim=primitive_text_features.size(-1),
+            hidden_dim=512,
+            num_heads=8,
+            dropout=0.1,
+        )
+        self.primitive_vae = PrimitiveSemanticVAE(
+            num_primitives=self.num_primitives,
+            hidden_dim=512,
+            num_heads=8,
+            num_layers=2,
+            dropout=0.1,
+        )
+        self.kl_weight = 0.01
+        self.score_temperature = 1.0
+        self.updata(getattr(config.OV_SETTING, "TRAIN_PART", "base"))
 
         b=time.time()
         print('init complete : '+str(b-a))
-        self.count=0
-        self.linear1=nn.Linear(1024,512, bias=False).to(self.device).half()
+
+    def _load_primitive_descriptions(self):
+        primitive_path = os.path.join(curpath, "primitive_descriptions_32.csv")
+        rows = []
+        with open(primitive_path, newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                rows.append((int(row["index"]), row["name"], row["description"]))
+        rows.sort(key=lambda x: x[0])
+        return rows
+
+    def _load_predicate_primitive_prior(self):
+        prior_path = os.path.join(curpath, "description_relation_32.csv")
+        rows = []
+        with open(prior_path, newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                primitive_vector = [float(x) for x in row["primitive_vector"].split(",")]
+                rows.append((int(row["predicate_id"]), primitive_vector))
+        rows.sort(key=lambda x: x[0])
+        return torch.Tensor([row[1] for row in rows]).float()
 
     def updata(self,mode):
         print("now is "+mode)
         if mode == "base":
-            pass
+            active_ids = self.base
         elif mode == "novel":
-            pass
+            active_ids = self.novel
         elif mode == "total":
-            pass
+            active_ids = list(range(self.predicate_primitive_prior.size(0)))
         elif mode == "semantic":
-            pass
+            active_ids = self.semantic
+        else:
+            raise ValueError("Unsupported SFClipPredictor mode: {}".format(mode))
+        self.mode = mode
+        self.active_predicate_ids = active_ids
+        self.active_predicate_ids_tensor = torch.LongTensor(active_ids).to(self.device)
 
-        with torch.no_grad():
-            self.texts_rel=[]
-            for obj in self.obj_names:
-                a = time.time()
-                obj_rel_text = clip.tokenize(["a photo of " + tex for tex in list(self.sub_filter_novel[obj])]).to(
-                    self.device)
-                obj_rel_text_features = self.clip_model.encode_text(obj_rel_text)
-                self.texts_rel.append(obj_rel_text_features.detach().cpu().numpy())
+    def _split_rel_tensor(self, rel_tensor, num_rels):
+        if len(num_rels) == 0:
+            return []
+        return list(rel_tensor.split(num_rels, dim=0))
+
+    def _kl_loss(self, mu, logvar, rel_labels):
+        if rel_labels is None:
+            return mu.sum() * 0.0
+        rel_labels = cat(rel_labels, dim=0).view(-1).long().to(mu.device)
+        keep = rel_labels > 0
+        if keep.sum().item() == 0:
+            return mu.sum() * 0.0
+        mu = mu[keep]
+        logvar = logvar[keep]
+        prior_mu = self.predicate_primitive_prior.to(device=mu.device, dtype=mu.dtype)[rel_labels[keep]]
+        prior_logvar = self.predicate_primitive_logvar.to(device=mu.device, dtype=mu.dtype)[rel_labels[keep]]
+        kl = 0.5 * (
+            prior_logvar - logvar
+            + (torch.exp(logvar) + (mu - prior_mu).pow(2)) / torch.exp(prior_logvar).clamp(min=1e-8)
+            - 1.0
+        )
+        return kl.mean()
 
     def forward(self, proposals, rel_pair_idxs, rel_labels, rel_binarys, roi_features, union_features, logger=None,img=None):
         """
@@ -1124,57 +1168,42 @@ class SFClipPredictor(nn.Module):
         num_rels = [r.shape[0] for r in rel_pair_idxs]
         num_objs = [len(b) for b in proposals]
         assert len(num_rels) == len(num_objs)
-        obj_preds = obj_preds.split(num_objs, dim=0)
+        if sum(num_rels) == 0:
+            obj_dists = obj_dists.split(num_objs, dim=0)
+            if self.training:
+                rel_dists = tuple(
+                    roi_features.new_zeros((0, self.num_primitives)) for _ in num_rels
+                )
+            else:
+                rel_dists = tuple(
+                    roi_features.new_zeros((0, len(self.active_predicate_ids))) for _ in num_rels
+                )
+            add_losses = {"loss_primitive_kl": roi_features.sum() * 0.0}
+            return obj_dists, rel_dists, add_losses
 
-
-        rel_dists=[]
-        for i in range(len(num_rels)):
-            rel_dist_per_batch=[]
-            union_imges=[]
-            image_tensor=[]
-            with torch.no_grad():
-                for j in range(len(proposals[i].bbox)):
-                    union_img = crop_and_resize(img[i].unsqueeze(0), proposals[i].bbox[j], proposals[i].bbox[j])
-                    iimg = union_img[0].permute(1, 2, 0).detach().cpu().numpy() * 255
-                    iimg = Image.fromarray(np.uint8(iimg))
-                    union_img = self.clip_preprocess(iimg).unsqueeze(0).to(self.device)
-                    image_tensor.append(union_img)
-                image_tensor = torch.cat(image_tensor)
-
-                image_features = self.clip_model.encode_image(image_tensor)
-
-            for la_count,rel_index in enumerate(rel_pair_idxs[i]):
-
-                obj_n1,obj_n2=obj_preds[i][rel_index[0]],obj_preds[i][rel_index[1]]#two object names
-
-                text_features1=self.text_features1
-                text_features2=self.text_features2
-
-                text_sub=self.text_features_sub[obj_n1]
-                text_obj=self.text_features_obj[obj_n2]
-
-                if is_training:
-                    pass
-
-                else:
-                    text_rel = torch.Tensor(self.texts_rel[obj_n1]).to(self.device).half()
-                    similarity_ori_sub = ((image_features[rel_index[0]][0].unsqueeze(0)/image_features[rel_index[0]][0].unsqueeze(0).norm(dim=-1, keepdim=True)) @ (text_rel/text_rel.norm(dim=-1, keepdim=True)).T/0.05)
-                    similarity_ori_obj = ((image_features[rel_index[1]][0].unsqueeze(0)/image_features[rel_index[1]][0].unsqueeze(0).norm(dim=-1, keepdim=True)) @ (text_rel/text_rel.norm(dim=-1, keepdim=True)).T/0.05)
-                    similarity_ori=(similarity_ori_sub+similarity_ori_obj)/2
-
-                    probs=similarity_ori
-                rel_dist_per_batch.append(probs)
-
-            rel_dist_per_batch=torch.cat(rel_dist_per_batch)
-
-            rel_dists.append(rel_dist_per_batch)
-
-
+        h_prim = self.primitive_adapter(
+            roi_features,
+            proposals,
+            rel_pair_idxs,
+            self.primitive_text_features,
+        )
+        vae_out = self.primitive_vae(h_prim)
+        mu_v = vae_out["mu"]
+        logvar_v = vae_out["logvar"]
 
         obj_dists = obj_dists.split(num_objs, dim=0)
-        rel_dists = tuple(rel_dists)
+        if self.training:
+            rel_dists = tuple(self._split_rel_tensor(mu_v, num_rels))
+        else:
+            active_prior = self.predicate_primitive_prior.to(device=mu_v.device, dtype=mu_v.dtype)[
+                self.active_predicate_ids_tensor.to(mu_v.device)
+            ]
+            rel_scores = torch.matmul(mu_v, active_prior.t()) / self.score_temperature
+            rel_dists = tuple(self._split_rel_tensor(rel_scores, num_rels))
 
-        add_losses = {}
+        add_losses = {
+            "loss_primitive_kl": self._kl_loss(mu_v, logvar_v, rel_labels) * self.kl_weight
+        }
         return obj_dists, rel_dists, add_losses
 
 def make_roi_relation_predictor(cfg, in_channels):

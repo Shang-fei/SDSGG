@@ -1,6 +1,7 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved.
 import sys
 import os
+import csv
 
 sys.path.append("../../../config")
 
@@ -189,6 +190,24 @@ class Loss(nn.Module):
         self.description_relation_loss = np.array(self.description_relation_loss)
         self.description_relation_loss = np.array([[np.array(item) for item in inner_list] for inner_list in self.description_relation_loss])
         self.description_relation_loss = torch.Tensor(self.description_relation_loss).to(device)
+        self.description_relation_loss_32 = self._load_description_relation_loss_32(device)
+        if self.description_relation_loss_32 is not None:
+            self.primitive_prior_logvar_32 = torch.zeros_like(self.description_relation_loss_32)
+        else:
+            self.primitive_prior_logvar_32 = None
+
+    def _load_description_relation_loss_32(self, device):
+        prior_path = os.path.join(curpath, "description_relation_loss_32.csv")
+        if not os.path.exists(prior_path):
+            return None
+
+        priors = []
+        with open(prior_path, newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                values = [float(x) for x in row["primitive_vector"].split(",")]
+                priors.append(values)
+        return torch.Tensor(priors).to(device)
 
     def forward(self, input, target):
 
@@ -197,6 +216,22 @@ class Loss(nn.Module):
         zz = torch.where(target > 0, True, False)
         input = input[zz].half()
         target = target[zz]
+        if target.numel() == 0:
+            return input.sum() * 0.0
+
+        if input.dim() == 2:
+            if self.description_relation_loss_32 is None:
+                raise RuntimeError("description_relation_loss_32.csv is required for [N, 32] relation logits")
+            primitive_target = self.description_relation_loss_32[target.long()].to(
+                device=input.device, dtype=input.dtype
+            )
+            if primitive_target.size(-1) != input.size(-1):
+                raise ValueError(
+                    "Primitive target dimension {} does not match relation logits dimension {}".format(
+                        primitive_target.size(-1), input.size(-1)
+                    )
+                )
+            return F.mse_loss(input, primitive_target, reduction="mean").half()
 
         totarget=input[:,1]
         input=input[:,0]
