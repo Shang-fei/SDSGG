@@ -1,0 +1,33 @@
+index,name,description
+0,spatial_proximity,The subject and object are spatially close or near each other.
+1,physical_contact,The subject and object physically touch or make contact.
+2,spatial_overlap,The subject and object visually overlap or intersect in the image.
+3,support_surface,One object supports the other from below or acts as a stable surface.
+4,vertical_above,The subject is vertically above or higher than the object.
+5,vertical_below,The subject is vertically below or lower than the object.
+6,front_depth,The subject is in front of the object in depth or viewing order.
+7,behind_occlusion,The subject is behind the object or partly hidden by it.
+8,containment_inside,"The subject is inside, within, or enclosed by the object."
+9,covering_surface,"The subject covers, coats, or lies over the visible surface of the object."
+10,attachment_connection,"The subject is attached, connected, fixed, or fastened to the object."
+11,part_whole_possession,"The subject is a part, component, attribute, or possession of the object."
+12,holding_grasping_carrying,"The subject is held, grasped, carried, or moved by an agent."
+13,wearing_body_contact,The subject is worn on or attached to a body part.
+14,riding_mounted,"The subject is riding, mounted on, or positioned on the back of the object."
+15,body_posture,"The relation involves a body posture such as sitting, standing, or lying."
+16,locomotion_walking,The relation involves walking or locomotion through or on a place.
+17,visual_attention,"The subject visually attends to, looks at, or watches the object."
+18,using_tool_function,"The subject uses the object as a tool, instrument, or functional aid."
+19,playing_activity,"The subject is engaged in play, sport, or recreational activity with the object."
+20,eating_ingestion,"The subject eats, bites, or consumes the object."
+21,flying_motion,The subject is flying or moving through the air in a region.
+22,hanging_suspended,The subject hangs from or is suspended by the object.
+23,source_origin,"The subject originates from, comes from, or is separated from the object."
+24,destination_purpose,"The subject is directed to, intended for, or associated with a purpose involving the object."
+25,material_composition,"The subject is made of, composed of, or formed from the object material."
+26,text_symbol_surface,"The subject is text, writing, symbol, picture, or paint displayed on the object."
+27,growth_biological,The subject grows on or is biologically rooted in the object.
+28,path_across_along,"The subject extends, moves, or lies across or along the object."
+29,between_multiple,The subject is between multiple objects or located in an intermediate spatial region.
+30,association_with,"The subject and object are associated, co-present, or paired without a specific physical relation."
+31,generic_relation,The subject and object have a broad semantic relation that is underspecified by visual primitives.
