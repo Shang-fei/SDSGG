@@ -1043,7 +1043,10 @@ class SFClipPredictor(nn.Module):
         self.rel_names = rel_classes
 
         self.device=config.MODEL.DEVICE
-        self.clip_model, _ = clip.load("ViT-B/32", device=self.device)
+        self.clip_model, self.clip_preprocess = clip.load("ViT-B/32", device=self.device)
+        self.clip_model.eval()
+        for param in self.clip_model.parameters():
+            param.requires_grad = False
 
         a=time.time()
         self.context_layer = TransformerContext(config, obj_classes, rel_classes, in_channels)
@@ -1064,14 +1067,17 @@ class SFClipPredictor(nn.Module):
                 "a photo of a relation where " + desc for desc in self.primitive_descriptions
             ]).to(self.device)
             primitive_text_features = self.clip_model.encode_text(primitive_tokens).float()
+            object_tokens = clip.tokenize(["a photo of " + obj for obj in self.obj_names]).to(self.device)
+            object_text_features = self.clip_model.encode_text(object_tokens).float()
         self.register_buffer("primitive_text_features", primitive_text_features)
+        self.register_buffer("object_text_features", object_text_features)
 
         predicate_prior = self._load_predicate_primitive_prior().to(self.device)
         self.register_buffer("predicate_primitive_prior", predicate_prior)
         self.register_buffer("predicate_primitive_logvar", torch.zeros_like(predicate_prior))
 
         self.primitive_adapter = PrimitiveGuidedRelationAdapter(
-            visual_dim=in_channels,
+            visual_dim=primitive_text_features.size(-1),
             text_dim=primitive_text_features.size(-1),
             hidden_dim=512,
             num_heads=8,
@@ -1151,6 +1157,25 @@ class SFClipPredictor(nn.Module):
         )
         return kl.mean()
 
+    def _extract_clip_object_tokens(self, proposals, img):
+        if img is None:
+            raise ValueError("SFClipPredictor requires img to extract CLIP object tokens")
+
+        image_tensors = []
+        for image, proposal in zip(img, proposals):
+            for box in proposal.bbox:
+                crop = crop_and_resize(image.unsqueeze(0), box, box)
+                crop = crop[0].permute(1, 2, 0).detach().cpu().numpy() * 255
+                crop = Image.fromarray(np.uint8(crop))
+                image_tensors.append(self.clip_preprocess(crop).unsqueeze(0))
+
+        if len(image_tensors) == 0:
+            return self.primitive_text_features.new_zeros((0, 197, self.primitive_text_features.size(-1)))
+
+        image_tensors = torch.cat(image_tensors, dim=0).to(self.device)
+        with torch.no_grad():
+            return self.clip_model.encode_image(image_tensors).float()
+
     def forward(self, proposals, rel_pair_idxs, rel_labels, rel_binarys, roi_features, union_features, logger=None,img=None):
         """
         Returns:
@@ -1181,8 +1206,11 @@ class SFClipPredictor(nn.Module):
             add_losses = {"loss_primitive_kl": roi_features.sum() * 0.0}
             return obj_dists, rel_dists, add_losses
 
+        obj_text_features = self.object_text_features.to(device=roi_features.device)[obj_preds.long()]
+        obj_visual_tokens = self._extract_clip_object_tokens(proposals, img).to(device=roi_features.device)
         h_prim = self.primitive_adapter(
-            roi_features,
+            obj_visual_tokens,
+            obj_text_features,
             proposals,
             rel_pair_idxs,
             self.primitive_text_features,
