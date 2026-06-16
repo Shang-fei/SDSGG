@@ -939,7 +939,160 @@ class ClipPredictor(nn.Module):
         add_losses = {}
         return obj_dists, rel_dists, add_losses
 
+@registry.ROI_RELATION_PREDICTOR.register("SFClipPredictor")
+class SFClipPredictor(nn.Module):
+    def __init__(self, config, in_channels):
+        super(ClipPredictor, self).__init__()
+        self.attribute_on = config.MODEL.ATTRIBUTE_ON
+        # load parameters
+        self.num_obj_cls = config.MODEL.ROI_BOX_HEAD.NUM_CLASSES
+        self.num_att_cls = config.MODEL.ROI_ATTRIBUTE_HEAD.NUM_ATTRIBUTES
+        self.num_rel_cls = config.MODEL.ROI_RELATION_HEAD.NUM_CLASSES
 
+        assert in_channels is not None
+
+        self.use_vision = config.MODEL.ROI_RELATION_HEAD.PREDICT_USE_VISION
+        self.use_bias = config.MODEL.ROI_RELATION_HEAD.PREDICT_USE_BIAS
+
+        # load class dict
+        statistics = get_dataset_statistics(config)
+        obj_classes, rel_classes, att_classes = statistics['obj_classes'], statistics['rel_classes'], statistics['att_classes']
+        self.obj_names = obj_classes
+
+        self.device=config.MODEL.DEVICE
+        self.clip_model, self.clip_preprocess = clip.load("ViT-B/32", device=self.device)
+
+        a=time.time()
+        self.context_layer = TransformerContext(config, obj_classes, rel_classes, in_channels)
+
+        self.id_dict={'__background__': 0, 'above': 1, 'across': 2, 'against': 3, 'along': 4, 'and': 5, 'at': 6, 'attached to': 7, 'behind': 8, 'belonging to': 9, 'between': 10, 'carrying': 11, 'covered in': 12, 'covering': 13, 'eating': 14, 'flying in': 15, 'for': 16, 'from': 17, 'growing on': 18, 'hanging from': 19, 'has': 20, 'holding': 21, 'in': 22, 'in front of': 23, 'laying on': 24, 'looking at': 25, 'lying on': 26, 'made of': 27, 'mounted on': 28, 'near': 29, 'of': 30, 'on': 31, 'on back of': 32, 'over': 33, 'painted on': 34, 'parked on': 35, 'part of': 36, 'playing': 37, 'riding': 38, 'says': 39, 'sitting on': 40, 'standing on': 41, 'to': 42, 'under': 43, 'using': 44, 'walking in': 45, 'walking on': 46, 'watching': 47, 'wearing': 48, 'wears': 49, 'with': 50}
+
+        self.base=[0]+[self.id_dict[x] for x in sorted(config.OV_SETTING.PRDCS_BASE)]
+        self.novel=[0]+[self.id_dict[x] for x in sorted(config.OV_SETTING.PRDCS_NOVEL)]
+
+        self.semantic = [0]+[self.id_dict[x] for x in sorted(config.OV_SETTING.SEMAN)]
+        mode="base"
+
+        if mode=="base":
+            pass
+        elif mode=="novel":
+            pass
+        elif mode=="total":
+            pass
+            
+        elif mode=="semantic":
+            pass
+           
+        with torch.no_grad():
+            text_sub=clip.tokenize(["a photo of subject " for x in self.obj_names]).to(self.device)
+            text_features_sub = self.clip_model.encode_text(text_sub)
+            self.text_features_sub = text_features_sub
+
+            text_obj=clip.tokenize(["a photo of object "  for x in self.obj_names]).to(self.device)
+            text_features_obj = self.clip_model.encode_text(text_obj)
+            self.text_features_obj = text_features_obj
+
+            self.texts_rel=[]
+            for obj in self.obj_names:
+                obj_rel_text = clip.tokenize(["a photo of " + tex for tex in list(self.sub_filter_novel[obj])]).to(
+                    self.device)
+                obj_rel_text_features = self.clip_model.encode_text(obj_rel_text)
+                self.texts_rel.append(obj_rel_text_features.detach().cpu().numpy())
+
+        b=time.time()
+        print('init complete : '+str(b-a))
+        self.count=0
+        self.linear1=nn.Linear(1024,512, bias=False).to(self.device).half()
+
+    def updata(self,mode):
+        print("now is "+mode)
+        if mode == "base":
+            pass
+        elif mode == "novel":
+            pass
+        elif mode == "total":
+            pass
+        elif mode == "semantic":
+            pass
+
+        with torch.no_grad():
+            self.texts_rel=[]
+            for obj in self.obj_names:
+                a = time.time()
+                obj_rel_text = clip.tokenize(["a photo of " + tex for tex in list(self.sub_filter_novel[obj])]).to(
+                    self.device)
+                obj_rel_text_features = self.clip_model.encode_text(obj_rel_text)
+                self.texts_rel.append(obj_rel_text_features.detach().cpu().numpy())
+
+    def forward(self, proposals, rel_pair_idxs, rel_labels, rel_binarys, roi_features, union_features, logger=None,img=None):
+        """
+        Returns:
+            obj_dists (list[Tensor]): logits of object label distribution
+            rel_dists (list[Tensor])
+            rel_pair_idxs (list[Tensor]): (num_rel, 2) index of subject and object
+            union_features (Tensor): (batch_num_rel, context_pooling_dim): visual union feature of each pair
+        """
+
+        if self.attribute_on:
+            obj_dists, obj_preds, att_dists, edge_ctx = self.context_layer(roi_features, proposals, logger)
+        else:
+            obj_dists, obj_preds, edge_ctx = self.context_layer(roi_features, proposals, logger)
+
+        num_rels = [r.shape[0] for r in rel_pair_idxs]
+        num_objs = [len(b) for b in proposals]
+        assert len(num_rels) == len(num_objs)
+        obj_preds = obj_preds.split(num_objs, dim=0)
+
+
+        rel_dists=[]
+        for i in range(len(num_rels)):
+            rel_dist_per_batch=[]
+            union_imges=[]
+            image_tensor=[]
+            with torch.no_grad():
+                for j in range(len(proposals[i].bbox)):
+                    union_img = crop_and_resize(img[i].unsqueeze(0), proposals[i].bbox[j], proposals[i].bbox[j])
+                    iimg = union_img[0].permute(1, 2, 0).detach().cpu().numpy() * 255
+                    iimg = Image.fromarray(np.uint8(iimg))
+                    union_img = self.clip_preprocess(iimg).unsqueeze(0).to(self.device)
+                    image_tensor.append(union_img)
+                image_tensor = torch.cat(image_tensor)
+
+                image_features = self.clip_model.encode_image(image_tensor)
+
+            for la_count,rel_index in enumerate(rel_pair_idxs[i]):
+
+                obj_n1,obj_n2=obj_preds[i][rel_index[0]],obj_preds[i][rel_index[1]]#two object names
+
+                text_features1=self.text_features1
+                text_features2=self.text_features2
+
+                text_sub=self.text_features_sub[obj_n1]
+                text_obj=self.text_features_obj[obj_n2]
+
+                if is_training:
+                    pass
+
+                else:
+                    text_rel = torch.Tensor(self.texts_rel[obj_n1]).to(self.device).half()
+                    similarity_ori_sub = ((image_features[rel_index[0]][0].unsqueeze(0)/image_features[rel_index[0]][0].unsqueeze(0).norm(dim=-1, keepdim=True)) @ (text_rel/text_rel.norm(dim=-1, keepdim=True)).T/0.05)
+                    similarity_ori_obj = ((image_features[rel_index[1]][0].unsqueeze(0)/image_features[rel_index[1]][0].unsqueeze(0).norm(dim=-1, keepdim=True)) @ (text_rel/text_rel.norm(dim=-1, keepdim=True)).T/0.05)
+                    similarity_ori=(similarity_ori_sub+similarity_ori_obj)/2
+
+                    probs=similarity_ori
+                rel_dist_per_batch.append(probs)
+
+            rel_dist_per_batch=torch.cat(rel_dist_per_batch)
+
+            rel_dists.append(rel_dist_per_batch)
+
+
+
+        obj_dists = obj_dists.split(num_objs, dim=0)
+        rel_dists = tuple(rel_dists)
+
+        add_losses = {}
+        return obj_dists, rel_dists, add_losses
 
 def make_roi_relation_predictor(cfg, in_channels):
     func = registry.ROI_RELATION_PREDICTOR[cfg.MODEL.ROI_RELATION_HEAD.PREDICTOR]
