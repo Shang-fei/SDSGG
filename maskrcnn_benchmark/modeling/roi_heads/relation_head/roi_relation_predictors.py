@@ -321,6 +321,27 @@ class PrimitiveGuidedRelationAdapter(nn.Module):
         return h_prim
 
 
+class PrimitiveSelfAttentionLayer(nn.Module):
+    def __init__(self, hidden_dim=512, num_heads=8, dropout=0.1, ffn_ratio=4):
+        super(PrimitiveSelfAttentionLayer, self).__init__()
+        self.self_attn = nn.MultiheadAttention(hidden_dim, num_heads, dropout=dropout, batch_first=True)
+        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.norm2 = nn.LayerNorm(hidden_dim)
+        self.dropout = nn.Dropout(dropout)
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * ffn_ratio),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim * ffn_ratio, hidden_dim),
+        )
+
+    def forward(self, x):
+        attn_out, _ = self.self_attn(x, x, x, need_weights=False)
+        x = self.norm1(x + self.dropout(attn_out))
+        ffn_out = self.ffn(x)
+        return self.norm2(x + self.dropout(ffn_out))
+
+
 class PrimitiveSemanticVAE(nn.Module):
     """
     Encodes primitive-conditioned relation evidence into a K-dimensional
@@ -330,7 +351,8 @@ class PrimitiveSemanticVAE(nn.Module):
     Args:
         num_primitives: Number of primitive dimensions K.
         hidden_dim: Feature dimension of each primitive evidence token.
-        decoder_hidden_dim: Hidden width of the primitive semantic decoder.
+        num_layers: Number of primitive self-attention layers in both encoder
+            and decoder.
         min_logvar/max_logvar: Bounds used to keep the posterior variance
             numerically stable.
 
@@ -350,23 +372,40 @@ class PrimitiveSemanticVAE(nn.Module):
         self,
         num_primitives,
         hidden_dim=512,
-        decoder_hidden_dim=512,
+        num_heads=8,
+        num_layers=3,
+        dropout=0.1,
         min_logvar=-8.0,
         max_logvar=4.0,
     ):
         super(PrimitiveSemanticVAE, self).__init__()
         self.num_primitives = num_primitives
+        self.hidden_dim = hidden_dim
         self.min_logvar = min_logvar
         self.max_logvar = max_logvar
 
+        self.encoder_input = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.LayerNorm(hidden_dim),
+            nn.Dropout(dropout),
+        )
+        self.encoder_layers = nn.ModuleList(
+            [PrimitiveSelfAttentionLayer(hidden_dim, num_heads, dropout) for _ in range(num_layers)]
+        )
         self.mu_head = nn.Linear(hidden_dim, 1)
         self.logvar_head = nn.Linear(hidden_dim, 1)
-        self.decoder = nn.Sequential(
-            nn.Linear(num_primitives, decoder_hidden_dim),
+
+        self.decoder_input = nn.Sequential(
+            nn.Linear(1, hidden_dim),
             nn.ReLU(inplace=True),
-            nn.LayerNorm(decoder_hidden_dim),
-            nn.Linear(decoder_hidden_dim, num_primitives),
+            nn.LayerNorm(hidden_dim),
+            nn.Dropout(dropout),
         )
+        self.decoder_layers = nn.ModuleList(
+            [PrimitiveSelfAttentionLayer(hidden_dim, num_heads, dropout) for _ in range(num_layers)]
+        )
+        self.decoder_output = nn.Linear(hidden_dim, 1)
 
     def reparameterize(self, mu, logvar):
         if self.training:
@@ -382,12 +421,26 @@ class PrimitiveSemanticVAE(nn.Module):
                     self.num_primitives, h_prim.size(1)
                 )
             )
+        if h_prim.size(2) != self.hidden_dim:
+            raise ValueError(
+                "PrimitiveSemanticVAE expected hidden_dim {}, got {}".format(
+                    self.hidden_dim, h_prim.size(2)
+                )
+            )
 
-        mu = self.mu_head(h_prim).squeeze(-1)
-        logvar = self.logvar_head(h_prim).squeeze(-1)
+        encoded = self.encoder_input(h_prim)
+        for layer in self.encoder_layers:
+            encoded = layer(encoded)
+
+        mu = self.mu_head(encoded).squeeze(-1)
+        logvar = self.logvar_head(encoded).squeeze(-1)
         logvar = logvar.clamp(min=self.min_logvar, max=self.max_logvar)
         z = self.reparameterize(mu, logvar)
-        recon_logits = self.decoder(z)
+
+        decoded = self.decoder_input(z.unsqueeze(-1))
+        for layer in self.decoder_layers:
+            decoded = layer(decoded)
+        recon_logits = self.decoder_output(decoded).squeeze(-1)
         return {
             "mu": mu,
             "logvar": logvar,
