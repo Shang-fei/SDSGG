@@ -164,20 +164,36 @@ class PrimitiveGuidedRelationAdapter(nn.Module):
     def __init__(self, visual_dim=512, text_dim=512, hidden_dim=512, num_heads=8, dropout=0.1):
         super(PrimitiveGuidedRelationAdapter, self).__init__()
         self.hidden_dim = hidden_dim
-        self.text_proj = nn.Sequential(
+        self.primitive_text_proj = nn.Sequential(
             nn.Linear(text_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.ReLU(inplace=True),
         )
+        self.subject_text_proj = nn.Sequential(
+            nn.Linear(text_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(inplace=True),
+        )
+        self.object_text_proj = nn.Sequential(
+            nn.Linear(text_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(inplace=True),
+        )
+        self.prompt_adapter = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        nn.init.zeros_(self.prompt_adapter.weight)
+        self.prompt_scale = nn.Parameter(torch.ones(1))
         self.visual_proj = nn.Sequential(
             nn.Linear(visual_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.ReLU(inplace=True),
         )
+        self.token_type = nn.Parameter(torch.zeros(4, hidden_dim))
+        self.query_norm = nn.LayerNorm(hidden_dim)
         self.subject_attn = PrimitiveCrossAttentionBlock(hidden_dim, num_heads, dropout)
         self.object_attn = PrimitiveCrossAttentionBlock(hidden_dim, num_heads, dropout)
         self.sub_to_obj_attn = PrimitiveCrossAttentionBlock(hidden_dim, num_heads, dropout)
         self.obj_to_sub_attn = PrimitiveCrossAttentionBlock(hidden_dim, num_heads, dropout)
+        self.pair_attn = PrimitiveCrossAttentionBlock(hidden_dim, num_heads, dropout)
 
         self.geometry_dim = 37
         self.geometry_encoder = nn.Sequential(
@@ -244,42 +260,66 @@ class PrimitiveGuidedRelationAdapter(nn.Module):
             iou.unsqueeze(1),
         ), dim=1)
 
-    def _split_object_features(self, obj_visual_features, proposals):
-        if isinstance(obj_visual_features, (list, tuple)):
-            return list(obj_visual_features)
+    def _split_by_image(self, features, proposals):
+        if isinstance(features, (list, tuple)):
+            return list(features)
         num_objs = [len(proposal) for proposal in proposals]
-        return list(obj_visual_features.split(num_objs, dim=0))
+        return list(features.split(num_objs, dim=0))
 
-    def _collect_pair_inputs(self, obj_visual_features, proposals, rel_pair_idxs):
-        obj_features_per_image = self._split_object_features(obj_visual_features, proposals)
-        sub_features = []
-        obj_features = []
+    def _collect_pair_inputs(self, obj_visual_tokens, obj_text_features, proposals, rel_pair_idxs):
+        obj_tokens_per_image = self._split_by_image(obj_visual_tokens, proposals)
+        obj_text_per_image = self._split_by_image(obj_text_features, proposals)
+        sub_tokens = []
+        obj_tokens = []
+        sub_texts = []
+        obj_texts = []
         geometry_features = []
 
-        for per_image_features, proposal, pair_idx in zip(obj_features_per_image, proposals, rel_pair_idxs):
+        for per_image_tokens, per_image_texts, proposal, pair_idx in zip(
+                obj_tokens_per_image, obj_text_per_image, proposals, rel_pair_idxs):
             if pair_idx.numel() == 0:
                 continue
             sub_idx = pair_idx[:, 0]
             obj_idx = pair_idx[:, 1]
-            sub_features.append(per_image_features[sub_idx])
-            obj_features.append(per_image_features[obj_idx])
+            sub_tokens.append(per_image_tokens[sub_idx])
+            obj_tokens.append(per_image_tokens[obj_idx])
+            sub_texts.append(per_image_texts[sub_idx])
+            obj_texts.append(per_image_texts[obj_idx])
             sub_boxes = proposal.bbox[sub_idx]
             obj_boxes = proposal.bbox[obj_idx]
             geometry_features.append(self._pair_geometry(sub_boxes, obj_boxes, proposal.size))
 
-        if len(sub_features) == 0:
-            return None, None, None
+        if len(sub_tokens) == 0:
+            return None, None, None, None, None
 
         return (
-            torch.cat(sub_features, dim=0),
-            torch.cat(obj_features, dim=0),
+            torch.cat(sub_tokens, dim=0),
+            torch.cat(obj_tokens, dim=0),
+            torch.cat(sub_texts, dim=0),
+            torch.cat(obj_texts, dim=0),
             torch.cat(geometry_features, dim=0),
         )
 
-    def forward(self, obj_visual_features, proposals, rel_pair_idxs, primitive_text_features):
+    def _project_visual_tokens(self, features):
+        if features.dim() != 3:
+            raise ValueError("obj_visual_tokens must be [N, T, D] CLIP visual tokens")
+        return self.visual_proj(features)
+
+    def _build_visual_memory(self, sub_tokens, obj_tokens):
+        sub_cls, sub_patch = sub_tokens[:, :1], sub_tokens[:, 1:]
+        obj_cls, obj_patch = obj_tokens[:, :1], obj_tokens[:, 1:]
+        sub_cls = sub_cls + self.token_type[0].view(1, 1, -1)
+        obj_cls = obj_cls + self.token_type[1].view(1, 1, -1)
+        sub_patch = sub_patch + self.token_type[2].view(1, 1, -1)
+        obj_patch = obj_patch + self.token_type[3].view(1, 1, -1)
+        return torch.cat((sub_cls, obj_cls, sub_patch, obj_patch), dim=1)
+
+    def forward(self, obj_visual_tokens, obj_text_features, proposals, rel_pair_idxs, primitive_text_features):
         """
         Args:
-            obj_visual_features: Tensor [sum_obj, Dv] or list of per-image tensors.
+            obj_visual_tokens: Tensor [sum_obj, T, Dv] or list of per-image tensors.
+                T is expected to be CLIP visual tokens, e.g. CLS + 196 patches.
+            obj_text_features: Tensor [sum_obj, Dt] or list of per-image tensors.
             proposals: list[BoxList], aligned with rel_pair_idxs.
             rel_pair_idxs: list[Tensor], each [num_rel_i, 2] with local object indices.
             primitive_text_features: Tensor [K, Dt].
@@ -287,34 +327,48 @@ class PrimitiveGuidedRelationAdapter(nn.Module):
         Returns:
             h_prim: Tensor [sum_rel, K, hidden_dim].
         """
-        dtype = self.text_proj[0].weight.dtype
-        device = self.text_proj[0].weight.device
-        obj_visual_features = obj_visual_features.to(device=device, dtype=dtype) \
-            if torch.is_tensor(obj_visual_features) else [x.to(device=device, dtype=dtype) for x in obj_visual_features]
+        dtype = self.primitive_text_proj[0].weight.dtype
+        device = self.primitive_text_proj[0].weight.device
+        obj_visual_tokens = obj_visual_tokens.to(device=device, dtype=dtype) \
+            if torch.is_tensor(obj_visual_tokens) else [x.to(device=device, dtype=dtype) for x in obj_visual_tokens]
+        obj_text_features = obj_text_features.to(device=device, dtype=dtype) \
+            if torch.is_tensor(obj_text_features) else [x.to(device=device, dtype=dtype) for x in obj_text_features]
         primitive_text_features = primitive_text_features.to(device=device, dtype=dtype)
 
-        sub_features, obj_features, geometry_features = self._collect_pair_inputs(
-            obj_visual_features, proposals, rel_pair_idxs
+        sub_tokens, obj_tokens, sub_texts, obj_texts, geometry_features = self._collect_pair_inputs(
+            obj_visual_tokens, obj_text_features, proposals, rel_pair_idxs
         )
         num_primitives = primitive_text_features.size(0)
-        if sub_features is None:
+        if sub_tokens is None:
             return primitive_text_features.new_zeros((0, num_primitives, self.hidden_dim))
 
-        q_prim = self.text_proj(primitive_text_features).unsqueeze(0).expand(sub_features.size(0), -1, -1)
-        sub_tokens = self.visual_proj(sub_features).unsqueeze(1)
-        obj_tokens = self.visual_proj(obj_features).unsqueeze(1)
+        sub_tokens = self._project_visual_tokens(sub_tokens)
+        obj_tokens = self._project_visual_tokens(obj_tokens)
         geometry = self.geometry_encoder(geometry_features.to(device=device, dtype=dtype)).unsqueeze(1)
+        primitive_query = self.primitive_text_proj(primitive_text_features)
+        primitive_query = primitive_query + self.prompt_scale * self.prompt_adapter(primitive_query)
+        subject_query = self.subject_text_proj(sub_texts).unsqueeze(1)
+        object_query = self.object_text_proj(obj_texts).unsqueeze(1)
+
+        q_prim = self.query_norm(
+            primitive_query.unsqueeze(0) +
+            subject_query +
+            object_query +
+            geometry
+        )
 
         sub_evidence = self.subject_attn(q_prim, sub_tokens)
         obj_evidence = self.object_attn(q_prim, obj_tokens)
         sub_obj_evidence = self.sub_to_obj_attn(sub_evidence, obj_evidence)
         obj_sub_evidence = self.obj_to_sub_attn(obj_evidence, sub_evidence)
+        visual_memory = self._build_visual_memory(sub_tokens, obj_tokens)
+        pair_evidence = self.pair_attn(q_prim, visual_memory)
 
         geometry = geometry.expand(-1, num_primitives, -1)
         h_prim = self.fusion(torch.cat((
             sub_obj_evidence,
             obj_sub_evidence,
-            sub_obj_evidence * obj_sub_evidence,
+            pair_evidence,
             torch.abs(sub_obj_evidence - obj_sub_evidence),
             geometry,
         ), dim=-1))
