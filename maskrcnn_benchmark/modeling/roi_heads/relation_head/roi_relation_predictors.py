@@ -352,134 +352,6 @@ class PrimitiveGuidedRelationAdapter(nn.Module):
         return self.pair_attn(q_prim, visual_memory)
 
 
-class PrimitiveSelfAttentionLayer(nn.Module):
-    def __init__(self, hidden_dim=512, num_heads=8, dropout=0.1, ffn_ratio=4):
-        super(PrimitiveSelfAttentionLayer, self).__init__()
-        self.self_attn = nn.MultiheadAttention(hidden_dim, num_heads, dropout=dropout, batch_first=True)
-        self.norm1 = nn.LayerNorm(hidden_dim)
-        self.norm2 = nn.LayerNorm(hidden_dim)
-        self.dropout = nn.Dropout(dropout)
-        self.ffn = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim * ffn_ratio),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim * ffn_ratio, hidden_dim),
-        )
-
-    def forward(self, x):
-        attn_out, _ = self.self_attn(x, x, x, need_weights=False)
-        x = self.norm1(x + self.dropout(attn_out))
-        ffn_out = self.ffn(x)
-        return self.norm2(x + self.dropout(ffn_out))
-
-
-class PrimitiveSemanticVAE(nn.Module):
-    """
-    Encodes primitive-conditioned relation evidence into a K-dimensional
-    primitive latent distribution and reconstructs the predicate primitive
-    composition from the sampled latent.
-
-    Args:
-        num_primitives: Number of primitive dimensions K.
-        hidden_dim: Feature dimension of each primitive evidence token.
-        num_layers: Number of primitive self-attention layers in both encoder
-            and decoder.
-        min_logvar/max_logvar: Bounds used to keep the posterior variance
-            numerically stable.
-
-    Inputs:
-        h_prim: Tensor [num_rel, K, hidden_dim] from
-            PrimitiveGuidedRelationAdapter.
-
-    Returns:
-        A dict with:
-            mu: [num_rel, K]
-            logvar: [num_rel, K]
-            z: [num_rel, K]
-            recon_logits: [num_rel, K]
-    """
-
-    def __init__(
-        self,
-        num_primitives,
-        hidden_dim=512,
-        num_heads=8,
-        num_layers=3,
-        dropout=0.1,
-        min_logvar=-8.0,
-        max_logvar=4.0,
-    ):
-        super(PrimitiveSemanticVAE, self).__init__()
-        self.num_primitives = num_primitives
-        self.hidden_dim = hidden_dim
-        self.min_logvar = min_logvar
-        self.max_logvar = max_logvar
-
-        self.encoder_input = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.LayerNorm(hidden_dim),
-            nn.Dropout(dropout),
-        )
-        self.encoder_layers = nn.ModuleList(
-            [PrimitiveSelfAttentionLayer(hidden_dim, num_heads, dropout) for _ in range(num_layers)]
-        )
-        self.mu_head = nn.Linear(hidden_dim, 1)
-        self.logvar_head = nn.Linear(hidden_dim, 1)
-
-        self.decoder_input = nn.Sequential(
-            nn.Linear(1, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.LayerNorm(hidden_dim),
-            nn.Dropout(dropout),
-        )
-        self.decoder_layers = nn.ModuleList(
-            [PrimitiveSelfAttentionLayer(hidden_dim, num_heads, dropout) for _ in range(num_layers)]
-        )
-        self.decoder_output = nn.Linear(hidden_dim, 1)
-
-    def reparameterize(self, mu, logvar):
-        if self.training:
-            std = torch.exp(0.5 * logvar)
-            eps = torch.randn_like(std)
-            return mu + eps * std
-        return mu
-
-    def forward(self, h_prim):
-        if h_prim.size(1) != self.num_primitives:
-            raise ValueError(
-                "PrimitiveSemanticVAE expected {} primitives, got {}".format(
-                    self.num_primitives, h_prim.size(1)
-                )
-            )
-        if h_prim.size(2) != self.hidden_dim:
-            raise ValueError(
-                "PrimitiveSemanticVAE expected hidden_dim {}, got {}".format(
-                    self.hidden_dim, h_prim.size(2)
-                )
-            )
-
-        encoded = self.encoder_input(h_prim)
-        for layer in self.encoder_layers:
-            encoded = layer(encoded)
-
-        mu = self.mu_head(encoded).squeeze(-1)
-        logvar = self.logvar_head(encoded).squeeze(-1)
-        logvar = logvar.clamp(min=self.min_logvar, max=self.max_logvar)
-        z = self.reparameterize(mu, logvar)
-
-        decoded = self.decoder_input(z.unsqueeze(-1))
-        for layer in self.decoder_layers:
-            decoded = layer(decoded)
-        recon_logits = self.decoder_output(decoded).squeeze(-1)
-        return {
-            "mu": mu,
-            "logvar": logvar,
-            "z": z,
-            "recon_logits": recon_logits,
-        }
-
-
 @registry.ROI_RELATION_PREDICTOR.register("GQAClipPredictor")
 class GQAClipPredictor(nn.Module):
     def __init__(self, config, in_channels):
@@ -1074,7 +946,6 @@ class SFClipPredictor(nn.Module):
 
         predicate_prior = self._load_predicate_primitive_prior().to(self.device)
         self.register_buffer("predicate_primitive_prior", predicate_prior)
-        self.register_buffer("predicate_primitive_logvar", torch.zeros_like(predicate_prior))
 
         self.primitive_adapter = PrimitiveGuidedRelationAdapter(
             visual_dim=primitive_text_features.size(-1),
@@ -1083,15 +954,8 @@ class SFClipPredictor(nn.Module):
             num_heads=8,
             dropout=0.1,
         )
-        self.primitive_vae = PrimitiveSemanticVAE(
-            num_primitives=self.num_primitives,
-            hidden_dim=512,
-            num_heads=8,
-            num_layers=2,
-            dropout=0.1,
-        )
-        self.kl_weight = 0.01
-        self.score_temperature = 1.0
+        self.primitive_temperature = 0.05
+        self.clip_object_batch_size = getattr(config.MODEL.ROI_RELATION_HEAD, "CLIP_OBJECT_BATCH_SIZE", 32)
         self.updata(getattr(config.OV_SETTING, "TRAIN_PART", "base"))
 
         b=time.time()
@@ -1139,24 +1003,6 @@ class SFClipPredictor(nn.Module):
             return []
         return list(rel_tensor.split(num_rels, dim=0))
 
-    def _kl_loss(self, mu, logvar, rel_labels):
-        if rel_labels is None:
-            return mu.sum() * 0.0
-        rel_labels = cat(rel_labels, dim=0).view(-1).long().to(mu.device)
-        keep = rel_labels > 0
-        if keep.sum().item() == 0:
-            return mu.sum() * 0.0
-        mu = mu[keep]
-        logvar = logvar[keep]
-        prior_mu = self.predicate_primitive_prior.to(device=mu.device, dtype=mu.dtype)[rel_labels[keep]]
-        prior_logvar = self.predicate_primitive_logvar.to(device=mu.device, dtype=mu.dtype)[rel_labels[keep]]
-        kl = 0.5 * (
-            prior_logvar - logvar
-            + (torch.exp(logvar) + (mu - prior_mu).pow(2)) / torch.exp(prior_logvar).clamp(min=1e-8)
-            - 1.0
-        )
-        return kl.mean()
-
     def _extract_clip_object_tokens(self, proposals, img):
         if img is None:
             raise ValueError("SFClipPredictor requires img to extract CLIP object tokens")
@@ -1173,8 +1019,23 @@ class SFClipPredictor(nn.Module):
             return self.primitive_text_features.new_zeros((0, 197, self.primitive_text_features.size(-1)))
 
         image_tensors = torch.cat(image_tensors, dim=0).to(self.device)
+        batch_size = max(int(self.clip_object_batch_size), 1)
+        clip_features = []
         with torch.no_grad():
-            return self.clip_model.encode_image(image_tensors).float()
+            for start in range(0, image_tensors.size(0), batch_size):
+                clip_features.append(
+                    self.clip_model.encode_image(image_tensors[start:start + batch_size]).float()
+                )
+        return torch.cat(clip_features, dim=0)
+
+    def _compute_primitive_logits(self, h_prim):
+        dtype = h_prim.dtype
+        device = h_prim.device
+        primitive_text_features = self.primitive_text_features.to(device=device, dtype=dtype)
+        primitive_proto = self.primitive_adapter.primitive_text_proj(primitive_text_features)
+        h_prim = F.normalize(h_prim, dim=-1)
+        primitive_proto = F.normalize(primitive_proto, dim=-1)
+        return (h_prim * primitive_proto.unsqueeze(0)).sum(-1) / self.primitive_temperature
 
     def forward(self, proposals, rel_pair_idxs, rel_labels, rel_binarys, roi_features, union_features, logger=None,img=None):
         """
@@ -1203,8 +1064,7 @@ class SFClipPredictor(nn.Module):
                 rel_dists = tuple(
                     roi_features.new_zeros((0, len(self.active_predicate_ids))) for _ in num_rels
                 )
-            add_losses = {"loss_primitive_kl": roi_features.sum() * 0.0}
-            return obj_dists, rel_dists, add_losses
+            return obj_dists, rel_dists, {}
 
         obj_text_features = self.object_text_features.to(device=roi_features.device)[obj_preds.long()]
         obj_visual_tokens = self._extract_clip_object_tokens(proposals, img).to(device=roi_features.device)
@@ -1215,24 +1075,21 @@ class SFClipPredictor(nn.Module):
             rel_pair_idxs,
             self.primitive_text_features,
         )
-        vae_out = self.primitive_vae(h_prim)
-        mu_v = vae_out["mu"]
-        logvar_v = vae_out["logvar"]
+        primitive_logits = self._compute_primitive_logits(h_prim)
 
         obj_dists = obj_dists.split(num_objs, dim=0)
         if self.training:
-            rel_dists = tuple(self._split_rel_tensor(mu_v, num_rels))
+            rel_dists = tuple(self._split_rel_tensor(primitive_logits, num_rels))
         else:
-            active_prior = self.predicate_primitive_prior.to(device=mu_v.device, dtype=mu_v.dtype)[
-                self.active_predicate_ids_tensor.to(mu_v.device)
+            active_prior = self.predicate_primitive_prior.to(
+                device=primitive_logits.device, dtype=primitive_logits.dtype
+            )[
+                self.active_predicate_ids_tensor.to(primitive_logits.device)
             ]
-            rel_scores = torch.matmul(mu_v, active_prior.t()) / self.score_temperature
+            rel_scores = torch.matmul(primitive_logits, active_prior.t())
             rel_dists = tuple(self._split_rel_tensor(rel_scores, num_rels))
 
-        add_losses = {
-            "loss_primitive_kl": self._kl_loss(mu_v, logvar_v, rel_labels) * self.kl_weight
-        }
-        return obj_dists, rel_dists, add_losses
+        return obj_dists, rel_dists, {}
 
 def make_roi_relation_predictor(cfg, in_channels):
     func = registry.ROI_RELATION_PREDICTOR[cfg.MODEL.ROI_RELATION_HEAD.PREDICTOR]
