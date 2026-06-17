@@ -1131,9 +1131,10 @@ class SFClipPredictor(nn.Module):
                         train_scores = torch.matmul(logits, active_prior.t())
                         train_top_cols = train_scores[:, 1:].max(dim=1)[1]
                         train_pred_ids = self.active_predicate_ids_tensor.to(logits.device)[train_top_cols + 1]
-                        pred_uniq, pred_counts = train_pred_ids.unique(return_counts=True)
-                        hit = (train_pred_ids[positive_mask] == all_labels[positive_mask]).float().mean().item()
-                        msg.append("train pred top={} pred@gt hit={:.4f}".format(
+                        gt_pair_pred_ids = train_pred_ids[positive_mask]
+                        pred_uniq, pred_counts = gt_pair_pred_ids.unique(return_counts=True)
+                        hit = (gt_pair_pred_ids == positive_labels).float().mean().item()
+                        msg.append("train pred top(gt pairs)={} pred@gt hit={:.4f}".format(
                             self._format_rel_hist(pred_uniq, pred_counts),
                             hit,
                         ))
