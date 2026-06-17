@@ -1074,7 +1074,7 @@ class SFClipPredictor(nn.Module):
             for val, idx in zip(top_vals, top_ids)
         ])
 
-    def _debug_sf_state(self, primitive_logits, rel_scores=None, rel_labels=None):
+    def _debug_sf_state(self, primitive_logits, h_prim=None, rel_scores=None, rel_labels=None):
         if not self.sf_debug:
             return
         rank = int(os.environ.get("RANK", "0"))
@@ -1123,6 +1123,23 @@ class SFClipPredictor(nn.Module):
                         msg.append("gt primitive abs mean={}".format(self._format_primitive_top(gt_primitive_mean)))
                         msg.append("decisive mae={:.4f} sign hit={:.4f}".format(decisive_mae, signed_hit))
 
+                    if h_prim is not None:
+                        # 诊断 32 个原语 token 是否学成相似表示；越接近 1，原语轴越可能塌缩。
+                        positive_h_prim = h_prim.detach().float()[positive_mask]
+                        if positive_h_prim.size(0) > 0 and positive_h_prim.size(1) > 1:
+                            norm_h_prim = F.normalize(positive_h_prim, dim=-1)
+                            primitive_sim = torch.bmm(norm_h_prim, norm_h_prim.transpose(1, 2))
+                            off_diag = ~torch.eye(
+                                primitive_sim.size(1),
+                                dtype=torch.bool,
+                                device=primitive_sim.device,
+                            ).unsqueeze(0)
+                            primitive_sim = primitive_sim[off_diag.expand_as(primitive_sim)]
+                            msg.append("primitive collapse cos={:.4f} abs={:.4f}".format(
+                                primitive_sim.mean().item(),
+                                primitive_sim.abs().mean().item(),
+                            ))
+
                     if rel_scores is None:
                         active_prior = self.predicate_primitive_prior.to(
                             device=logits.device, dtype=logits.dtype
@@ -1141,6 +1158,22 @@ class SFClipPredictor(nn.Module):
                         ))
 
             if rel_scores is not None and rel_scores.numel() > 0:
+                if h_prim is not None:
+                    # eval 阶段没有采样标签时，也统计全部候选 pair 的原语相似度。
+                    eval_h_prim = h_prim.detach().float()
+                    if eval_h_prim.size(0) > 0 and eval_h_prim.size(1) > 1:
+                        norm_h_prim = F.normalize(eval_h_prim, dim=-1)
+                        primitive_sim = torch.bmm(norm_h_prim, norm_h_prim.transpose(1, 2))
+                        off_diag = ~torch.eye(
+                            primitive_sim.size(1),
+                            dtype=torch.bool,
+                            device=primitive_sim.device,
+                        ).unsqueeze(0)
+                        primitive_sim = primitive_sim[off_diag.expand_as(primitive_sim)]
+                        msg.append("primitive collapse cos={:.4f} abs={:.4f}".format(
+                            primitive_sim.mean().item(),
+                            primitive_sim.abs().mean().item(),
+                        ))
                 scores = rel_scores.detach().float()
                 top_scores, top_cols = scores[:, 1:].max(dim=1)
                 pred_ids = self.active_predicate_ids_tensor.to(top_cols.device)[top_cols + 1]
@@ -1210,7 +1243,7 @@ class SFClipPredictor(nn.Module):
 
         obj_dists = obj_dists.split(num_objs, dim=0)
         if self.training:
-            self._debug_sf_state(primitive_logits, rel_labels=rel_labels)
+            self._debug_sf_state(primitive_logits, h_prim=h_prim, rel_labels=rel_labels)
             rel_dists = tuple(self._split_rel_tensor(primitive_logits, num_rels))
         else:
             active_prior = self.predicate_primitive_prior.to(
@@ -1221,7 +1254,7 @@ class SFClipPredictor(nn.Module):
             active_prior = F.normalize(active_prior, dim=-1)
             rel_scores = torch.matmul(primitive_logits, active_prior.t())
             debug_gt_labels = self._collect_pair_gt_labels(proposals, rel_pair_idxs, primitive_logits.device)
-            self._debug_sf_state(primitive_logits, rel_scores=rel_scores, rel_labels=debug_gt_labels)
+            self._debug_sf_state(primitive_logits, h_prim=h_prim, rel_scores=rel_scores, rel_labels=debug_gt_labels)
             rel_dists = tuple(self._split_rel_tensor(rel_scores, num_rels))
 
         return obj_dists, rel_dists, {}
