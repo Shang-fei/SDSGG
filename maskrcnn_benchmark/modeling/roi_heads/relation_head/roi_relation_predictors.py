@@ -170,7 +170,6 @@ class PrimitiveGuidedRelationAdapter(nn.Module):
             nn.LayerNorm(hidden_dim),
             nn.ReLU(inplace=True),
         )
-        self.shared_prompt = nn.Parameter(torch.zeros(1, hidden_dim))
         self.subject_object_mva = MVA().float()
         self.object_subject_mva = MVA().float()
         self.memory_type = nn.Parameter(torch.zeros(2, hidden_dim))
@@ -246,9 +245,9 @@ class PrimitiveGuidedRelationAdapter(nn.Module):
 
         sub_tokens = self._project_visual_tokens(sub_tokens)
         obj_tokens = self._project_visual_tokens(obj_tokens)
-        # query 只保留原语文本锚点和共享可学习 prompt，避免 pair 条件广播导致原语轴塌缩。
+        # query 只保留原语文本锚点，避免共享 prompt 或 pair 条件把 32 个原语拉到同一方向。
         primitive_query = self.primitive_text_proj(primitive_text_features)
-        q_prim = self.query_norm(primitive_query + self.shared_prompt).unsqueeze(0)
+        q_prim = self.query_norm(primitive_query).unsqueeze(0)
         q_prim = q_prim.expand(sub_tokens.size(0), -1, -1)
         visual_memory = self._build_visual_memory(sub_tokens, obj_tokens)
         return self.pair_attn(q_prim, visual_memory)
