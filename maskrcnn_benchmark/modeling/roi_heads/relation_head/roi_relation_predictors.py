@@ -956,6 +956,9 @@ class SFClipPredictor(nn.Module):
         )
         self.primitive_temperature = 0.05
         self.clip_object_batch_size = getattr(config.MODEL.ROI_RELATION_HEAD, "CLIP_OBJECT_BATCH_SIZE", 32)
+        self.sf_debug = os.environ.get("SFC_DEBUG", "0") == "1"
+        self.sf_debug_interval = max(int(os.environ.get("SFC_DEBUG_INTERVAL", "200")), 1)
+        self.sf_debug_step = 0
         self.updata(getattr(config.OV_SETTING, "TRAIN_PART", "base"))
 
         b=time.time()
@@ -1037,6 +1040,69 @@ class SFClipPredictor(nn.Module):
         primitive_proto = F.normalize(primitive_proto, dim=-1)
         return (h_prim * primitive_proto.unsqueeze(0)).sum(-1) / self.primitive_temperature
 
+    def _debug_sf_state(self, primitive_logits, rel_scores=None, rel_labels=None):
+        if not self.sf_debug:
+            return
+        rank = int(os.environ.get("RANK", "0"))
+        if rank != 0:
+            return
+        self.sf_debug_step += 1
+        if self.sf_debug_step % self.sf_debug_interval != 0:
+            return
+
+        with torch.no_grad():
+            logits = primitive_logits.detach().float()
+            msg = [
+                "[SFClipDebug step={} mode={} train={}]".format(
+                    self.sf_debug_step, self.mode, self.training
+                ),
+                "primitive_logits shape={} mean={:.4f} std={:.4f} min={:.4f} max={:.4f}".format(
+                    tuple(logits.shape),
+                    logits.mean().item(),
+                    logits.std(unbiased=False).item(),
+                    logits.min().item(),
+                    logits.max().item(),
+                ),
+            ]
+            primitive_mean = logits.mean(dim=0)
+            top_vals, top_ids = primitive_mean.topk(min(5, primitive_mean.numel()))
+            top_prim = [
+                "{}:{:.3f}".format(self.primitive_names[int(idx)], val.item())
+                for val, idx in zip(top_vals, top_ids)
+            ]
+            msg.append("top primitive mean={}".format(", ".join(top_prim)))
+
+            if rel_labels is not None:
+                labels = cat(rel_labels, dim=0).view(-1).long().to(logits.device)
+                labels = labels[labels > 0]
+                if labels.numel() > 0:
+                    uniq, counts = labels.unique(return_counts=True)
+                    order = counts.argsort(descending=True)[:5]
+                    label_hist = [
+                        "{}:{}".format(self.rel_names[int(uniq[i])], int(counts[i]))
+                        for i in order
+                    ]
+                    msg.append("positive label top={}".format(", ".join(label_hist)))
+
+            if rel_scores is not None and rel_scores.numel() > 0:
+                scores = rel_scores.detach().float()
+                top_scores, top_cols = scores[:, 1:].max(dim=1)
+                pred_ids = self.active_predicate_ids_tensor.to(top_cols.device)[top_cols + 1]
+                uniq, counts = pred_ids.unique(return_counts=True)
+                order = counts.argsort(descending=True)[:5]
+                pred_hist = [
+                    "{}:{}".format(self.rel_names[int(uniq[i])], int(counts[i]))
+                    for i in order
+                ]
+                msg.append("rel_scores shape={} mean={:.4f} std={:.4f} pred top={} score mean={:.4f}".format(
+                    tuple(scores.shape),
+                    scores.mean().item(),
+                    scores.std(unbiased=False).item(),
+                    ", ".join(pred_hist),
+                    top_scores.mean().item(),
+                ))
+            print(" | ".join(msg))
+
     def forward(self, proposals, rel_pair_idxs, rel_labels, rel_binarys, roi_features, union_features, logger=None,img=None):
         """
         Returns:
@@ -1079,6 +1145,7 @@ class SFClipPredictor(nn.Module):
 
         obj_dists = obj_dists.split(num_objs, dim=0)
         if self.training:
+            self._debug_sf_state(primitive_logits, rel_labels=rel_labels)
             rel_dists = tuple(self._split_rel_tensor(primitive_logits, num_rels))
         else:
             active_prior = self.predicate_primitive_prior.to(
@@ -1088,6 +1155,7 @@ class SFClipPredictor(nn.Module):
             ]
             active_prior = F.normalize(active_prior, dim=-1)
             rel_scores = torch.matmul(primitive_logits, active_prior.t())
+            self._debug_sf_state(primitive_logits, rel_scores=rel_scores)
             rel_dists = tuple(self._split_rel_tensor(rel_scores, num_rels))
 
         return obj_dists, rel_dists, {}
