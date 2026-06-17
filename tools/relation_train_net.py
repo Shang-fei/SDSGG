@@ -9,10 +9,13 @@ from maskrcnn_benchmark.utils.env import setup_environment  # noqa F401 isort:sk
 
 import argparse
 import os
+import random
 import time
 import datetime
 
+import numpy as np
 import torch
+import torch.backends.cudnn as cudnn
 from torch.nn.utils import clip_grad_norm_
 
 from maskrcnn_benchmark.config import cfg
@@ -36,6 +39,15 @@ from maskrcnn_benchmark.utils.metric_logger import MetricLogger
 
 from torch.cuda.amp import autocast as autocast, GradScaler
 from thop import  profile
+
+def set_random_seed(seed, deterministic=False):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    if deterministic:
+        cudnn.deterministic = True
+        cudnn.benchmark = False
 
 def train(cfg, local_rank, distributed, logger):
     debug_print(logger, 'prepare training')
@@ -335,6 +347,8 @@ def main():
         type=str,
     )
     parser.add_argument("--local_rank", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=3407)
+    parser.add_argument("--deterministic", action="store_true")
     parser.add_argument(
         "--skip-test",
         dest="skip_test",
@@ -360,6 +374,9 @@ def main():
         )
         synchronize()
 
+    seed = args.seed + get_rank()
+    set_random_seed(seed, deterministic=args.deterministic)
+
     cfg.merge_from_file(args.config_file)
     cfg.merge_from_list(args.opts)
     cfg.freeze()
@@ -370,6 +387,7 @@ def main():
 
     logger = setup_logger("maskrcnn_benchmark", output_dir, get_rank())
     logger.info("Using {} GPUs".format(num_gpus))
+    logger.info("Using random seed {} deterministic={}".format(seed, args.deterministic))
     logger.info(args)
 
     logger.info("Collecting env info (might take some time)")

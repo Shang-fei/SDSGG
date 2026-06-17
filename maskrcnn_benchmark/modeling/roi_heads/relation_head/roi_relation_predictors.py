@@ -1060,6 +1060,20 @@ class SFClipPredictor(nn.Module):
             return None
         return gt_labels
 
+    def _format_rel_hist(self, labels, counts):
+        order = counts.argsort(descending=True)[:5]
+        return ", ".join([
+            "{}:{}".format(self._rel_name(labels[i]), int(counts[i]))
+            for i in order
+        ])
+
+    def _format_primitive_top(self, values):
+        top_vals, top_ids = values.topk(min(5, values.numel()))
+        return ", ".join([
+            "{}:{:.3f}".format(self.primitive_names[int(idx)], val.item())
+            for val, idx in zip(top_vals, top_ids)
+        ])
+
     def _debug_sf_state(self, primitive_logits, rel_scores=None, rel_labels=None):
         if not self.sf_debug:
             return
@@ -1085,24 +1099,44 @@ class SFClipPredictor(nn.Module):
                 ),
             ]
             primitive_mean = logits.mean(dim=0)
-            top_vals, top_ids = primitive_mean.topk(min(5, primitive_mean.numel()))
-            top_prim = [
-                "{}:{:.3f}".format(self.primitive_names[int(idx)], val.item())
-                for val, idx in zip(top_vals, top_ids)
-            ]
-            msg.append("top primitive mean={}".format(", ".join(top_prim)))
+            msg.append("pred primitive mean={}".format(self._format_primitive_top(primitive_mean)))
 
             if rel_labels is not None:
-                labels = cat(rel_labels, dim=0).view(-1).long().to(logits.device)
-                labels = labels[labels > 0]
-                if labels.numel() > 0:
-                    uniq, counts = labels.unique(return_counts=True)
-                    order = counts.argsort(descending=True)[:5]
-                    label_hist = [
-                        "{}:{}".format(self._rel_name(uniq[i]), int(counts[i]))
-                        for i in order
-                    ]
-                    msg.append("positive label top={}".format(", ".join(label_hist)))
+                all_labels = cat(rel_labels, dim=0).view(-1).long().to(logits.device)
+                positive_mask = all_labels > 0
+                positive_labels = all_labels[positive_mask]
+                if positive_labels.numel() > 0:
+                    uniq, counts = positive_labels.unique(return_counts=True)
+                    msg.append("gt predicate top={}".format(self._format_rel_hist(uniq, counts)))
+                    gt_prior = self.predicate_primitive_prior.to(
+                        device=logits.device, dtype=logits.dtype
+                    )[positive_labels]
+                    positive_logits = logits[positive_mask]
+                    decisive = gt_prior != 0
+                    if decisive.any():
+                        gt_target = gt_prior * 2.0
+                        decisive_mae = (positive_logits[decisive] - gt_target[decisive]).abs().mean().item()
+                        signed_hit = (
+                            torch.sign(positive_logits[decisive]) == torch.sign(gt_prior[decisive])
+                        ).float().mean().item()
+                        gt_primitive_mean = gt_prior.float().mean(dim=0).abs()
+                        msg.append("gt primitive abs mean={}".format(self._format_primitive_top(gt_primitive_mean)))
+                        msg.append("decisive mae={:.4f} sign hit={:.4f}".format(decisive_mae, signed_hit))
+
+                    if rel_scores is None:
+                        active_prior = self.predicate_primitive_prior.to(
+                            device=logits.device, dtype=logits.dtype
+                        )[self.active_predicate_ids_tensor.to(logits.device)]
+                        active_prior = F.normalize(active_prior, dim=-1)
+                        train_scores = torch.matmul(logits, active_prior.t())
+                        train_top_cols = train_scores[:, 1:].max(dim=1)[1]
+                        train_pred_ids = self.active_predicate_ids_tensor.to(logits.device)[train_top_cols + 1]
+                        pred_uniq, pred_counts = train_pred_ids.unique(return_counts=True)
+                        hit = (train_pred_ids[positive_mask] == all_labels[positive_mask]).float().mean().item()
+                        msg.append("train pred top={} pred@gt hit={:.4f}".format(
+                            self._format_rel_hist(pred_uniq, pred_counts),
+                            hit,
+                        ))
 
             if rel_scores is not None and rel_scores.numel() > 0:
                 scores = rel_scores.detach().float()
@@ -1114,23 +1148,16 @@ class SFClipPredictor(nn.Module):
                     if valid_gt.any():
                         hit = (pred_ids[valid_gt] == gt_labels[valid_gt]).float().mean().item()
                         gt_uniq, gt_counts = gt_labels[valid_gt].unique(return_counts=True)
-                        gt_order = gt_counts.argsort(descending=True)[:5]
-                        gt_hist = [
-                            "{}:{}".format(self._rel_name(gt_uniq[i]), int(gt_counts[i]))
-                            for i in gt_order
-                        ]
-                        msg.append("gt top={} pred@gt hit={:.4f}".format(", ".join(gt_hist), hit))
+                        msg.append("gt predicate top={} pred@gt hit={:.4f}".format(
+                            self._format_rel_hist(gt_uniq, gt_counts),
+                            hit,
+                        ))
                 uniq, counts = pred_ids.unique(return_counts=True)
-                order = counts.argsort(descending=True)[:5]
-                pred_hist = [
-                    "{}:{}".format(self._rel_name(uniq[i]), int(counts[i]))
-                    for i in order
-                ]
                 msg.append("rel_scores shape={} mean={:.4f} std={:.4f} pred top={} score mean={:.4f}".format(
                     tuple(scores.shape),
                     scores.mean().item(),
                     scores.std(unbiased=False).item(),
-                    ", ".join(pred_hist),
+                    self._format_rel_hist(uniq, counts),
                     top_scores.mean().item(),
                 ))
             print(" | ".join(msg))
