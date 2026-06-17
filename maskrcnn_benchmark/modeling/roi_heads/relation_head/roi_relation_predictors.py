@@ -158,8 +158,8 @@ class PrimitiveGuidedRelationAdapter(nn.Module):
     """
     Builds primitive-conditioned relation evidence for subject-object pairs.
 
-    The output h_prim keeps the primitive axis, so it can be used directly as
-    the visual input to a later primitive-space VAE.
+    The output h_prim keeps the primitive axis. The visual memory follows the
+    MVA design: one relation token for subject->object and one for object->subject.
     """
 
     def __init__(self, visual_dim=512, text_dim=512, hidden_dim=512, num_heads=8, dropout=0.1):
@@ -170,86 +170,17 @@ class PrimitiveGuidedRelationAdapter(nn.Module):
             nn.LayerNorm(hidden_dim),
             nn.ReLU(inplace=True),
         )
-        self.subject_text_proj = nn.Sequential(
-            nn.Linear(text_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(inplace=True),
-        )
-        self.object_text_proj = nn.Sequential(
-            nn.Linear(text_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(inplace=True),
-        )
-        self.prompt_adapter = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        nn.init.zeros_(self.prompt_adapter.weight)
-        self.prompt_scale = nn.Parameter(torch.ones(1))
-        self.visual_proj = nn.Sequential(
-            nn.Linear(visual_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(inplace=True),
-        )
-        self.token_type = nn.Parameter(torch.zeros(4, hidden_dim))
+        self.shared_prompt = nn.Parameter(torch.zeros(1, hidden_dim))
+        self.subject_object_mva = MVA().float()
+        self.object_subject_mva = MVA().float()
+        self.memory_type = nn.Parameter(torch.zeros(2, hidden_dim))
         self.query_norm = nn.LayerNorm(hidden_dim)
         self.pair_attn = PrimitiveCrossAttentionBlock(hidden_dim, num_heads, dropout)
 
-        self.geometry_dim = 37
-        self.geometry_encoder = nn.Sequential(
-            nn.Linear(self.geometry_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
-
-    def _box_info(self, boxes, image_size):
-        width, height = image_size
-        scale = boxes.new_tensor([width, height, width, height]).clamp(min=1.0)
-        norm_boxes = boxes / scale
-        wh = (boxes[:, 2:] - boxes[:, :2] + 1.0).clamp(min=1.0)
-        centers = boxes[:, :2] + 0.5 * wh
-        center_scale = boxes.new_tensor([width, height]).clamp(min=1.0)
-        size_scale = boxes.new_tensor([width, height]).clamp(min=1.0)
-        return torch.cat((norm_boxes, centers / center_scale, wh / size_scale), dim=1)
-
-    def _pair_geometry(self, sub_boxes, obj_boxes, image_size):
-        eps = 1e-6
-        union_boxes = sub_boxes.clone()
-        union_boxes[:, 0] = torch.min(sub_boxes[:, 0], obj_boxes[:, 0])
-        union_boxes[:, 1] = torch.min(sub_boxes[:, 1], obj_boxes[:, 1])
-        union_boxes[:, 2] = torch.max(sub_boxes[:, 2], obj_boxes[:, 2])
-        union_boxes[:, 3] = torch.max(sub_boxes[:, 3], obj_boxes[:, 3])
-
-        inter_boxes = sub_boxes.clone()
-        inter_boxes[:, 0] = torch.max(sub_boxes[:, 0], obj_boxes[:, 0])
-        inter_boxes[:, 1] = torch.max(sub_boxes[:, 1], obj_boxes[:, 1])
-        inter_boxes[:, 2] = torch.min(sub_boxes[:, 2], obj_boxes[:, 2])
-        inter_boxes[:, 3] = torch.min(sub_boxes[:, 3], obj_boxes[:, 3])
-        valid_inter = (inter_boxes[:, 2] >= inter_boxes[:, 0]) & (inter_boxes[:, 3] >= inter_boxes[:, 1])
-        inter_boxes = inter_boxes * valid_inter.float().unsqueeze(1)
-
-        sub_wh = (sub_boxes[:, 2:] - sub_boxes[:, :2] + 1.0).clamp(min=1.0)
-        obj_wh = (obj_boxes[:, 2:] - obj_boxes[:, :2] + 1.0).clamp(min=1.0)
-        union_wh = (union_boxes[:, 2:] - union_boxes[:, :2] + 1.0).clamp(min=1.0)
-        sub_ctr = sub_boxes[:, :2] + 0.5 * sub_wh
-        obj_ctr = obj_boxes[:, :2] + 0.5 * obj_wh
-        center_offset = (sub_ctr - obj_ctr) / union_wh
-        log_scale = torch.log(sub_wh / obj_wh.clamp(min=eps))
-
-        inter_wh = (torch.min(sub_boxes[:, 2:], obj_boxes[:, 2:]) -
-                    torch.max(sub_boxes[:, :2], obj_boxes[:, :2]) + 1.0).clamp(min=0.0)
-        inter_area = inter_wh[:, 0] * inter_wh[:, 1]
-        sub_area = sub_wh[:, 0] * sub_wh[:, 1]
-        obj_area = obj_wh[:, 0] * obj_wh[:, 1]
-        iou = inter_area / (sub_area + obj_area - inter_area + eps)
-
-        return torch.cat((
-            self._box_info(sub_boxes, image_size),
-            self._box_info(obj_boxes, image_size),
-            self._box_info(union_boxes, image_size),
-            self._box_info(inter_boxes, image_size),
-            center_offset,
-            log_scale,
-            iou.unsqueeze(1),
-        ), dim=1)
+        if visual_dim != hidden_dim:
+            self.visual_proj = nn.Linear(visual_dim, hidden_dim)
+        else:
+            self.visual_proj = nn.Identity()
 
     def _split_by_image(self, features, proposals):
         if isinstance(features, (list, tuple)):
@@ -257,39 +188,21 @@ class PrimitiveGuidedRelationAdapter(nn.Module):
         num_objs = [len(proposal) for proposal in proposals]
         return list(features.split(num_objs, dim=0))
 
-    def _collect_pair_inputs(self, obj_visual_tokens, obj_text_features, proposals, rel_pair_idxs):
+    def _collect_pair_visual_tokens(self, obj_visual_tokens, proposals, rel_pair_idxs):
         obj_tokens_per_image = self._split_by_image(obj_visual_tokens, proposals)
-        obj_text_per_image = self._split_by_image(obj_text_features, proposals)
         sub_tokens = []
         obj_tokens = []
-        sub_texts = []
-        obj_texts = []
-        geometry_features = []
 
-        for per_image_tokens, per_image_texts, proposal, pair_idx in zip(
-                obj_tokens_per_image, obj_text_per_image, proposals, rel_pair_idxs):
+        for per_image_tokens, pair_idx in zip(obj_tokens_per_image, rel_pair_idxs):
             if pair_idx.numel() == 0:
                 continue
-            sub_idx = pair_idx[:, 0]
-            obj_idx = pair_idx[:, 1]
-            sub_tokens.append(per_image_tokens[sub_idx])
-            obj_tokens.append(per_image_tokens[obj_idx])
-            sub_texts.append(per_image_texts[sub_idx])
-            obj_texts.append(per_image_texts[obj_idx])
-            sub_boxes = proposal.bbox[sub_idx]
-            obj_boxes = proposal.bbox[obj_idx]
-            geometry_features.append(self._pair_geometry(sub_boxes, obj_boxes, proposal.size))
+            sub_tokens.append(per_image_tokens[pair_idx[:, 0]])
+            obj_tokens.append(per_image_tokens[pair_idx[:, 1]])
 
         if len(sub_tokens) == 0:
-            return None, None, None, None, None
+            return None, None
 
-        return (
-            torch.cat(sub_tokens, dim=0),
-            torch.cat(obj_tokens, dim=0),
-            torch.cat(sub_texts, dim=0),
-            torch.cat(obj_texts, dim=0),
-            torch.cat(geometry_features, dim=0),
-        )
+        return torch.cat(sub_tokens, dim=0), torch.cat(obj_tokens, dim=0)
 
     def _project_visual_tokens(self, features):
         if features.dim() != 3:
@@ -297,13 +210,11 @@ class PrimitiveGuidedRelationAdapter(nn.Module):
         return self.visual_proj(features)
 
     def _build_visual_memory(self, sub_tokens, obj_tokens):
-        sub_cls, sub_patch = sub_tokens[:, :1], sub_tokens[:, 1:]
-        obj_cls, obj_patch = obj_tokens[:, :1], obj_tokens[:, 1:]
-        sub_cls = sub_cls + self.token_type[0].view(1, 1, -1)
-        obj_cls = obj_cls + self.token_type[1].view(1, 1, -1)
-        sub_patch = sub_patch + self.token_type[2].view(1, 1, -1)
-        obj_patch = obj_patch + self.token_type[3].view(1, 1, -1)
-        return torch.cat((sub_cls, obj_cls, sub_patch, obj_patch), dim=1)
+        # 沿用 MVA 的双向交互思想，但一次性并行处理所有 pair，避免 ClipPredictor 的逐 pair 循环。
+        subject_object = self.subject_object_mva(sub_tokens, obj_tokens)
+        object_subject = self.object_subject_mva(obj_tokens, sub_tokens)
+        visual_memory = torch.stack((subject_object, object_subject), dim=1)
+        return visual_memory + self.memory_type.view(1, 2, -1)
 
     def forward(self, obj_visual_tokens, obj_text_features, proposals, rel_pair_idxs, primitive_text_features):
         """
@@ -326,8 +237,8 @@ class PrimitiveGuidedRelationAdapter(nn.Module):
             if torch.is_tensor(obj_text_features) else [x.to(device=device, dtype=dtype) for x in obj_text_features]
         primitive_text_features = primitive_text_features.to(device=device, dtype=dtype)
 
-        sub_tokens, obj_tokens, sub_texts, obj_texts, geometry_features = self._collect_pair_inputs(
-            obj_visual_tokens, obj_text_features, proposals, rel_pair_idxs
+        sub_tokens, obj_tokens = self._collect_pair_visual_tokens(
+            obj_visual_tokens, proposals, rel_pair_idxs
         )
         num_primitives = primitive_text_features.size(0)
         if sub_tokens is None:
@@ -335,19 +246,10 @@ class PrimitiveGuidedRelationAdapter(nn.Module):
 
         sub_tokens = self._project_visual_tokens(sub_tokens)
         obj_tokens = self._project_visual_tokens(obj_tokens)
-        geometry = self.geometry_encoder(geometry_features.to(device=device, dtype=dtype)).unsqueeze(1)
+        # query 只保留原语文本锚点和共享可学习 prompt，避免 pair 条件广播导致原语轴塌缩。
         primitive_query = self.primitive_text_proj(primitive_text_features)
-        primitive_query = primitive_query + self.prompt_scale * self.prompt_adapter(primitive_query)
-        subject_query = self.subject_text_proj(sub_texts).unsqueeze(1)
-        object_query = self.object_text_proj(obj_texts).unsqueeze(1)
-
-        q_prim = self.query_norm(
-            primitive_query.unsqueeze(0) +
-            subject_query +
-            object_query +
-            geometry
-        )
-
+        q_prim = self.query_norm(primitive_query + self.shared_prompt).unsqueeze(0)
+        q_prim = q_prim.expand(sub_tokens.size(0), -1, -1)
         visual_memory = self._build_visual_memory(sub_tokens, obj_tokens)
         return self.pair_attn(q_prim, visual_memory)
 
