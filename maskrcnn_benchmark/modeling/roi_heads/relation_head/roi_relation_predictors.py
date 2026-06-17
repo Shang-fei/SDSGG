@@ -1086,6 +1086,7 @@ class SFClipPredictor(nn.Module):
             )[
                 self.active_predicate_ids_tensor.to(primitive_logits.device)
             ]
+            active_prior = F.normalize(active_prior, dim=-1)
             rel_scores = torch.matmul(primitive_logits, active_prior.t())
             rel_dists = tuple(self._split_rel_tensor(rel_scores, num_rels))
 

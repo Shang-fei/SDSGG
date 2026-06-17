@@ -231,6 +231,7 @@ class Loss(nn.Module):
                         primitive_target.size(-1), input.size(-1)
                     )
                 )
+            primitive_target = primitive_target * 2.0
             return F.mse_loss(input, primitive_target, reduction="mean").half()
 
         totarget=input[:,1]
