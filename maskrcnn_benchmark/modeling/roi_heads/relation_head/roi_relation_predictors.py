@@ -1107,7 +1107,7 @@ class SFClipPredictor(nn.Module):
                 positive_labels = all_labels[positive_mask]
                 if positive_labels.numel() > 0:
                     uniq, counts = positive_labels.unique(return_counts=True)
-                    msg.append("gt predicate top={}".format(self._format_rel_hist(uniq, counts)))
+                    gt_predicate_hist = self._format_rel_hist(uniq, counts)
                     gt_prior = self.predicate_primitive_prior.to(
                         device=logits.device, dtype=logits.dtype
                     )[positive_labels]
@@ -1134,7 +1134,8 @@ class SFClipPredictor(nn.Module):
                         gt_pair_pred_ids = train_pred_ids[positive_mask]
                         pred_uniq, pred_counts = gt_pair_pred_ids.unique(return_counts=True)
                         hit = (gt_pair_pred_ids == positive_labels).float().mean().item()
-                        msg.append("train pred top(gt pairs)={} pred@gt hit={:.4f}".format(
+                        msg.append("gt predicate top={} | train pred top(gt pairs)={} | pred@gt hit={:.4f}".format(
+                            gt_predicate_hist,
                             self._format_rel_hist(pred_uniq, pred_counts),
                             hit,
                         ))
@@ -1149,18 +1150,22 @@ class SFClipPredictor(nn.Module):
                     if valid_gt.any():
                         hit = (pred_ids[valid_gt] == gt_labels[valid_gt]).float().mean().item()
                         gt_uniq, gt_counts = gt_labels[valid_gt].unique(return_counts=True)
-                        msg.append("gt predicate top={} pred@gt hit={:.4f}".format(
-                            self._format_rel_hist(gt_uniq, gt_counts),
-                            hit,
-                        ))
+                        eval_gt_hist = self._format_rel_hist(gt_uniq, gt_counts)
                 uniq, counts = pred_ids.unique(return_counts=True)
+                eval_pred_hist = self._format_rel_hist(uniq, counts)
                 msg.append("rel_scores shape={} mean={:.4f} std={:.4f} pred top={} score mean={:.4f}".format(
                     tuple(scores.shape),
                     scores.mean().item(),
                     scores.std(unbiased=False).item(),
-                    self._format_rel_hist(uniq, counts),
+                    eval_pred_hist,
                     top_scores.mean().item(),
                 ))
+                if rel_labels is not None and 'eval_gt_hist' in locals():
+                    msg.append("gt predicate top={} | eval pred top={} | pred@gt hit={:.4f}".format(
+                        eval_gt_hist,
+                        eval_pred_hist,
+                        hit,
+                    ))
             print(" | ".join(msg))
 
     def forward(self, proposals, rel_pair_idxs, rel_labels, rel_binarys, roi_features, union_features, logger=None,img=None):
