@@ -1040,6 +1040,26 @@ class SFClipPredictor(nn.Module):
         primitive_proto = F.normalize(primitive_proto, dim=-1)
         return (h_prim * primitive_proto.unsqueeze(0)).sum(-1) / self.primitive_temperature
 
+    def _rel_name(self, rel_id):
+        rel_id = int(rel_id)
+        if 0 <= rel_id < len(self.rel_names):
+            return self.rel_names[rel_id]
+        return "rel_{}".format(rel_id)
+
+    def _collect_pair_gt_labels(self, proposals, rel_pair_idxs, device):
+        gt_labels = []
+        has_gt = False
+        for proposal, pair_idx in zip(proposals, rel_pair_idxs):
+            if proposal.has_field("relation"):
+                rel_matrix = proposal.get_field("relation").to(device=device)
+                gt_labels.append(rel_matrix[pair_idx[:, 0], pair_idx[:, 1]].long())
+                has_gt = True
+            else:
+                gt_labels.append(torch.zeros(pair_idx.size(0), dtype=torch.long, device=device))
+        if not has_gt:
+            return None
+        return gt_labels
+
     def _debug_sf_state(self, primitive_logits, rel_scores=None, rel_labels=None):
         if not self.sf_debug:
             return
@@ -1079,7 +1099,7 @@ class SFClipPredictor(nn.Module):
                     uniq, counts = labels.unique(return_counts=True)
                     order = counts.argsort(descending=True)[:5]
                     label_hist = [
-                        "{}:{}".format(self.rel_names[int(uniq[i])], int(counts[i]))
+                        "{}:{}".format(self._rel_name(uniq[i]), int(counts[i]))
                         for i in order
                     ]
                     msg.append("positive label top={}".format(", ".join(label_hist)))
@@ -1088,10 +1108,22 @@ class SFClipPredictor(nn.Module):
                 scores = rel_scores.detach().float()
                 top_scores, top_cols = scores[:, 1:].max(dim=1)
                 pred_ids = self.active_predicate_ids_tensor.to(top_cols.device)[top_cols + 1]
+                if rel_labels is not None:
+                    gt_labels = cat(rel_labels, dim=0).view(-1).long().to(pred_ids.device)
+                    valid_gt = gt_labels > 0
+                    if valid_gt.any():
+                        hit = (pred_ids[valid_gt] == gt_labels[valid_gt]).float().mean().item()
+                        gt_uniq, gt_counts = gt_labels[valid_gt].unique(return_counts=True)
+                        gt_order = gt_counts.argsort(descending=True)[:5]
+                        gt_hist = [
+                            "{}:{}".format(self._rel_name(gt_uniq[i]), int(gt_counts[i]))
+                            for i in gt_order
+                        ]
+                        msg.append("gt top={} pred@gt hit={:.4f}".format(", ".join(gt_hist), hit))
                 uniq, counts = pred_ids.unique(return_counts=True)
                 order = counts.argsort(descending=True)[:5]
                 pred_hist = [
-                    "{}:{}".format(self.rel_names[int(uniq[i])], int(counts[i]))
+                    "{}:{}".format(self._rel_name(uniq[i]), int(counts[i]))
                     for i in order
                 ]
                 msg.append("rel_scores shape={} mean={:.4f} std={:.4f} pred top={} score mean={:.4f}".format(
@@ -1155,7 +1187,8 @@ class SFClipPredictor(nn.Module):
             ]
             active_prior = F.normalize(active_prior, dim=-1)
             rel_scores = torch.matmul(primitive_logits, active_prior.t())
-            self._debug_sf_state(primitive_logits, rel_scores=rel_scores)
+            debug_gt_labels = self._collect_pair_gt_labels(proposals, rel_pair_idxs, primitive_logits.device)
+            self._debug_sf_state(primitive_logits, rel_scores=rel_scores, rel_labels=debug_gt_labels)
             rel_dists = tuple(self._split_rel_tensor(rel_scores, num_rels))
 
         return obj_dists, rel_dists, {}

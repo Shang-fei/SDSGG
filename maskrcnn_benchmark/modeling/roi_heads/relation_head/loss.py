@@ -231,8 +231,17 @@ class Loss(nn.Module):
                         primitive_target.size(-1), input.size(-1)
                     )
                 )
+            # 三值原语先验中，1/-1 表示需要明确拉开方向，0 表示该原语对当前谓词不作强判断。
+            # 这里保留 CLIPPredictor 的 logit 尺度习惯，把非零目标映射到 +/-2。
             primitive_target = primitive_target * 2.0
-            return F.mse_loss(input, primitive_target, reduction="mean").half()
+            loss_matrix = F.mse_loss(input, primitive_target, reduction="none")
+            decisive_primitive = primitive_target != 0
+            if decisive_primitive.any():
+                # 非零维度是谓词区分的关键原语，强监督；零维度只做弱约束，避免模型靠全零输出取得低 loss。
+                decisive_loss = loss_matrix[decisive_primitive].mean()
+                neutral_loss = loss_matrix[~decisive_primitive].mean()
+                return (decisive_loss + 0.1 * neutral_loss).half()
+            return loss_matrix.mean().half()
 
         totarget=input[:,1]
         input=input[:,0]
