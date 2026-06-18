@@ -38,7 +38,7 @@ _C.MODEL.CLS_AGNOSTIC_BBOX_REG = False
 _C.MODEL.WEIGHT = ""
 
 # checkpoint of detector, for relation prediction
-_C.MODEL.PRETRAINED_DETECTOR_CKPT = "checkpoint/pretrained_faster_rcnn/last_checkpoint"
+_C.MODEL.PRETRAINED_DETECTOR_CKPT = "/workspace/ccloud/sf/SDSGG/checkpoint/pretrained_faster_rcnn/model_final.pth"
 
 # -----------------------------------------------------------------------------
 # INPUT
