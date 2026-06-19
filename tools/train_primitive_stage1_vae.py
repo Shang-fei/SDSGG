@@ -105,6 +105,7 @@ def main():
                 "clip_token_dim": model.clip_token_dim,
                 "generator_out_dim": model.generator.net[-1].out_features,
                 "primitive_prompt_dim": model.prompt_learner.primitive_prompt_bank.shape[-1],
+                "target_feature_mode": "cls-token" if getattr(clip_model.visual, "proj", None) is not None else "pooled",
             },
             sort_keys=True,
         )

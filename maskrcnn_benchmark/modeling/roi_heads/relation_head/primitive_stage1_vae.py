@@ -155,6 +155,8 @@ class PrimitiveStage1VAE(nn.Module):
     def encode_image(self, images):
         with torch.no_grad():
             features = self.clip_model.encode_image(images)
+        if features.dim() == 3:
+            features = features[:, 0, :]
         return F.normalize(features.float(), dim=-1)
 
     def reparameterize(self, mean, log_var):
@@ -181,6 +183,8 @@ class PrimitiveStage1VAE(nn.Module):
         return embeddings, tokenized
 
     def forward(self, target_features, slot_ids, triplet_texts, sample=True):
+        if target_features.dim() == 3:
+            target_features = target_features[:, 0, :]
         mean, log_var = self.encoder(target_features)
         z = self.reparameterize(mean, log_var) if sample else mean
         bias = self.generator(z)
