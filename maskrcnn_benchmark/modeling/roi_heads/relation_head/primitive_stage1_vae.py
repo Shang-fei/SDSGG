@@ -87,6 +87,13 @@ class PrimitivePromptLearner(nn.Module):
         slot_ids = slot_ids.long()
         tokens = self.primitive_prompt_bank[slot_ids]
         tokens = tokens.reshape(slot_ids.shape[0], self.primitive_token_count, -1)
+        if bias.shape[-1] != tokens.shape[-1]:
+            raise RuntimeError(
+                "Prompt bias dim {} must match CLIP token dim {}".format(
+                    bias.shape[-1],
+                    tokens.shape[-1],
+                )
+            )
         return tokens + bias.unsqueeze(1)
 
     def orthogonal_loss(self):
@@ -108,15 +115,18 @@ class PrimitiveStage1VAE(nn.Module):
         num_slots=16,
         n_ctx=4,
         max_slots_per_predicate=4,
-        feature_dim=512,
+        feature_dim=None,
         hidden_dim=2048,
         latent_dim=512,
     ):
         super().__init__()
+        clip_feature_dim = int(clip_model.text_projection.shape[1])
+        token_dim = int(clip_model.ln_final.weight.shape[0])
+        feature_dim = int(feature_dim or clip_feature_dim)
         self.clip_model = clip_model
         self.text_encoder = CLIPTextEncoder(clip_model)
         self.encoder = RelationVAEEncoder(feature_dim, hidden_dim, latent_dim)
-        self.generator = PromptBiasGenerator(latent_dim, hidden_dim=4096, prompt_dim=feature_dim)
+        self.generator = PromptBiasGenerator(latent_dim, hidden_dim=4096, prompt_dim=token_dim)
         self.prompt_learner = PrimitivePromptLearner(
             clip_model,
             num_slots=num_slots,

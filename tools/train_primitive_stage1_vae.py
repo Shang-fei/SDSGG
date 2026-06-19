@@ -10,6 +10,7 @@ from maskrcnn_benchmark.utils.env import setup_environment  # noqa F401
 
 import torch
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 import yaml
 
 from maskrcnn_benchmark.config import cfg
@@ -47,6 +48,7 @@ def parse_args():
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--save-every", type=int, default=10)
     parser.add_argument("--device", default=None)
+    parser.add_argument("--no-progress", action="store_true")
     parser.add_argument("opts", nargs=argparse.REMAINDER)
     return parser.parse_args()
 
@@ -129,7 +131,13 @@ def main():
     for epoch in range(1, args.epochs + 1):
         model.train()
         totals = {"loss": 0.0, "recon": 0.0, "kl": 0.0, "orth": 0.0, "count": 0}
-        for batch in loader:
+        progress = tqdm(
+            loader,
+            desc="epoch {}/{}".format(epoch, args.epochs),
+            dynamic_ncols=True,
+            disable=args.no_progress,
+        )
+        for batch in progress:
             images = batch["union_image"].to(device, non_blocking=True)
             slot_ids = batch["slot_ids"].to(device, non_blocking=True)
             with torch.no_grad():
@@ -151,6 +159,12 @@ def main():
             totals["kl"] += float(loss_kl.item()) * n
             totals["orth"] += float(loss_orth.item()) * n
             totals["count"] += n
+            progress.set_postfix(
+                loss="{:.4f}".format(totals["loss"] / totals["count"]),
+                recon="{:.4f}".format(totals["recon"] / totals["count"]),
+                kl="{:.4f}".format(totals["kl"] / totals["count"]),
+                orth="{:.4f}".format(totals["orth"] / totals["count"]),
+            )
 
         row = {
             "epoch": epoch,
