@@ -98,6 +98,17 @@ def main():
         n_ctx=4,
         max_slots_per_predicate=dataset.max_slots,
     ).to(device)
+    print(
+        json.dumps(
+            {
+                "clip_feature_dim": model.clip_feature_dim,
+                "clip_token_dim": model.clip_token_dim,
+                "generator_out_dim": model.generator.net[-1].out_features,
+                "primitive_prompt_dim": model.prompt_learner.primitive_prompt_bank.shape[-1],
+            },
+            sort_keys=True,
+        )
+    )
     optimizer = torch.optim.AdamW(
         list(model.encoder.parameters())
         + list(model.generator.parameters())

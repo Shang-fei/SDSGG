@@ -123,6 +123,8 @@ class PrimitiveStage1VAE(nn.Module):
         clip_feature_dim = int(clip_model.text_projection.shape[1])
         token_dim = int(clip_model.ln_final.weight.shape[0])
         feature_dim = int(feature_dim or clip_feature_dim)
+        self.clip_feature_dim = feature_dim
+        self.clip_token_dim = token_dim
         self.clip_model = clip_model
         self.text_encoder = CLIPTextEncoder(clip_model)
         self.encoder = RelationVAEEncoder(feature_dim, hidden_dim, latent_dim)
@@ -134,6 +136,14 @@ class PrimitiveStage1VAE(nn.Module):
             max_slots_per_predicate=max_slots_per_predicate,
         )
         self.latent_dim = latent_dim
+        generator_out_dim = self.generator.net[-1].out_features
+        if generator_out_dim != self.clip_token_dim:
+            raise ValueError(
+                "Generator output dim {} must match CLIP token dim {}".format(
+                    generator_out_dim,
+                    self.clip_token_dim,
+                )
+            )
 
         empty_tokens = clip.tokenize([""])
         self.sot_token = int(empty_tokens[0, 0])
