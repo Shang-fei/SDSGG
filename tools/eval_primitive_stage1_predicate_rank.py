@@ -81,6 +81,36 @@ def build_prompt_text(subject, predicate, obj, text_mode):
     raise ValueError("Unknown text_mode: {}".format(text_mode))
 
 
+def build_batch_prototypes(model, mapping, candidate_names, subjects, objects, text_mode, num_prototypes, device):
+    slot_rows = []
+    prompt_texts = []
+    for subject, obj in zip(subjects, objects):
+        for predicate in candidate_names:
+            slots = mapping["predicate_to_slots"].get(predicate, mapping["fallback_slots"])
+            slot_rows.append(pad_slots(mapping, slots))
+            prompt_texts.append(build_prompt_text(subject, predicate, obj, text_mode))
+
+    slot_ids = torch.tensor(slot_rows, dtype=torch.long, device=device)
+    if num_prototypes == 1:
+        z = torch.randn(len(prompt_texts), model.latent_dim, device=device)
+        bias = model.generator(z)
+        prompts, tokenized = model.build_prompt(slot_ids, bias, prompt_texts)
+        features = model.text_encoder(prompts, tokenized)
+        features = F.normalize(features.float(), dim=-1)
+        return features.view(len(subjects), len(candidate_names), -1)
+
+    slot_ids = slot_ids.repeat_interleave(num_prototypes, dim=0)
+    repeated_texts = []
+    for text in prompt_texts:
+        repeated_texts.extend([text] * num_prototypes)
+    z = torch.randn(len(repeated_texts), model.latent_dim, device=device)
+    bias = model.generator(z)
+    prompts, tokenized = model.build_prompt(slot_ids, bias, repeated_texts)
+    features = model.text_encoder(prompts, tokenized)
+    features = F.normalize(features.float(), dim=-1)
+    return features.view(len(subjects), len(candidate_names), num_prototypes, -1)
+
+
 def summarize_ranks(ranks):
     ranks = torch.tensor(ranks, dtype=torch.float)
     return {
@@ -164,24 +194,21 @@ def main():
         for batch in tqdm(loader, desc="ranking predicates", dynamic_ncols=True):
             images = batch["union_image"].to(device, non_blocking=True)
             target = model.encode_image(images)
-            batch_scores = []
-            for pred_name in candidate_names:
-                slots = mapping["predicate_to_slots"].get(pred_name, mapping["fallback_slots"])
-                slots = pad_slots(mapping, slots)
-                slot_ids = torch.tensor(slots, dtype=torch.long, device=device)
-                proto_rows = []
-                for i in range(len(batch["subject_name"])):
-                    prompt_text = build_prompt_text(
-                        batch["subject_name"][i],
-                        pred_name,
-                        batch["object_name"][i],
-                        text_mode,
-                    )
-                    generated = model.generate(slot_ids, [prompt_text], args.num_prototypes)
-                    score = (target[i:i + 1] @ generated.t()).max(dim=1).values
-                    proto_rows.append(score)
-                batch_scores.append(torch.cat(proto_rows, dim=0))
-            scores = torch.stack(batch_scores, dim=1) / args.temperature
+            prototypes = build_batch_prototypes(
+                model,
+                mapping,
+                candidate_names,
+                batch["subject_name"],
+                batch["object_name"],
+                text_mode,
+                args.num_prototypes,
+                device,
+            )
+            if args.num_prototypes == 1:
+                scores = (target.unsqueeze(1) * prototypes).sum(dim=-1)
+            else:
+                scores = (target.unsqueeze(1).unsqueeze(2) * prototypes).sum(dim=-1).max(dim=2).values
+            scores = scores / args.temperature
 
             for i, pred_id_tensor in enumerate(batch["predicate_id"]):
                 pred_id = int(pred_id_tensor.item())
