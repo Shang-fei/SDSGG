@@ -56,17 +56,20 @@ class RelationVAEEncoder(nn.Module):
 
 
 class PromptBiasGenerator(nn.Module):
-    def __init__(self, latent_dim=512, hidden_dim=4096, prompt_dim=512):
+    def __init__(self, latent_dim=512, hidden_dim=4096, prompt_dim=512, token_count=1):
         super().__init__()
+        self.token_count = int(token_count)
+        self.prompt_dim = int(prompt_dim)
         self.net = nn.Sequential(
             nn.Linear(latent_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, prompt_dim),
+            nn.Linear(hidden_dim, self.token_count * self.prompt_dim),
         )
         self.apply(RelationVAEEncoder._init_weights)
 
     def forward(self, z):
-        return self.net(z)
+        bias = self.net(z)
+        return bias.view(z.shape[0], self.token_count, self.prompt_dim)
 
 
 class PrimitivePromptLearner(nn.Module):
@@ -87,6 +90,8 @@ class PrimitivePromptLearner(nn.Module):
         slot_ids = slot_ids.long()
         tokens = self.primitive_prompt_bank[slot_ids]
         tokens = tokens.reshape(slot_ids.shape[0], self.primitive_token_count, -1)
+        if bias.dim() == 2:
+            bias = bias.unsqueeze(1)
         if bias.shape[-1] != tokens.shape[-1]:
             raise RuntimeError(
                 "Prompt bias dim {} must match CLIP token dim {}".format(
@@ -94,7 +99,14 @@ class PrimitivePromptLearner(nn.Module):
                     tokens.shape[-1],
                 )
             )
-        return tokens + bias.unsqueeze(1)
+        if bias.shape[1] not in (1, tokens.shape[1]):
+            raise RuntimeError(
+                "Prompt bias token count {} must be 1 or match primitive token count {}".format(
+                    bias.shape[1],
+                    tokens.shape[1],
+                )
+            )
+        return tokens + bias
 
     def orthogonal_loss(self):
         slot_repr = F.normalize(self.primitive_prompt_bank.mean(dim=1), dim=-1)
@@ -127,21 +139,27 @@ class PrimitiveStage1VAE(nn.Module):
         self.clip_token_dim = token_dim
         self.clip_model = clip_model
         self.text_encoder = CLIPTextEncoder(clip_model)
-        self.encoder = RelationVAEEncoder(feature_dim, hidden_dim, latent_dim)
-        self.generator = PromptBiasGenerator(latent_dim, hidden_dim=4096, prompt_dim=token_dim)
         self.prompt_learner = PrimitivePromptLearner(
             clip_model,
             num_slots=num_slots,
             n_ctx=n_ctx,
             max_slots_per_predicate=max_slots_per_predicate,
         )
+        self.encoder = RelationVAEEncoder(feature_dim, hidden_dim, latent_dim)
+        self.generator = PromptBiasGenerator(
+            latent_dim,
+            hidden_dim=4096,
+            prompt_dim=token_dim,
+            token_count=self.prompt_learner.primitive_token_count,
+        )
         self.latent_dim = latent_dim
         generator_out_dim = self.generator.net[-1].out_features
-        if generator_out_dim != self.clip_token_dim:
+        expected_generator_out_dim = self.prompt_learner.primitive_token_count * self.clip_token_dim
+        if generator_out_dim != expected_generator_out_dim:
             raise ValueError(
-                "Generator output dim {} must match CLIP token dim {}".format(
+                "Generator output dim {} must match primitive_token_count * CLIP token dim {}".format(
                     generator_out_dim,
-                    self.clip_token_dim,
+                    expected_generator_out_dim,
                 )
             )
 
@@ -231,7 +249,13 @@ class PrimitiveStage1VAE(nn.Module):
 
     def load_trainable_state_dict(self, state):
         self.encoder.load_state_dict(state["encoder"])
-        self.generator.load_state_dict(state["generator"])
+        try:
+            self.generator.load_state_dict(state["generator"])
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "Generator checkpoint is incompatible with token-wise prompt bias. "
+                "Please retrain Stage 1 with the current primitive_stage1_vae.py."
+            ) from exc
         self.prompt_learner.load_state_dict(state["prompt_learner"])
 
 

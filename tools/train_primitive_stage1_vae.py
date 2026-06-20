@@ -104,6 +104,10 @@ def main():
                 "clip_feature_dim": model.clip_feature_dim,
                 "clip_token_dim": model.clip_token_dim,
                 "generator_out_dim": model.generator.net[-1].out_features,
+                "generator_bias_shape": [
+                    model.prompt_learner.primitive_token_count,
+                    model.clip_token_dim,
+                ],
                 "primitive_prompt_dim": model.prompt_learner.primitive_prompt_bank.shape[-1],
                 "target_feature_mode": "cls-token" if getattr(clip_model.visual, "proj", None) is not None else "pooled",
             },
@@ -196,6 +200,7 @@ def main():
                     "epoch": epoch,
                     "clip_model": args.clip_model,
                     "mapping": dataset.mapping,
+                    "stage1_arch": "token_wise_prompt_bias_v1",
                     "predicate_part": args.predicate_part,
                     "allowed_predicates": sorted(allowed_predicates) if allowed_predicates is not None else None,
                     "args": vars(args),
