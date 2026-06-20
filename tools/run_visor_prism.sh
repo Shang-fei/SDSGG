@@ -96,6 +96,19 @@ run_and_log python3 tools/eval_visor_prism.py \
   "${COMMON_DEVICE_ARGS[@]}" \
   "${COMMON_SAMPLE_ARGS[@]}"
 
+run_and_log python3 tools/eval_visor_prism.py \
+  --config-file "${CONFIG_FILE}" \
+  --checkpoint "${CHECKPOINT}" \
+  --split test \
+  --predicate-part novel \
+  --candidate-part total \
+  --output-dir "${RUN_DIR}/eval_test_novel_total" \
+  --batch-size "${BATCH_SIZE}" \
+  --text-encode-batch-size "${TEXT_ENCODE_BATCH_SIZE}" \
+  --num-workers "${NUM_WORKERS}" \
+  "${COMMON_DEVICE_ARGS[@]}" \
+  "${COMMON_SAMPLE_ARGS[@]}"
+
 python3 - <<'PY' | tee -a "${REPORT}"
 import json
 import os
@@ -110,6 +123,7 @@ def load_json(path):
 
 base = load_json(os.path.join(run_dir, "eval_val_base", "summary.json"))
 novel = load_json(os.path.join(run_dir, "eval_test_novel", "summary.json"))
+novel_total = load_json(os.path.join(run_dir, "eval_test_novel_total", "summary.json"))
 
 def rows(title, data):
     out = []
@@ -146,7 +160,8 @@ block.append("\n## Run {}".format(datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
 block.append("")
 block.append("Output: `{}`".format(run_dir))
 block.append(rows("Validation Base Standalone", base))
-block.append(rows("Test Novel Standalone", novel))
+block.append(rows("Test Novel Standalone (novel candidates)", novel))
+block.append(rows("Test Novel Standalone (total candidates)", novel_total))
 block.append("")
 block = "\n".join(block)
 
