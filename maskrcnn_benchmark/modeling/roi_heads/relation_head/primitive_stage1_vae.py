@@ -182,12 +182,24 @@ class PrimitiveStage1VAE(nn.Module):
         embeddings[:, 1:1 + primitive_count] = primitive_tokens.float()
         return embeddings, tokenized
 
-    def forward(self, target_features, slot_ids, triplet_texts, sample=True):
+    def encode_triplet_text(self, triplet_texts, device):
+        tokenized = clip.tokenize(triplet_texts, truncate=True).to(device)
+        return F.normalize(self.clip_model.encode_text(tokenized).float(), dim=-1)
+
+    def forward(self, target_features, slot_ids, triplet_texts, sample=True, prompt_mode="full"):
         if target_features.dim() == 3:
             target_features = target_features[:, 0, :]
+        if prompt_mode == "triplet_only":
+            mean, log_var = self.encoder(target_features)
+            return self.encode_triplet_text(triplet_texts, target_features.device), mean, log_var
+
         mean, log_var = self.encoder(target_features)
         z = self.reparameterize(mean, log_var) if sample else mean
         bias = self.generator(z)
+        if prompt_mode == "primitive_only":
+            bias = torch.zeros_like(bias)
+        elif prompt_mode != "full":
+            raise ValueError("Unknown prompt_mode: {}".format(prompt_mode))
         prompts, tokenized = self.build_prompt(slot_ids, bias, triplet_texts)
         recon = self.text_encoder(prompts, tokenized)
         return F.normalize(recon.float(), dim=-1), mean, log_var

@@ -37,6 +37,12 @@ def parse_args():
     parser.add_argument("--split", default="val", choices=["train", "val", "test"])
     parser.add_argument("--predicate-part", default="total", choices=["base", "novel", "semantic", "total"])
     parser.add_argument("--predicate-split-file", default=None)
+    parser.add_argument(
+        "--prompt-mode",
+        default="full",
+        choices=["full", "primitive_only", "triplet_only"],
+        help="full: primitive + VAE bias + triplet; primitive_only: primitive + triplet; triplet_only: raw triplet text.",
+    )
     parser.add_argument("--mapping-file", default=default_mapping_path())
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--num-workers", type=int, default=4)
@@ -118,7 +124,13 @@ def main():
             images = batch["union_image"].to(device, non_blocking=True)
             slot_ids = batch["slot_ids"].to(device, non_blocking=True)
             target = model.encode_image(images)
-            recon, _, _ = model(target, slot_ids, batch["triplet_text"], sample=False)
+            recon, _, _ = model(
+                target,
+                slot_ids,
+                batch["triplet_text"],
+                sample=False,
+                prompt_mode=args.prompt_mode,
+            )
             mse_vec = (F.normalize(recon, dim=-1) - F.normalize(target, dim=-1)).pow(2).mean(dim=1)
             cos_vec = F.cosine_similarity(recon, target, dim=-1)
             metrics = retrieval_metrics(F.normalize(recon, dim=-1), F.normalize(target, dim=-1))
@@ -141,6 +153,7 @@ def main():
     summary = {
         "predicate_part": args.predicate_part,
         "predicate_split_file": args.predicate_split_file,
+        "prompt_mode": args.prompt_mode,
         "allowed_predicates": sorted(allowed_predicates) if allowed_predicates is not None else None,
         "mse": totals["mse"] / totals["count"],
         "cosine": totals["cos"] / totals["count"],
@@ -165,6 +178,7 @@ def main():
             {
                 "predicate_part": args.predicate_part,
                 "predicate_split_file": args.predicate_split_file,
+                "prompt_mode": args.prompt_mode,
                 "allowed_predicates": sorted(allowed_predicates) if allowed_predicates is not None else None,
                 "skipped_predicates": sorted(dataset.skipped_predicates),
                 "num_samples": len(dataset),
