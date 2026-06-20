@@ -141,6 +141,33 @@ class PrimitiveStage1Dataset(Dataset):
             x1, y1, x2, y2 = 0, 0, image.width, image.height
         return image.crop((x1, y1, x2, y2))
 
+    def _pair_geometry(self, image, boxes, subject_index, object_index):
+        sub = boxes[subject_index].astype(np.float32)
+        obj = boxes[object_index].astype(np.float32)
+        width = max(float(image.width), 1.0)
+        height = max(float(image.height), 1.0)
+        scale = np.array([width, height, width, height], dtype=np.float32)
+        sub_n = sub / scale
+        obj_n = obj / scale
+
+        sub_wh = np.maximum(sub[2:] - sub[:2], 1.0)
+        obj_wh = np.maximum(obj[2:] - obj[:2], 1.0)
+        sub_ctr = sub[:2] + 0.5 * sub_wh
+        obj_ctr = obj[:2] + 0.5 * obj_wh
+        delta = (obj_ctr - sub_ctr) / np.array([width, height], dtype=np.float32)
+
+        inter_x1 = max(sub[0], obj[0])
+        inter_y1 = max(sub[1], obj[1])
+        inter_x2 = min(sub[2], obj[2])
+        inter_y2 = min(sub[3], obj[3])
+        inter = max(0.0, inter_x2 - inter_x1) * max(0.0, inter_y2 - inter_y1)
+        sub_area = sub_wh[0] * sub_wh[1]
+        obj_area = obj_wh[0] * obj_wh[1]
+        union = max(sub_area + obj_area - inter, 1.0)
+        iou = np.array([inter / union], dtype=np.float32)
+
+        return np.concatenate([sub_n, obj_n, delta.astype(np.float32), iou], axis=0)
+
     def __getitem__(self, index):
         sample = self.samples[index]
         image = Image.open(self._image_path(sample["image_index"])).convert("RGB")
@@ -155,6 +182,12 @@ class PrimitiveStage1Dataset(Dataset):
             "union_image": self.preprocess(crop),
             "slot_ids": torch.tensor(sample["slot_ids"], dtype=torch.long),
             "predicate_id": torch.tensor(sample["predicate_id"], dtype=torch.long),
+            "subject_id": torch.tensor(int(self.base_dataset.gt_classes[sample["image_index"]][sample["subject_index"]]), dtype=torch.long),
+            "object_id": torch.tensor(int(self.base_dataset.gt_classes[sample["image_index"]][sample["object_index"]]), dtype=torch.long),
+            "geometry": torch.tensor(
+                self._pair_geometry(image, boxes, sample["subject_index"], sample["object_index"]),
+                dtype=torch.float32,
+            ),
             "predicate_name": sample["predicate_name"],
             "subject_name": sample["subject_name"],
             "object_name": sample["object_name"],
@@ -167,6 +200,9 @@ def primitive_stage1_collate(batch):
         "union_image": torch.stack([item["union_image"] for item in batch], dim=0),
         "slot_ids": torch.stack([item["slot_ids"] for item in batch], dim=0),
         "predicate_id": torch.stack([item["predicate_id"] for item in batch], dim=0),
+        "subject_id": torch.stack([item["subject_id"] for item in batch], dim=0),
+        "object_id": torch.stack([item["object_id"] for item in batch], dim=0),
+        "geometry": torch.stack([item["geometry"] for item in batch], dim=0),
         "predicate_name": [item["predicate_name"] for item in batch],
         "subject_name": [item["subject_name"] for item in batch],
         "object_name": [item["object_name"] for item in batch],
