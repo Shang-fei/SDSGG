@@ -31,6 +31,7 @@ if [[ -n "${MAX_SAMPLES}" ]]; then
 fi
 
 mkdir -p "${OUTPUT_ROOT}"
+export OUTPUT_ROOT
 
 for split_part in "${EVAL_SPLITS[@]}"; do
   split="${split_part%%:*}"
@@ -75,16 +76,41 @@ for name in sorted(os.listdir(output_root)):
             "r@5": retrieval["r@5"],
             "r@10": retrieval["r@10"],
             "mean_rank": retrieval["mean_rank"],
+            "same_pred_r@10": summary.get("hard_retrieval", {}).get("same_predicate", {}).get("r@10"),
+            "same_pred_rank": summary.get("hard_retrieval", {}).get("same_predicate", {}).get("mean_rank"),
+            "same_so_r@10": summary.get("hard_retrieval", {}).get("same_subject_object", {}).get("r@10"),
+            "same_so_rank": summary.get("hard_retrieval", {}).get("same_subject_object", {}).get("mean_rank"),
+            "same_triplet_r@10": summary.get("hard_retrieval", {}).get("same_triplet", {}).get("r@10"),
+            "same_triplet_rank": summary.get("hard_retrieval", {}).get("same_triplet", {}).get("mean_rank"),
             "num_samples": summary["num_samples"],
         }
     )
 
 print("\nAblation summary")
-print("name,prompt_mode,predicate_part,num_samples,mse,cosine,r@1,r@5,r@10,mean_rank")
+print("name,prompt_mode,predicate_part,num_samples,mse,cosine,r@1,r@5,r@10,mean_rank,same_pred_r@10,same_pred_rank,same_so_r@10,same_so_rank,same_triplet_r@10,same_triplet_rank")
 for row in rows:
+    def fmt(value, places=6):
+        return "" if value is None else f"{value:.{places}f}"
     print(
-        "{name},{prompt_mode},{predicate_part},{num_samples},{mse:.6f},{cosine:.6f},{r@1:.6f},{r@5:.6f},{r@10:.6f},{mean_rank:.2f}".format(
-            **row
+        ",".join(
+            [
+                row["name"],
+                row["prompt_mode"],
+                row["predicate_part"],
+                str(row["num_samples"]),
+                fmt(row["mse"]),
+                fmt(row["cosine"]),
+                fmt(row["r@1"]),
+                fmt(row["r@5"]),
+                fmt(row["r@10"]),
+                fmt(row["mean_rank"], 2),
+                fmt(row["same_pred_r@10"]),
+                fmt(row["same_pred_rank"], 2),
+                fmt(row["same_so_r@10"]),
+                fmt(row["same_so_rank"], 2),
+                fmt(row["same_triplet_r@10"]),
+                fmt(row["same_triplet_rank"], 2),
+            ]
         )
     )
 PY

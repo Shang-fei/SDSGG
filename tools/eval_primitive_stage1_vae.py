@@ -47,6 +47,7 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--max-samples", type=int, default=None)
+    parser.add_argument("--hard-retrieval-min-candidates", type=int, default=2)
     parser.add_argument("--device", default=None)
     parser.add_argument("opts", nargs=argparse.REMAINDER)
     return parser.parse_args()
@@ -54,18 +55,107 @@ def parse_args():
 
 def retrieval_metrics(query, target):
     sim = query @ target.t()
+    return summarize_ranks(ranks_from_similarity(sim))
+
+
+def ranks_from_similarity(sim, candidate_mask=None, min_candidates=1):
     ranks = []
+    candidate_counts = []
     for i in range(sim.shape[0]):
-        order = torch.argsort(sim[i], descending=True)
+        if candidate_mask is None:
+            candidates = torch.ones(sim.shape[1], dtype=torch.bool, device=sim.device)
+        else:
+            candidates = candidate_mask[i]
+        if not bool(candidates[i]):
+            candidates = candidates.clone()
+            candidates[i] = True
+        candidate_count = int(candidates.sum().item())
+        if candidate_count < min_candidates:
+            continue
+        candidate_indices = torch.nonzero(candidates, as_tuple=False).squeeze(1)
+        scores = sim[i, candidate_indices]
+        order = candidate_indices[torch.argsort(scores, descending=True)]
         rank = int(torch.nonzero(order == i, as_tuple=False)[0, 0]) + 1
         ranks.append(rank)
-    ranks = torch.tensor(ranks, device=sim.device)
+        candidate_counts.append(candidate_count)
+    if not ranks:
+        return None, None
+    return torch.tensor(ranks, device=sim.device), torch.tensor(candidate_counts, device=sim.device)
+
+
+def summarize_ranks(rank_result, candidate_counts=None):
+    if isinstance(rank_result, tuple):
+        ranks, candidate_counts = rank_result
+    else:
+        ranks = rank_result
+    if ranks is None or ranks.numel() == 0:
+        return {
+            "r@1": None,
+            "r@5": None,
+            "r@10": None,
+            "mean_rank": None,
+            "count": 0,
+            "mean_candidates": None,
+        }
+    if candidate_counts is None:
+        candidate_counts = torch.full_like(ranks, int(ranks.numel()))
     return {
         "r@1": float((ranks <= 1).float().mean().item()),
         "r@5": float((ranks <= 5).float().mean().item()),
         "r@10": float((ranks <= 10).float().mean().item()),
         "mean_rank": float(ranks.float().mean().item()),
+        "count": int(ranks.numel()),
+        "mean_candidates": float(candidate_counts.float().mean().item()),
     }
+
+
+def hard_retrieval_metrics(query, target, groups, min_candidates=2):
+    sim = query @ target.t()
+    result = {}
+    for name, labels in groups.items():
+        masks = []
+        for label in labels:
+            masks.append(torch.tensor([other == label for other in labels], device=sim.device))
+        candidate_mask = torch.stack(masks, dim=0)
+        result[name] = summarize_ranks(
+            ranks_from_similarity(
+                sim,
+                candidate_mask=candidate_mask,
+                min_candidates=min_candidates,
+            )
+        )
+    return result
+
+
+def update_retrieval_totals(totals, metrics):
+    if metrics["count"] == 0:
+        return
+    count = metrics["count"]
+    for key in ["r@1", "r@5", "r@10", "mean_rank", "mean_candidates"]:
+        totals[key] += metrics[key] * count
+    totals["count"] += count
+
+
+def finalize_retrieval_totals(totals):
+    if totals["count"] == 0:
+        return {
+            "r@1": None,
+            "r@5": None,
+            "r@10": None,
+            "mean_rank": None,
+            "count": 0,
+            "mean_candidates": None,
+        }
+    result = {
+        key: totals[key] / totals["count"]
+        for key in ["r@1", "r@5", "r@10", "mean_rank", "mean_candidates"]
+    }
+    result["count"] = totals["count"]
+    return result
+
+
+def empty_retrieval_totals():
+    return {"r@1": 0.0, "r@5": 0.0, "r@10": 0.0, "mean_rank": 0.0, "mean_candidates": 0.0, "count": 0}
 
 
 def main():
@@ -117,7 +207,12 @@ def main():
 
     totals = {"mse": 0.0, "cos": 0.0, "count": 0}
     per_pred = defaultdict(lambda: {"mse": 0.0, "cos": 0.0, "count": 0})
-    retrieval_rows = []
+    retrieval_totals = empty_retrieval_totals()
+    hard_retrieval_totals = {
+        "same_predicate": empty_retrieval_totals(),
+        "same_subject_object": empty_retrieval_totals(),
+        "same_triplet": empty_retrieval_totals(),
+    }
 
     with torch.no_grad():
         for batch in loader:
@@ -133,8 +228,26 @@ def main():
             )
             mse_vec = (F.normalize(recon, dim=-1) - F.normalize(target, dim=-1)).pow(2).mean(dim=1)
             cos_vec = F.cosine_similarity(recon, target, dim=-1)
-            metrics = retrieval_metrics(F.normalize(recon, dim=-1), F.normalize(target, dim=-1))
-            retrieval_rows.append(metrics)
+            query = F.normalize(recon, dim=-1)
+            target = F.normalize(target, dim=-1)
+            metrics = retrieval_metrics(query, target)
+            update_retrieval_totals(retrieval_totals, metrics)
+            groups = {
+                "same_predicate": batch["predicate_name"],
+                "same_subject_object": [
+                    "{}|{}".format(subject, obj)
+                    for subject, obj in zip(batch["subject_name"], batch["object_name"])
+                ],
+                "same_triplet": batch["triplet_text"],
+            }
+            hard_metrics = hard_retrieval_metrics(
+                query,
+                target,
+                groups,
+                min_candidates=args.hard_retrieval_min_candidates,
+            )
+            for name, row in hard_metrics.items():
+                update_retrieval_totals(hard_retrieval_totals[name], row)
             for i, pred in enumerate(batch["predicate_name"]):
                 per_pred[pred]["mse"] += float(mse_vec[i].item())
                 per_pred[pred]["cos"] += float(cos_vec[i].item())
@@ -157,10 +270,12 @@ def main():
         "allowed_predicates": sorted(allowed_predicates) if allowed_predicates is not None else None,
         "mse": totals["mse"] / totals["count"],
         "cosine": totals["cos"] / totals["count"],
-        "retrieval": {
-            key: sum(row[key] for row in retrieval_rows) / max(len(retrieval_rows), 1)
-            for key in ["r@1", "r@5", "r@10", "mean_rank"]
+        "retrieval": finalize_retrieval_totals(retrieval_totals),
+        "hard_retrieval": {
+            name: finalize_retrieval_totals(row)
+            for name, row in hard_retrieval_totals.items()
         },
+        "hard_retrieval_min_candidates": args.hard_retrieval_min_candidates,
         "primitive_similarity_offdiag_mean": float(off_diag.mean().item()),
         "primitive_similarity_offdiag_max": float(off_diag.max().item()),
         "slot_coverage": len(slot_usage),
@@ -179,13 +294,41 @@ def main():
                 "predicate_part": args.predicate_part,
                 "predicate_split_file": args.predicate_split_file,
                 "prompt_mode": args.prompt_mode,
+                "hard_retrieval_min_candidates": args.hard_retrieval_min_candidates,
                 "allowed_predicates": sorted(allowed_predicates) if allowed_predicates is not None else None,
                 "skipped_predicates": sorted(dataset.skipped_predicates),
                 "num_samples": len(dataset),
             },
             f,
             indent=2,
+            )
+
+    with open(os.path.join(output_dir, "hard_retrieval_metrics.csv"), "w", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "group",
+                "count",
+                "mean_candidates",
+                "r@1",
+                "r@5",
+                "r@10",
+                "mean_rank",
+            ],
         )
+        writer.writeheader()
+        for name, row in sorted(summary["hard_retrieval"].items()):
+            writer.writerow(
+                {
+                    "group": name,
+                    "count": row["count"],
+                    "mean_candidates": row["mean_candidates"],
+                    "r@1": row["r@1"],
+                    "r@5": row["r@5"],
+                    "r@10": row["r@10"],
+                    "mean_rank": row["mean_rank"],
+                }
+            )
 
     with open(os.path.join(output_dir, "per_predicate_metrics.csv"), "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["predicate", "count", "mse", "cosine"])
