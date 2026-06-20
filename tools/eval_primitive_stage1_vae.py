@@ -43,6 +43,9 @@ def parse_args():
         choices=["full", "primitive_only", "triplet_only"],
         help="full: primitive + VAE bias + triplet; primitive_only: primitive + triplet; triplet_only: raw triplet text.",
     )
+    parser.add_argument("--text-mode", default=None, choices=["subject_object", "triplet"])
+    parser.add_argument("--n-ctx", type=int, default=None)
+    parser.add_argument("--bias-mode", default=None, choices=["global", "token_wise"])
     parser.add_argument("--mapping-file", default=default_mapping_path())
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--num-workers", type=int, default=4)
@@ -158,6 +161,17 @@ def empty_retrieval_totals():
     return {"r@1": 0.0, "r@5": 0.0, "r@10": 0.0, "mean_rank": 0.0, "mean_candidates": 0.0, "count": 0}
 
 
+def build_prompt_texts(batch, text_mode):
+    if text_mode == "triplet":
+        return batch["triplet_text"]
+    if text_mode == "subject_object":
+        return [
+            "{} {}".format(subject, obj)
+            for subject, obj in zip(batch["subject_name"], batch["object_name"])
+        ]
+    raise ValueError("Unknown text_mode: {}".format(text_mode))
+
+
 def main():
     args = parse_args()
     if args.opts and args.opts[0] == "--":
@@ -167,6 +181,10 @@ def main():
     cfg.freeze()
 
     checkpoint = torch.load(args.checkpoint, map_location="cpu")
+    ckpt_args = checkpoint.get("args", {})
+    text_mode = args.text_mode or checkpoint.get("text_mode") or ckpt_args.get("text_mode", "triplet")
+    n_ctx = args.n_ctx or checkpoint.get("n_ctx") or ckpt_args.get("n_ctx", 4)
+    bias_mode = args.bias_mode or checkpoint.get("bias_mode") or ckpt_args.get("bias_mode", "token_wise")
     device = torch.device(args.device or cfg.MODEL.DEVICE)
     output_dir = args.output_dir or os.path.join(os.path.dirname(args.checkpoint), "eval")
     mkdir(output_dir)
@@ -199,8 +217,9 @@ def main():
     model = PrimitiveStage1VAE(
         clip_model,
         num_slots=dataset.mapping["num_slots"],
-        n_ctx=4,
+        n_ctx=n_ctx,
         max_slots_per_predicate=dataset.max_slots,
+        bias_token_count=1 if bias_mode == "global" else dataset.max_slots * n_ctx,
     ).to(device)
     model.load_trainable_state_dict(checkpoint["model"])
     model.eval()
@@ -222,7 +241,7 @@ def main():
             recon, _, _ = model(
                 target,
                 slot_ids,
-                batch["triplet_text"],
+                build_prompt_texts(batch, text_mode),
                 sample=False,
                 prompt_mode=args.prompt_mode,
             )
@@ -267,6 +286,9 @@ def main():
         "predicate_part": args.predicate_part,
         "predicate_split_file": args.predicate_split_file,
         "prompt_mode": args.prompt_mode,
+        "text_mode": text_mode,
+        "n_ctx": n_ctx,
+        "bias_mode": bias_mode,
         "allowed_predicates": sorted(allowed_predicates) if allowed_predicates is not None else None,
         "mse": totals["mse"] / totals["count"],
         "cosine": totals["cos"] / totals["count"],
@@ -294,6 +316,9 @@ def main():
                 "predicate_part": args.predicate_part,
                 "predicate_split_file": args.predicate_split_file,
                 "prompt_mode": args.prompt_mode,
+                "text_mode": text_mode,
+                "n_ctx": n_ctx,
+                "bias_mode": bias_mode,
                 "hard_retrieval_min_candidates": args.hard_retrieval_min_candidates,
                 "allowed_predicates": sorted(allowed_predicates) if allowed_predicates is not None else None,
                 "skipped_predicates": sorted(dataset.skipped_predicates),

@@ -39,6 +39,9 @@ def parse_args():
     parser.add_argument("--predicate-part", default="novel", choices=["base", "novel", "semantic", "total"])
     parser.add_argument("--predicate-split-file", default=None)
     parser.add_argument("--mapping-file", default=default_mapping_path())
+    parser.add_argument("--text-mode", default=None, choices=["subject_object", "triplet"])
+    parser.add_argument("--n-ctx", type=int, default=None)
+    parser.add_argument("--bias-mode", default=None, choices=["global", "token_wise"])
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--max-samples", type=int, default=None)
@@ -73,6 +76,14 @@ def cosine_stats(query, target):
     }
 
 
+def build_prompt_text(item, text_mode):
+    if text_mode == "triplet":
+        return item["triplet_text"]
+    if text_mode == "subject_object":
+        return "{} {}".format(item["subject_name"], item["object_name"])
+    raise ValueError("Unknown text_mode: {}".format(text_mode))
+
+
 def main():
     args = parse_args()
     if args.opts and args.opts[0] == "--":
@@ -85,6 +96,10 @@ def main():
     cfg.freeze()
 
     checkpoint = torch.load(args.checkpoint, map_location="cpu")
+    ckpt_args = checkpoint.get("args", {})
+    text_mode = args.text_mode or checkpoint.get("text_mode") or ckpt_args.get("text_mode", "triplet")
+    n_ctx = args.n_ctx or checkpoint.get("n_ctx") or ckpt_args.get("n_ctx", 4)
+    bias_mode = args.bias_mode or checkpoint.get("bias_mode") or ckpt_args.get("bias_mode", "token_wise")
     device = torch.device(args.device or cfg.MODEL.DEVICE)
     output_dir = args.output_dir or os.path.join(os.path.dirname(args.checkpoint), "generation_eval")
     mkdir(output_dir)
@@ -118,8 +133,9 @@ def main():
     model = PrimitiveStage1VAE(
         clip_model,
         num_slots=dataset.mapping["num_slots"],
-        n_ctx=4,
+        n_ctx=n_ctx,
         max_slots_per_predicate=dataset.max_slots,
+        bias_token_count=1 if bias_mode == "global" else dataset.max_slots * n_ctx,
     ).to(device)
     model.load_trainable_state_dict(checkpoint["model"])
     model.eval()
@@ -174,7 +190,7 @@ def main():
             indices = by_triplet[triplet]
             first = metadata[indices[0]]
             slot_ids = torch.tensor(first["slot_ids"], dtype=torch.long, device=device)
-            generated = model.generate(slot_ids, [triplet], args.num_gen_per_triplet)
+            generated = model.generate(slot_ids, [build_prompt_text(first, text_mode)], args.num_gen_per_triplet)
             generated = F.normalize(generated, dim=-1)
 
             same_triplet_real = real_features[torch.tensor(indices, dtype=torch.long, device=device)]
@@ -220,6 +236,9 @@ def main():
     summary = {
         "split": args.split,
         "predicate_part": args.predicate_part,
+        "text_mode": text_mode,
+        "n_ctx": n_ctx,
+        "bias_mode": bias_mode,
         "num_real_samples": len(metadata),
         "num_eval_triplets": len(rows),
         "num_gen_per_triplet": args.num_gen_per_triplet,

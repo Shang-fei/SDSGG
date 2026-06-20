@@ -39,6 +39,9 @@ def parse_args():
     parser.add_argument("--predicate-split-file", default=None)
     parser.add_argument("--clip-model", default="ViT-B/32")
     parser.add_argument("--mapping-file", default=default_mapping_path())
+    parser.add_argument("--text-mode", default="subject_object", choices=["subject_object", "triplet"])
+    parser.add_argument("--n-ctx", type=int, default=2)
+    parser.add_argument("--bias-mode", default="global", choices=["global", "token_wise"])
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -51,6 +54,17 @@ def parse_args():
     parser.add_argument("--no-progress", action="store_true")
     parser.add_argument("opts", nargs=argparse.REMAINDER)
     return parser.parse_args()
+
+
+def build_prompt_texts(batch, text_mode):
+    if text_mode == "triplet":
+        return batch["triplet_text"]
+    if text_mode == "subject_object":
+        return [
+            "{} {}".format(subject, obj)
+            for subject, obj in zip(batch["subject_name"], batch["object_name"])
+        ]
+    raise ValueError("Unknown text_mode: {}".format(text_mode))
 
 
 def main():
@@ -95,8 +109,9 @@ def main():
     model = PrimitiveStage1VAE(
         clip_model,
         num_slots=dataset.mapping["num_slots"],
-        n_ctx=4,
+        n_ctx=args.n_ctx,
         max_slots_per_predicate=dataset.max_slots,
+        bias_token_count=1 if args.bias_mode == "global" else dataset.max_slots * args.n_ctx,
     ).to(device)
     print(
         json.dumps(
@@ -105,10 +120,14 @@ def main():
                 "clip_token_dim": model.clip_token_dim,
                 "generator_out_dim": model.generator.net[-1].out_features,
                 "generator_bias_shape": [
-                    model.prompt_learner.primitive_token_count,
+                    model.bias_token_count,
                     model.clip_token_dim,
                 ],
                 "primitive_prompt_dim": model.prompt_learner.primitive_prompt_bank.shape[-1],
+                "primitive_token_count": model.prompt_learner.primitive_token_count,
+                "text_mode": args.text_mode,
+                "bias_mode": args.bias_mode,
+                "n_ctx": args.n_ctx,
                 "target_feature_mode": "cls-token" if getattr(clip_model.visual, "proj", None) is not None else "pooled",
             },
             sort_keys=True,
@@ -159,7 +178,8 @@ def main():
             with torch.no_grad():
                 target_features = model.encode_image(images)
 
-            recon, mean, log_var = model(target_features, slot_ids, batch["triplet_text"])
+            prompt_texts = build_prompt_texts(batch, args.text_mode)
+            recon, mean, log_var = model(target_features, slot_ids, prompt_texts)
             loss_recon = reconstruction_loss(recon, target_features)
             loss_kl = kl_loss(mean, log_var)
             loss_orth = model.prompt_learner.orthogonal_loss()
@@ -200,7 +220,10 @@ def main():
                     "epoch": epoch,
                     "clip_model": args.clip_model,
                     "mapping": dataset.mapping,
-                    "stage1_arch": "token_wise_prompt_bias_v1",
+                    "stage1_arch": "primitive_subject_object_global_bias_v1",
+                    "text_mode": args.text_mode,
+                    "n_ctx": args.n_ctx,
+                    "bias_mode": args.bias_mode,
                     "predicate_part": args.predicate_part,
                     "allowed_predicates": sorted(allowed_predicates) if allowed_predicates is not None else None,
                     "args": vars(args),
