@@ -44,6 +44,7 @@ def parse_args():
     parser.add_argument("--predicate-split-file", default=None)
     parser.add_argument("--mapping-file", default=default_mapping_path())
     parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--text-encode-batch-size", type=int, default=512)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--temperature", type=float, default=1.0)
@@ -127,7 +128,25 @@ def geometry_pseudo_labels(geometry, num_slots):
     return labels, mask
 
 
-def build_scores(model, mode, target, candidate_features, candidate_names, batch, geometry, so_features, random_primitives):
+def encode_text_chunked(model, texts, device, chunk_size):
+    features = []
+    for start in range(0, len(texts), chunk_size):
+        features.append(model.encode_text(texts[start:start + chunk_size], device).cpu())
+    return torch.cat(features, dim=0).to(device)
+
+
+def build_scores(
+    model,
+    mode,
+    target,
+    candidate_features,
+    candidate_names,
+    batch,
+    geometry,
+    so_features,
+    random_primitives,
+    text_encode_batch_size,
+):
     device = target.device
     bsz = target.shape[0]
     num_candidates = len(candidate_names)
@@ -136,7 +155,7 @@ def build_scores(model, mode, target, candidate_features, candidate_names, batch
         for subject, obj in zip(batch["subject_name"], batch["object_name"]):
             for predicate in candidate_names:
                 texts.append("{} {} {}".format(subject, predicate, obj))
-        proto = model.encode_text(texts, device).view(bsz, num_candidates, -1)
+        proto = encode_text_chunked(model, texts, device, text_encode_batch_size).view(bsz, num_candidates, -1)
     elif mode == "text_only_primitive":
         condition, _, _ = model.compose(candidate_features)
         proto = condition.unsqueeze(0).expand(bsz, -1, -1)
@@ -261,6 +280,7 @@ def main():
                     geometry,
                     so_features,
                     random_primitives,
+                    args.text_encode_batch_size,
                 )
                 for mode in modes
             }

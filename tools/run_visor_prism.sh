@@ -8,6 +8,8 @@ EPOCHS="${EPOCHS:-10}"
 BATCH_SIZE="${BATCH_SIZE:-256}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 TOP_M="${TOP_M:-4}"
+TEXT_ENCODE_BATCH_SIZE="${TEXT_ENCODE_BATCH_SIZE:-256}"
+SKIP_TRAIN="${SKIP_TRAIN:-0}"
 DEVICE="${DEVICE:-}"
 MAX_SAMPLES="${MAX_SAMPLES:-}"
 
@@ -43,20 +45,30 @@ fi
   echo "batch_size=${BATCH_SIZE}"
   echo "num_workers=${NUM_WORKERS}"
   echo "top_m=${TOP_M}"
+  echo "text_encode_batch_size=${TEXT_ENCODE_BATCH_SIZE}"
+  echo "skip_train=${SKIP_TRAIN}"
   echo "checkpoint=${CHECKPOINT}"
 } | tee -a "${REPORT}"
 
-run_and_log python3 tools/train_visor_prism.py \
-  --config-file "${CONFIG_FILE}" \
-  --predicate-part base \
-  --output-dir "${OUTPUT_ROOT}" \
-  --epochs "${EPOCHS}" \
-  --save-every 1 \
-  --batch-size "${BATCH_SIZE}" \
-  --num-workers "${NUM_WORKERS}" \
-  --top-m "${TOP_M}" \
-  "${COMMON_DEVICE_ARGS[@]}" \
-  "${COMMON_SAMPLE_ARGS[@]}"
+if [[ "${SKIP_TRAIN}" == "1" ]]; then
+  if [[ ! -f "${CHECKPOINT}" ]]; then
+    echo "SKIP_TRAIN=1 but checkpoint does not exist: ${CHECKPOINT}" | tee -a "${REPORT}"
+    exit 1
+  fi
+  echo "Skipping training and using checkpoint: ${CHECKPOINT}" | tee -a "${REPORT}"
+else
+  run_and_log python3 tools/train_visor_prism.py \
+    --config-file "${CONFIG_FILE}" \
+    --predicate-part base \
+    --output-dir "${OUTPUT_ROOT}" \
+    --epochs "${EPOCHS}" \
+    --save-every 1 \
+    --batch-size "${BATCH_SIZE}" \
+    --num-workers "${NUM_WORKERS}" \
+    --top-m "${TOP_M}" \
+    "${COMMON_DEVICE_ARGS[@]}" \
+    "${COMMON_SAMPLE_ARGS[@]}"
+fi
 
 run_and_log python3 tools/eval_visor_prism.py \
   --config-file "${CONFIG_FILE}" \
@@ -66,6 +78,7 @@ run_and_log python3 tools/eval_visor_prism.py \
   --candidate-part base \
   --output-dir "${RUN_DIR}/eval_val_base" \
   --batch-size "${BATCH_SIZE}" \
+  --text-encode-batch-size "${TEXT_ENCODE_BATCH_SIZE}" \
   --num-workers "${NUM_WORKERS}" \
   "${COMMON_DEVICE_ARGS[@]}" \
   "${COMMON_SAMPLE_ARGS[@]}"
@@ -78,6 +91,7 @@ run_and_log python3 tools/eval_visor_prism.py \
   --candidate-part novel \
   --output-dir "${RUN_DIR}/eval_test_novel" \
   --batch-size "${BATCH_SIZE}" \
+  --text-encode-batch-size "${TEXT_ENCODE_BATCH_SIZE}" \
   --num-workers "${NUM_WORKERS}" \
   "${COMMON_DEVICE_ARGS[@]}" \
   "${COMMON_SAMPLE_ARGS[@]}"
