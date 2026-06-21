@@ -70,11 +70,15 @@ def candidate_slot_tensor(mapping, candidate_names, device):
 
 
 def build_candidate_predicates(raw_dataset, allowed_names):
+    if allowed_names is not None:
+        name_to_id = {name: pred_id for pred_id, name in enumerate(raw_dataset.ind_to_predicates) if pred_id > 0}
+        pairs = []
+        for idx, name in enumerate(sorted(allowed_names)):
+            pairs.append((name_to_id.get(name, -100000 - idx), name))
+        return pairs
     pairs = []
     for pred_id, name in enumerate(raw_dataset.ind_to_predicates):
         if pred_id == 0:
-            continue
-        if allowed_names is not None and name not in allowed_names:
             continue
         pairs.append((pred_id, name))
     return pairs

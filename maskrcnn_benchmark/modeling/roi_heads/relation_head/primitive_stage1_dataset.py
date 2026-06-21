@@ -38,12 +38,12 @@ def predicate_names_for_part(cfg, part="total", split_file=None):
         return set(split_data[part])
 
     part = part.lower()
-    if part == "total":
-        return None
     if part == "base":
         return set(cfg.OV_SETTING.PRDCS_BASE)
     if part == "novel":
         return set(cfg.OV_SETTING.PRDCS_NOVEL)
+    if part == "total":
+        return set(cfg.OV_SETTING.PRDCS_BASE) | set(cfg.OV_SETTING.PRDCS_NOVEL)
     if part == "semantic":
         return set(cfg.OV_SETTING.SEMAN)
     raise ValueError("Unknown predicate part: {}".format(part))
