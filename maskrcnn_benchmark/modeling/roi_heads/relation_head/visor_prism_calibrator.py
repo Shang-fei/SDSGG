@@ -74,6 +74,7 @@ class VisorPrismCalibrator(nn.Module):
         if not self.should_apply() or img is None:
             return rel_dists
         with torch.no_grad():
+            obj_preds = self._split_obj_preds(obj_preds, proposals)
             additions = self.compute_logits(proposals, rel_pair_idxs, obj_preds, img)
         fused = []
         for rel_logit, add_logit in zip(rel_dists, additions):
@@ -89,6 +90,18 @@ class VisorPrismCalibrator(nn.Module):
                 add_logit = add_logit.index_select(1, index)
             fused.append(rel_logit + self.alpha * add_logit / max(self.temperature, 1e-6))
         return fused
+
+    def _split_obj_preds(self, obj_preds, proposals):
+        if isinstance(obj_preds, torch.Tensor):
+            if obj_preds.dim() == 0:
+                return [obj_preds.view(1)]
+            num_objs = [len(proposal) for proposal in proposals]
+            if obj_preds.dim() == 1 and int(obj_preds.numel()) == sum(num_objs):
+                return list(obj_preds.split(num_objs, dim=0))
+            return [obj_preds]
+        if isinstance(obj_preds, (list, tuple)):
+            return list(obj_preds)
+        raise TypeError("Unsupported obj_preds type for VISOR-PRISM: {}".format(type(obj_preds)))
 
     def compute_logits(self, proposals, rel_pair_idxs, obj_preds, img):
         logits = []
