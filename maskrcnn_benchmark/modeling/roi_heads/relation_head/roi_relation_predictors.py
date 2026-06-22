@@ -13,6 +13,7 @@ from .model_msg_passing import IMPContext
 from .model_vtranse import VTransEFeature
 from .model_vctree import VCTreeLSTMContext
 from .model_motifs import LSTMContext, FrequencyBias
+from .utils_motifs import obj_edge_vectors
 from .model_motifs_with_attribute import AttributeLSTMContext
 from .model_transformer import TransformerContext
 from .utils_relation import layer_init, get_box_info, get_box_pair_info
@@ -722,6 +723,15 @@ class ELRGFMetricScorer(nn.Module):
         with torch.no_grad():
             self.pred_prototypes.copy_(F.normalize(classifier.weight.detach(), dim=-1))
 
+    def init_from_text_vectors(self, text_vectors):
+        if text_vectors.size(0) != self.num_rel_cls:
+            return
+        with torch.no_grad():
+            proto = self.pred_prototypes.new_zeros((self.num_rel_cls, self.metric_dim))
+            copy_dim = min(text_vectors.size(1), self.metric_dim)
+            proto[:, :copy_dim] = text_vectors[:, :copy_dim].to(proto.device, dtype=proto.dtype)
+            self.pred_prototypes.copy_(F.normalize(proto, dim=-1))
+
     def forward(self, pair_rep, axis_feat):
         q = F.normalize(self.visual_proj(pair_rep), dim=-1)
         proto = F.normalize(self.pred_prototypes, dim=-1)
@@ -738,6 +748,258 @@ class ELRGFMetricScorer(nn.Module):
         logits = -self.logit_scale.clamp(0.1, 20.0) * dist
         metric_reg = (diag - 1.0).pow(2).mean() + 0.01 * low_rank.pow(2).mean()
         return logits, metric_reg
+
+
+class ReSASparseAtomEncoder(nn.Module):
+    def __init__(self, pair_dim, atom_dim, dropout):
+        super(ReSASparseAtomEncoder, self).__init__()
+        self.atom_logits = nn.Sequential(
+            nn.Linear(pair_dim, pair_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(pair_dim, atom_dim),
+        )
+        nn.init.constant_(self.atom_logits[-1].bias, 0.1)
+
+    def forward(self, pair_rep):
+        atom_logits = self.atom_logits(pair_rep)
+        atom_act = F.relu(atom_logits)
+        atom_code = atom_act / atom_act.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+        return atom_logits, atom_act, atom_code
+
+
+@registry.ROI_RELATION_PREDICTOR.register("ReSAPredictor")
+class ReSAPredictor(nn.Module):
+    def __init__(self, config, in_channels):
+        super(ReSAPredictor, self).__init__()
+        self.attribute_on = config.MODEL.ATTRIBUTE_ON
+        self.num_obj_cls = config.MODEL.ROI_BOX_HEAD.NUM_CLASSES
+        self.num_att_cls = config.MODEL.ROI_ATTRIBUTE_HEAD.NUM_ATTRIBUTES
+        self.num_rel_cls = config.MODEL.ROI_RELATION_HEAD.NUM_CLASSES
+        self.use_vision = config.MODEL.ROI_RELATION_HEAD.PREDICT_USE_VISION
+        self.use_bias = config.MODEL.ROI_RELATION_HEAD.PREDICT_USE_BIAS
+
+        statistics = get_dataset_statistics(config)
+        obj_classes, rel_classes, att_classes = statistics['obj_classes'], statistics['rel_classes'], statistics['att_classes']
+        self.rel_classes = rel_classes
+        self.context_layer = TransformerContext(config, obj_classes, rel_classes, in_channels)
+
+        resa_cfg = config.MODEL.ROI_RELATION_HEAD.RESA
+        self.atom_dim = resa_cfg.ATOM_DIM
+        self.pair_dim = resa_cfg.PAIR_DIM
+        self.base_weight = resa_cfg.BASE_WEIGHT
+        self.atom_weight = resa_cfg.ATOM_WEIGHT
+        self.freq_weight = resa_cfg.FREQ_WEIGHT
+        self.recon_weight = resa_cfg.RECON_WEIGHT
+        self.sparse_weight = resa_cfg.SPARSE_WEIGHT
+        self.diversity_weight = resa_cfg.DIVERSITY_WEIGHT
+        self.consist_weight = resa_cfg.CONSIST_WEIGHT
+        self.contrast_weight = resa_cfg.CONTRAST_WEIGHT
+        self.use_union_features = resa_cfg.USE_UNION_FEATURES and self.use_vision
+
+        hidden_dim = config.MODEL.ROI_RELATION_HEAD.CONTEXT_HIDDEN_DIM
+        pooling_dim = config.MODEL.ROI_RELATION_HEAD.CONTEXT_POOLING_DIM
+        pair_input_dim = hidden_dim * 2 + 128
+        if self.use_union_features:
+            self.union_proj = nn.Sequential(
+                nn.Linear(pooling_dim, hidden_dim),
+                nn.ReLU(inplace=True),
+            )
+            pair_input_dim += hidden_dim
+        else:
+            self.union_proj = None
+
+        self.geom_embed = nn.Sequential(
+            nn.Linear(32, 128),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.1),
+            nn.Linear(128, 128),
+            nn.ReLU(inplace=True),
+        )
+        self.pair_proj = nn.Sequential(
+            nn.Linear(pair_input_dim, self.pair_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(config.MODEL.ROI_RELATION_HEAD.CONTEXT_DROPOUT_RATE),
+            nn.Linear(self.pair_dim, self.pair_dim),
+            nn.ReLU(inplace=True),
+        )
+        self.rel_compress = nn.Linear(self.pair_dim, self.num_rel_cls)
+        layer_init(self.rel_compress, xavier=True)
+
+        self.atom_encoder = ReSASparseAtomEncoder(
+            self.pair_dim,
+            self.atom_dim,
+            config.MODEL.ROI_RELATION_HEAD.CONTEXT_DROPOUT_RATE,
+        )
+        self.atom_dictionary = nn.Parameter(torch.empty(self.atom_dim, self.pair_dim))
+        self.pred_atom_logits = nn.Parameter(torch.empty(self.num_rel_cls, self.atom_dim))
+        self.atom_logit_scale = nn.Parameter(torch.tensor(10.0))
+        nn.init.xavier_normal_(self.atom_dictionary)
+        nn.init.uniform_(self.pred_atom_logits, 0.0, 0.1)
+
+        if resa_cfg.INIT_PRED_ATOMS_FROM_TEXT:
+            rel_embed_vecs = obj_edge_vectors(rel_classes, wv_dir=config.GLOVE_DIR, wv_dim=config.MODEL.ROI_RELATION_HEAD.EMBED_DIM)
+            self._init_pred_atoms_from_text(rel_embed_vecs)
+
+        self.freq_bias = FrequencyBias(config, statistics) if self.use_bias else None
+        self._confusable_groups = self._build_confusable_groups(rel_classes)
+
+    def updata(self, mode):
+        return
+
+    def _init_pred_atoms_from_text(self, text_vectors):
+        if text_vectors.size(0) != self.num_rel_cls:
+            return
+        with torch.no_grad():
+            init = self.pred_atom_logits.new_zeros((self.num_rel_cls, self.atom_dim))
+            copy_dim = min(text_vectors.size(1), self.atom_dim)
+            init[:, :copy_dim] = text_vectors[:, :copy_dim].to(init.device, dtype=init.dtype)
+            init = init - init.min(dim=-1, keepdim=True)[0]
+            init = init / init.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+            init[0].zero_()
+            self.pred_atom_logits.copy_(init + 1e-3)
+
+    def _build_confusable_groups(self, rel_classes):
+        name_to_idx = {name.lower(): idx for idx, name in enumerate(rel_classes)}
+        groups = [
+            ["on", "standing on", "sitting on", "laying on", "lying on", "mounted on", "parked on", "on back of"],
+            ["holding", "touching", "carrying", "wearing", "wears", "using", "attached to"],
+            ["above", "under", "over", "behind", "in front of", "near", "against", "between"],
+            ["in", "inside", "covered in", "covering", "part of", "of", "has"],
+            ["looking at", "watching", "playing", "eating", "riding", "walking on", "walking in"],
+        ]
+        confusable = {}
+        for group in groups:
+            ids = [name_to_idx[name] for name in group if name in name_to_idx]
+            for idx in ids:
+                confusable[idx] = [other for other in ids if other != idx]
+        return confusable
+
+    def _pair_geometry(self, proposal, pair_idx):
+        box_info = get_box_info(proposal.bbox, proposal=proposal)
+        sub_info = box_info[pair_idx[:, 0]]
+        obj_info = box_info[pair_idx[:, 1]]
+        return get_box_pair_info(sub_info, obj_info)
+
+    def _build_pair_rep(self, edge_ctx, proposals, rel_pair_idxs, union_features):
+        num_rels = [r.shape[0] for r in rel_pair_idxs]
+        num_objs = [len(b) for b in proposals]
+        edge_ctx = edge_ctx.split(num_objs, dim=0)
+        if self.use_union_features and union_features is not None:
+            union_splits = union_features.split(num_rels, dim=0)
+        else:
+            union_splits = [None] * len(num_rels)
+
+        pair_reps = []
+        for img_idx, pair_idx in enumerate(rel_pair_idxs):
+            sub_ctx = edge_ctx[img_idx][pair_idx[:, 0]]
+            obj_ctx = edge_ctx[img_idx][pair_idx[:, 1]]
+            geom_embed = self.geom_embed(self._pair_geometry(proposals[img_idx], pair_idx))
+            features = [sub_ctx, obj_ctx, geom_embed]
+            if self.use_union_features and union_splits[img_idx] is not None:
+                features.append(self.union_proj(union_splits[img_idx]))
+            pair_reps.append(torch.cat(features, dim=-1))
+        pair_reps = torch.cat(pair_reps, dim=0)
+        return self.pair_proj(pair_reps)
+
+    def _pred_atom_code(self):
+        pred_act = F.relu(self.pred_atom_logits)
+        pred_code = pred_act / pred_act.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+        pred_code = pred_code.clone()
+        pred_code[0].zero_()
+        return pred_code
+
+    def _atom_logits(self, atom_code, base_logits):
+        pred_code = self._pred_atom_code()
+        atom_query = F.normalize(atom_code, dim=-1)
+        atom_proto = F.normalize(pred_code, dim=-1)
+        atom_logits = self.atom_logit_scale.clamp(1.0, 30.0) * torch.matmul(atom_query, atom_proto.t())
+        atom_logits = atom_logits.clone()
+        atom_logits[:, 0] = 0.0
+        return atom_logits
+
+    def _diversity_loss(self):
+        dictionary = F.normalize(self.atom_dictionary, dim=-1)
+        gram = torch.matmul(dictionary, dictionary.t())
+        eye = torch.eye(gram.size(0), device=gram.device, dtype=gram.dtype)
+        return (gram - eye).pow(2).mean()
+
+    def _sparse_loss(self, atom_code):
+        entropy = -(atom_code * atom_code.clamp(min=1e-6).log()).sum(dim=-1)
+        return entropy.mean()
+
+    def _consistency_loss(self, atom_code, rel_labels):
+        if rel_labels is None:
+            return atom_code.sum() * 0.0
+        labels = torch.cat(rel_labels, dim=0).view(-1)
+        pos = labels > 0
+        if pos.sum() == 0:
+            return atom_code.sum() * 0.0
+        pred_code = self._pred_atom_code()
+        target_code = pred_code[labels[pos].long()]
+        return (1.0 - F.cosine_similarity(atom_code[pos], target_code, dim=-1)).mean()
+
+    def _contrast_loss(self, atom_logits, rel_labels):
+        if rel_labels is None:
+            return atom_logits.sum() * 0.0
+        labels = torch.cat(rel_labels, dim=0).view(-1).long()
+        pos = labels > 0
+        if pos.sum() == 0:
+            return atom_logits.sum() * 0.0
+        losses = []
+        for label in labels[pos].unique():
+            label_int = int(label.item())
+            negatives = self._confusable_groups.get(label_int, None)
+            if not negatives:
+                continue
+            sample_mask = pos & (labels == label)
+            neg_ids = torch.tensor(negatives, device=atom_logits.device, dtype=torch.long)
+            pos_score = atom_logits[sample_mask, label_int].unsqueeze(1)
+            neg_score = atom_logits[sample_mask].index_select(1, neg_ids)
+            losses.append(F.relu(0.2 + neg_score - pos_score).mean())
+        if len(losses) == 0:
+            return atom_logits.sum() * 0.0
+        return torch.stack(losses).mean()
+
+    def forward(self, proposals, rel_pair_idxs, rel_labels, rel_binarys, roi_features, union_features, logger=None, img=None):
+        if self.attribute_on:
+            obj_dists, obj_preds, att_dists, edge_ctx = self.context_layer(roi_features, proposals, logger)
+        else:
+            obj_dists, obj_preds, edge_ctx = self.context_layer(roi_features, proposals, logger)
+
+        num_rels = [r.shape[0] for r in rel_pair_idxs]
+        num_objs = [len(b) for b in proposals]
+        assert len(num_rels) == len(num_objs)
+
+        pair_rep = self._build_pair_rep(edge_ctx, proposals, rel_pair_idxs, union_features)
+        base_logits = self.rel_compress(pair_rep)
+        atom_raw_logits, atom_act, atom_code = self.atom_encoder(pair_rep)
+        atom_logits = self._atom_logits(atom_code, base_logits)
+        rel_logits = self.base_weight * base_logits + self.atom_weight * atom_logits
+        rel_logits[:, 0] = base_logits[:, 0]
+
+        if self.freq_bias is not None and self.freq_weight != 0:
+            obj_preds_split = obj_preds.split(num_objs, dim=0)
+            pair_obj_preds = []
+            for img_idx, pair_idx in enumerate(rel_pair_idxs):
+                pair_obj_preds.append(torch.stack((obj_preds_split[img_idx][pair_idx[:, 0]], obj_preds_split[img_idx][pair_idx[:, 1]]), dim=1))
+            pair_obj_preds = torch.cat(pair_obj_preds, dim=0)
+            rel_logits = rel_logits + self.freq_weight * self.freq_bias.index_with_labels(pair_obj_preds.long())
+            rel_logits[:, 0] = base_logits[:, 0]
+
+        rel_dists = tuple(rel_logits.split(num_rels, dim=0))
+        obj_dists = obj_dists.split(num_objs, dim=0)
+
+        add_losses = {}
+        if self.training:
+            recon = torch.matmul(atom_code, self.atom_dictionary)
+            add_losses["loss_resa_recon"] = self.recon_weight * F.smooth_l1_loss(recon.float(), pair_rep.detach().float())
+            add_losses["loss_resa_sparse"] = self.sparse_weight * self._sparse_loss(atom_code)
+            add_losses["loss_resa_diversity"] = self.diversity_weight * self._diversity_loss()
+            add_losses["loss_resa_consist"] = self.consist_weight * self._consistency_loss(atom_code, rel_labels)
+            add_losses["loss_resa_contrast"] = self.contrast_weight * self._contrast_loss(atom_logits, rel_labels)
+
+        return obj_dists, rel_dists, add_losses
 
 
 @registry.ROI_RELATION_PREDICTOR.register("ELRGFPredictor")
@@ -760,6 +1022,7 @@ class ELRGFPredictor(nn.Module):
         self.metric_dim = elrgf_cfg.METRIC_DIM
         self.axis_dim = elrgf_cfg.AXIS_DIM
         self.num_axes = elrgf_cfg.NUM_AXES
+        self.base_logit_weight = elrgf_cfg.BASE_LOGIT_WEIGHT
         self.metric_weight = elrgf_cfg.METRIC_WEIGHT
         self.freq_weight = elrgf_cfg.FREQ_WEIGHT
         self.axis_loss_weight = elrgf_cfg.AXIS_LOSS_WEIGHT
@@ -812,6 +1075,9 @@ class ELRGFPredictor(nn.Module):
         )
         if elrgf_cfg.INIT_PROTOTYPES_FROM_CLASSIFIER:
             self.metric_scorer.init_from_classifier(self.rel_compress)
+        if elrgf_cfg.INIT_PROTOTYPES_FROM_TEXT:
+            rel_embed_vecs = obj_edge_vectors(rel_classes, wv_dir=config.GLOVE_DIR, wv_dim=config.MODEL.ROI_RELATION_HEAD.EMBED_DIM)
+            self.metric_scorer.init_from_text_vectors(rel_embed_vecs)
 
         self.freq_bias = FrequencyBias(config, statistics) if self.use_bias else None
         self._axis_predicate_map = self._build_axis_predicate_map(rel_classes)
@@ -975,7 +1241,7 @@ class ELRGFPredictor(nn.Module):
         if self.disable_bg_metric:
             metric_logits[:, 0] = 0.0
 
-        rel_logits = base_logits + self.metric_weight * metric_logits
+        rel_logits = self.base_logit_weight * base_logits + self.metric_weight * metric_logits
 
         if self.freq_bias is not None and self.freq_weight != 0:
             obj_preds_split = obj_preds.split(num_objs, dim=0)
