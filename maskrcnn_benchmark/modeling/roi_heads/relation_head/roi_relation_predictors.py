@@ -16,6 +16,7 @@ from .model_motifs import LSTMContext, FrequencyBias
 from .model_motifs_with_attribute import AttributeLSTMContext
 from .model_transformer import TransformerContext
 from .utils_relation import layer_init, get_box_info, get_box_pair_info
+from .visor_prism_calibrator import VisorPrismCalibrator
 from maskrcnn_benchmark.data import get_dataset_statistics
 from CLIP import clip
 import time
@@ -157,6 +158,7 @@ class GQAClipPredictor(nn.Module):
         self.adaper_clip2 = MVA()
 
         self.obj_names = obj_classes
+        self.visor_calibrator = VisorPrismCalibrator(config, obj_classes, rel_classes)
 
         a=time.time()
         self.texts1=[]
@@ -214,6 +216,7 @@ class GQAClipPredictor(nn.Module):
         self.novel=[0,26, 14, 25, 15, 19, 44, 45, 18, 28, 7]
 
         mode="base"
+        self.active_rel_ids = self.base
 
         if mode=="base":
             self.description_relation = self.description_relation.iloc[self.base, 1:]
@@ -261,8 +264,10 @@ class GQAClipPredictor(nn.Module):
         self.description_relation = pd.read_csv(
             curpath+"/description_relation_loss.csv")
         if mode=="base":
+            self.active_rel_ids = self.base
             self.description_relation = self.description_relation.iloc[self.base, 1:]
         elif mode=="novel":
+            self.active_rel_ids = self.novel
             self.description_relation = self.description_relation.iloc[self.novel, 1:]
 
         self.description_relation=self.description_relation.applymap(lambda x: [int(s) for s in x.split(',')])
@@ -373,6 +378,7 @@ class GQAClipPredictor(nn.Module):
 
         obj_dists = obj_dists.split(num_objs, dim=0)
         rel_dists = tuple(rel_dists)
+        rel_dists = tuple(self.visor_calibrator(rel_dists, proposals, rel_pair_idxs, obj_preds, img, getattr(self, "active_rel_ids", None)))
 
         add_losses = {}
 
@@ -406,6 +412,7 @@ class ClipPredictor(nn.Module):
         self.adaper_clip1 = MVA()
         self.adaper_clip2 = MVA()
         self.obj_names = obj_classes
+        self.visor_calibrator = VisorPrismCalibrator(config, obj_classes, rel_classes)
         a=time.time()
         self.texts1=[]
         self.texts2=[]
@@ -464,6 +471,7 @@ class ClipPredictor(nn.Module):
 
         self.semantic = [0]+[self.id_dict[x] for x in sorted(config.OV_SETTING.SEMAN)]
         mode="base"
+        self.active_rel_ids = self.base
 
         if mode=="base":
 
@@ -529,6 +537,7 @@ class ClipPredictor(nn.Module):
         self.description_relation = pd.read_csv(
             curpath+"/description_relation.csv")
         if mode == "base":
+            self.active_rel_ids = self.base
 
             self.description_relation = self.description_relation.iloc[self.base, 1:]
 
@@ -536,16 +545,19 @@ class ClipPredictor(nn.Module):
                 curpath+"/filter_total.csv").iloc[
                                     self.base, 1:]
         elif mode == "novel":
+            self.active_rel_ids = self.novel
             self.description_relation = self.description_relation.iloc[self.novel, 1:]
             self.sub_filter_novel = pd.read_csv(
                 curpath+"/filter_total.csv").iloc[
                                     self.novel, 1:]
         elif mode == "total":
+            self.active_rel_ids = list(range(self.num_rel_cls))
             self.description_relation = self.description_relation.iloc[:, 1:]
             self.sub_filter_novel = pd.read_csv(
                 curpath+"/filter_total.csv").iloc[
                                     :, 1:]
         elif mode == "semantic":
+            self.active_rel_ids = self.semantic
             self.description_relation = self.description_relation.iloc[self.semantic, 1:]
             self.sub_filter_novel = pd.read_csv(
                 curpath+"/filter_total.csv").iloc[
@@ -670,6 +682,7 @@ class ClipPredictor(nn.Module):
 
         obj_dists = obj_dists.split(num_objs, dim=0)
         rel_dists = tuple(rel_dists)
+        rel_dists = tuple(self.visor_calibrator(rel_dists, proposals, rel_pair_idxs, obj_preds, img, getattr(self, "active_rel_ids", None)))
 
         add_losses = {}
         return obj_dists, rel_dists, add_losses
@@ -699,6 +712,7 @@ class ClipPredictor(nn.Module):
         self.adaper_clip1 = MVA()
         self.adaper_clip2 = MVA()
         self.obj_names = obj_classes
+        self.visor_calibrator = VisorPrismCalibrator(config, obj_classes, rel_classes)
         a=time.time()
         self.context_layer = TransformerContext(config, obj_classes, rel_classes, in_channels)
 
@@ -709,6 +723,7 @@ class ClipPredictor(nn.Module):
 
         self.semantic = [0]+[self.id_dict[x] for x in sorted(config.OV_SETTING.SEMAN)]
         mode="base"
+        self.active_rel_ids = self.base
 
         if mode=="base":
             self.sub_filter_novel = pd.read_csv(
@@ -752,18 +767,22 @@ class ClipPredictor(nn.Module):
     def updata(self,mode):
         print("now is "+mode)
         if mode == "base":
+            self.active_rel_ids = self.base
             self.sub_filter_novel = pd.read_csv(
                 curpath+"/filter_total.csv").iloc[
                                     self.base, 1:]
         elif mode == "novel":
+            self.active_rel_ids = self.novel
             self.sub_filter_novel = pd.read_csv(
                 curpath+"/filter_total.csv").iloc[
                                     self.novel, 1:]
         elif mode == "total":
+            self.active_rel_ids = list(range(self.num_rel_cls))
             self.sub_filter_novel = pd.read_csv(
                 curpath+"/filter_total.csv").iloc[
                                     :, 1:]
         elif mode == "semantic":
+            self.active_rel_ids = self.semantic
             self.sub_filter_novel = pd.read_csv(
                 curpath+"/filter_total.csv").iloc[
                                     self.semantic, 1:]
@@ -855,6 +874,7 @@ class ClipPredictor(nn.Module):
 
         obj_dists = obj_dists.split(num_objs, dim=0)
         rel_dists = tuple(rel_dists)
+        rel_dists = tuple(self.visor_calibrator(rel_dists, proposals, rel_pair_idxs, obj_preds, img, getattr(self, "active_rel_ids", None)))
 
         add_losses = {}
         return obj_dists, rel_dists, add_losses
