@@ -34,6 +34,125 @@ SEMAN = ["attached to", "carrying", "covered in", "covering", "eating", "flying 
                                "painted on", "parked on", "playing", "riding", "says", "sitting on", "standing on",
                                "using", "walking in", "walking on", "watching"]
 # from utils_clip import *
+
+
+@registry.ROI_RELATION_PREDICTOR.register("CausalAnalysisPredictor")
+class CausalAnalysisPredictor(nn.Module):
+    def __init__(self, config, in_channels):
+        super(CausalAnalysisPredictor, self).__init__()
+        self.cfg = config
+        self.attribute_on = config.MODEL.ATTRIBUTE_ON
+        self.num_obj_cls = config.MODEL.ROI_BOX_HEAD.NUM_CLASSES
+        self.num_att_cls = config.MODEL.ROI_ATTRIBUTE_HEAD.NUM_ATTRIBUTES
+        self.num_rel_cls = config.MODEL.ROI_RELATION_HEAD.NUM_CLASSES
+        self.hidden_dim = config.MODEL.ROI_RELATION_HEAD.CONTEXT_HIDDEN_DIM
+        self.pooling_dim = config.MODEL.ROI_RELATION_HEAD.CONTEXT_POOLING_DIM
+        self.use_vision = config.MODEL.ROI_RELATION_HEAD.PREDICT_USE_VISION
+        self.use_bias = config.MODEL.ROI_RELATION_HEAD.PREDICT_USE_BIAS
+        self.fusion_type = config.MODEL.ROI_RELATION_HEAD.CAUSAL.FUSION_TYPE
+        self.context_layer_name = config.MODEL.ROI_RELATION_HEAD.CAUSAL.CONTEXT_LAYER
+
+        statistics = get_dataset_statistics(config)
+        obj_classes = statistics["obj_classes"]
+        rel_classes = statistics["rel_classes"]
+        att_classes = statistics["att_classes"]
+
+        if self.context_layer_name == "motifs":
+            self.context_layer = LSTMContext(config, obj_classes, rel_classes, in_channels)
+        elif self.context_layer_name == "vctree":
+            self.context_layer = VCTreeLSTMContext(config, obj_classes, rel_classes, in_channels)
+        elif self.context_layer_name == "transformer":
+            self.context_layer = TransformerContext(config, obj_classes, rel_classes, in_channels)
+        else:
+            raise ValueError("Unsupported CAUSAL.CONTEXT_LAYER: {}".format(self.context_layer_name))
+
+        self.post_emb = nn.Linear(self.hidden_dim, self.hidden_dim * 2)
+        self.post_cat = nn.Linear(self.hidden_dim * 2, self.pooling_dim)
+        self.ctx_compress = nn.Linear(self.pooling_dim, self.num_rel_cls)
+        self.vis_compress = nn.Linear(self.pooling_dim, self.num_rel_cls)
+        if self.use_bias:
+            self.freq_bias = FrequencyBias(config, statistics)
+
+        layer_init(self.post_emb, xavier=True)
+        layer_init(self.post_cat, xavier=True)
+        layer_init(self.ctx_compress, xavier=True)
+        layer_init(self.vis_compress, xavier=True)
+
+        self.id_dict = {name: idx for idx, name in enumerate(rel_classes)}
+        self.base = [0] + [self.id_dict[x] for x in sorted(config.OV_SETTING.PRDCS_BASE) if x in self.id_dict]
+        self.novel = [0] + [self.id_dict[x] for x in sorted(config.OV_SETTING.PRDCS_NOVEL) if x in self.id_dict]
+        self.semantic = [0] + [self.id_dict[x] for x in sorted(config.OV_SETTING.SEMAN) if x in self.id_dict]
+        self.active_rel_ids = None
+        self.visor_calibrator = VisorPrismCalibrator(config, obj_classes, rel_classes)
+
+    def updata(self, mode):
+        if mode == "base":
+            self.active_rel_ids = self.base
+        elif mode == "novel":
+            self.active_rel_ids = self.novel
+        elif mode == "semantic":
+            self.active_rel_ids = self.semantic
+        else:
+            self.active_rel_ids = None
+
+    def _build_pair_rep(self, edge_ctx, rel_pair_idxs, num_objs):
+        edge_rep = self.post_emb(edge_ctx).view(edge_ctx.size(0), 2, self.hidden_dim)
+        head_rep = edge_rep[:, 0].contiguous()
+        tail_rep = edge_rep[:, 1].contiguous()
+        head_reps = head_rep.split(num_objs, dim=0)
+        tail_reps = tail_rep.split(num_objs, dim=0)
+
+        prod_reps = []
+        for pair_idx, head, tail in zip(rel_pair_idxs, head_reps, tail_reps):
+            prod_reps.append(torch.cat((head[pair_idx[:, 0]], tail[pair_idx[:, 1]]), dim=-1))
+        prod_rep = cat(prod_reps, dim=0)
+        return self.post_cat(prod_rep)
+
+    def _build_pair_pred(self, obj_preds, rel_pair_idxs, num_objs):
+        obj_preds = obj_preds.split(num_objs, dim=0)
+        pair_preds = []
+        for pair_idx, pred in zip(rel_pair_idxs, obj_preds):
+            pair_preds.append(torch.stack((pred[pair_idx[:, 0]], pred[pair_idx[:, 1]]), dim=1))
+        return cat(pair_preds, dim=0)
+
+    def _fuse_logits(self, ctx_logits, union_logits):
+        if union_logits is None:
+            return ctx_logits
+        if self.fusion_type == "gate":
+            return ctx_logits * torch.sigmoid(union_logits)
+        if self.fusion_type == "sum":
+            return ctx_logits + union_logits
+        return ctx_logits + union_logits
+
+    def forward(self, proposals, rel_pair_idxs, rel_labels, rel_binarys, roi_features, union_features, logger=None, img=None):
+        num_objs = [len(p) for p in proposals]
+        if self.context_layer_name in ("motifs", "vctree"):
+            obj_dists, obj_preds, edge_ctx, binary_preds = self.context_layer(
+                roi_features, proposals, rel_pair_idxs, logger
+            )
+        else:
+            obj_dists, obj_preds, edge_ctx = self.context_layer(roi_features, proposals, logger)
+            binary_preds = None
+
+        prod_rep = self._build_pair_rep(edge_ctx, rel_pair_idxs, num_objs)
+        ctx_logits = self.ctx_compress(prod_rep)
+        union_logits = self.vis_compress(union_features) if self.use_vision and union_features is not None else None
+        rel_logits = self._fuse_logits(ctx_logits, union_logits)
+
+        if self.use_bias:
+            pair_pred = self._build_pair_pred(obj_preds, rel_pair_idxs, num_objs)
+            rel_logits = rel_logits + self.freq_bias.index_with_labels(pair_pred.long())
+
+        obj_dists = obj_dists.split(num_objs, dim=0)
+        rel_dists = rel_logits.split([len(pair_idx) for pair_idx in rel_pair_idxs], dim=0)
+        rel_dists = tuple(self.visor_calibrator(
+            rel_dists, proposals, rel_pair_idxs, obj_preds, img, self.active_rel_ids
+        ))
+
+        add_losses = {}
+        return obj_dists, rel_dists, add_losses
+
+
 def crop_and_resize(image, posi1, posi2):
     posi = torch.cat((torch.min(posi1[0:2], posi2[0:2]),
                       torch.max(posi1[2:], posi2[2:])), dim=0).int()
