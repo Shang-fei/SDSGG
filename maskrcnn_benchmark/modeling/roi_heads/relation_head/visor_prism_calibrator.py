@@ -29,7 +29,7 @@ class VisorPrismCalibrator(nn.Module):
         self.clip_preprocess = None
         self.candidate_ids = []
         self.candidate_names = []
-        self.candidate_features = torch.empty(0)
+        self.register_buffer("candidate_features", torch.empty(0))
 
         if not self.enabled:
             return
@@ -65,7 +65,7 @@ class VisorPrismCalibrator(nn.Module):
             raise ValueError("VISOR-PRISM found no candidate predicates for {}".format(visor_cfg.CANDIDATE_PART))
         with torch.no_grad():
             candidate_features = self.model.encode_text(self.candidate_names, torch.device(self.device_name))
-        self.register_buffer("candidate_features", candidate_features)
+        self.candidate_features = candidate_features
 
     def should_apply(self):
         return self.enabled and self.model is not None and (not self.training or self.apply_in_train)

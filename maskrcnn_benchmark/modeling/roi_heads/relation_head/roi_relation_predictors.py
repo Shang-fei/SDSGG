@@ -387,8 +387,7 @@ class GQAClipPredictor(nn.Module):
 
 
 
-@registry.ROI_RELATION_PREDICTOR.register("ClipPredictor")
-class ClipPredictor(nn.Module):
+class ClipPredictorDuplicate(nn.Module):
     def __init__(self, config, in_channels):
         super(ClipPredictor, self).__init__()
         self.attribute_on = config.MODEL.ATTRIBUTE_ON
