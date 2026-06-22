@@ -124,6 +124,28 @@ class CausalAnalysisPredictor(nn.Module):
             return ctx_logits + union_logits
         return ctx_logits + union_logits
 
+    def _add_frequency_bias(self, rel_logits, pair_pred):
+        freq_logits = self.freq_bias.index_with_labels(pair_pred.long())
+        if freq_logits.shape[-1] == rel_logits.shape[-1]:
+            return rel_logits + freq_logits
+
+        target_ids = None
+        if freq_logits.shape[-1] == len(self.base):
+            target_ids = self.base
+        elif freq_logits.shape[-1] == len(self.novel):
+            target_ids = self.novel
+        elif self.active_rel_ids is not None and freq_logits.shape[-1] == len(self.active_rel_ids):
+            target_ids = self.active_rel_ids
+
+        if target_ids is None:
+            return rel_logits
+        target_ids = torch.as_tensor(target_ids, device=rel_logits.device, dtype=torch.long)
+        if target_ids.max().item() >= rel_logits.shape[-1]:
+            return rel_logits
+        rel_logits = rel_logits.clone()
+        rel_logits[:, target_ids] = rel_logits[:, target_ids] + freq_logits.to(rel_logits.dtype)
+        return rel_logits
+
     def forward(self, proposals, rel_pair_idxs, rel_labels, rel_binarys, roi_features, union_features, logger=None, img=None):
         num_objs = [len(p) for p in proposals]
         if self.context_layer_name in ("motifs", "vctree"):
@@ -141,7 +163,7 @@ class CausalAnalysisPredictor(nn.Module):
 
         if self.use_bias:
             pair_pred = self._build_pair_pred(obj_preds, rel_pair_idxs, num_objs)
-            rel_logits = rel_logits + self.freq_bias.index_with_labels(pair_pred.long())
+            rel_logits = self._add_frequency_bias(rel_logits, pair_pred)
 
         obj_dists = obj_dists.split(num_objs, dim=0)
         rel_dists = rel_logits.split([len(pair_idx) for pair_idx in rel_pair_idxs], dim=0)
