@@ -195,6 +195,11 @@ class Loss(nn.Module):
         target = target.view(-1)
 
         zz = torch.where(target > 0, True, False)
+        if zz.sum() == 0:
+            return input.sum() * 0.0
+        if input.dim() == 2:
+            return F.cross_entropy(input[zz].float(), target[zz].long())
+
         input = input[zz].half()
         target = target[zz]
 

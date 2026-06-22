@@ -676,6 +676,333 @@ class ClipPredictor(nn.Module):
 
 
 
+class ELRGFAxisHead(nn.Module):
+    def __init__(self, in_dim, hidden_dim, num_axes, dropout):
+        super(ELRGFAxisHead, self).__init__()
+        self.axis_logits = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, num_axes),
+        )
+        self.axis_feat = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.LayerNorm(hidden_dim),
+        )
+
+    def forward(self, pair_rep):
+        return self.axis_logits(pair_rep), self.axis_feat(pair_rep)
+
+
+class ELRGFMetricScorer(nn.Module):
+    def __init__(self, pair_dim, num_rel_cls, metric_dim, axis_dim, low_rank, dropout):
+        super(ELRGFMetricScorer, self).__init__()
+        self.num_rel_cls = num_rel_cls
+        self.metric_dim = metric_dim
+        self.low_rank = low_rank
+
+        self.visual_proj = nn.Sequential(
+            nn.Linear(pair_dim, metric_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(metric_dim, metric_dim),
+        )
+        self.pred_prototypes = nn.Parameter(torch.empty(num_rel_cls, metric_dim))
+        self.diag_head = nn.Linear(axis_dim, metric_dim)
+        self.lowrank_head = nn.Linear(axis_dim, metric_dim * low_rank)
+        self.logit_scale = nn.Parameter(torch.tensor(1.0))
+        nn.init.normal_(self.pred_prototypes, std=0.01)
+
+    def init_from_classifier(self, classifier):
+        if classifier.weight.size(0) != self.num_rel_cls:
+            return
+        if classifier.weight.size(1) != self.metric_dim:
+            return
+        with torch.no_grad():
+            self.pred_prototypes.copy_(F.normalize(classifier.weight.detach(), dim=-1))
+
+    def forward(self, pair_rep, axis_feat):
+        q = F.normalize(self.visual_proj(pair_rep), dim=-1)
+        proto = F.normalize(self.pred_prototypes, dim=-1)
+
+        diag = F.softplus(self.diag_head(axis_feat)) + 1e-4
+        low_rank = torch.tanh(self.lowrank_head(axis_feat))
+        low_rank = low_rank.view(pair_rep.size(0), self.metric_dim, self.low_rank)
+
+        diff = q[:, None, :] - proto[None, :, :]
+        diag_dist = (diff.pow(2) * diag[:, None, :]).sum(-1)
+        low_rank_dist = torch.einsum("ncd,ndr->ncr", diff, low_rank).pow(2).sum(-1)
+        dist = diag_dist + low_rank_dist
+
+        logits = -self.logit_scale.clamp(0.1, 20.0) * dist
+        metric_reg = (diag - 1.0).pow(2).mean() + 0.01 * low_rank.pow(2).mean()
+        return logits, metric_reg
+
+
+@registry.ROI_RELATION_PREDICTOR.register("ELRGFPredictor")
+class ELRGFPredictor(nn.Module):
+    def __init__(self, config, in_channels):
+        super(ELRGFPredictor, self).__init__()
+        self.attribute_on = config.MODEL.ATTRIBUTE_ON
+        self.num_obj_cls = config.MODEL.ROI_BOX_HEAD.NUM_CLASSES
+        self.num_att_cls = config.MODEL.ROI_ATTRIBUTE_HEAD.NUM_ATTRIBUTES
+        self.num_rel_cls = config.MODEL.ROI_RELATION_HEAD.NUM_CLASSES
+        self.use_vision = config.MODEL.ROI_RELATION_HEAD.PREDICT_USE_VISION
+        self.use_bias = config.MODEL.ROI_RELATION_HEAD.PREDICT_USE_BIAS
+
+        statistics = get_dataset_statistics(config)
+        obj_classes, rel_classes, att_classes = statistics['obj_classes'], statistics['rel_classes'], statistics['att_classes']
+        self.rel_classes = rel_classes
+        self.context_layer = TransformerContext(config, obj_classes, rel_classes, in_channels)
+
+        elrgf_cfg = config.MODEL.ROI_RELATION_HEAD.ELRGF
+        self.metric_dim = elrgf_cfg.METRIC_DIM
+        self.axis_dim = elrgf_cfg.AXIS_DIM
+        self.num_axes = elrgf_cfg.NUM_AXES
+        self.metric_weight = elrgf_cfg.METRIC_WEIGHT
+        self.freq_weight = elrgf_cfg.FREQ_WEIGHT
+        self.axis_loss_weight = elrgf_cfg.AXIS_LOSS_WEIGHT
+        self.metric_reg_weight = elrgf_cfg.METRIC_REG_WEIGHT
+        self.axiom_loss_weight = elrgf_cfg.AXIOM_LOSS_WEIGHT
+        self.axis_dropout = elrgf_cfg.AXIS_DROPOUT
+        self.detach_axis = elrgf_cfg.DETACH_AXIS
+        self.use_axis_pseudo_labels = elrgf_cfg.USE_AXIS_PSEUDO_LABELS
+        self.center_metric_logits = elrgf_cfg.CENTER_METRIC_LOGITS
+        self.disable_bg_metric = elrgf_cfg.DISABLE_BG_METRIC
+        self.use_union_features = elrgf_cfg.USE_UNION_FEATURES and self.use_vision
+
+        hidden_dim = config.MODEL.ROI_RELATION_HEAD.CONTEXT_HIDDEN_DIM
+        pooling_dim = config.MODEL.ROI_RELATION_HEAD.CONTEXT_POOLING_DIM
+        pair_input_dim = hidden_dim * 2 + 128
+        if self.use_union_features:
+            self.union_proj = nn.Sequential(
+                nn.Linear(pooling_dim, hidden_dim),
+                nn.ReLU(inplace=True),
+            )
+            pair_input_dim += hidden_dim
+        else:
+            self.union_proj = None
+
+        self.geom_embed = nn.Sequential(
+            nn.Linear(32, 128),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.1),
+            nn.Linear(128, 128),
+            nn.ReLU(inplace=True),
+        )
+        self.pair_proj = nn.Sequential(
+            nn.Linear(pair_input_dim, self.metric_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(config.MODEL.ROI_RELATION_HEAD.CONTEXT_DROPOUT_RATE),
+            nn.Linear(self.metric_dim, self.metric_dim),
+            nn.ReLU(inplace=True),
+        )
+        self.rel_compress = nn.Linear(self.metric_dim, self.num_rel_cls)
+        layer_init(self.rel_compress, xavier=True)
+
+        self.axis_head = ELRGFAxisHead(self.metric_dim, self.axis_dim, self.num_axes, self.axis_dropout)
+        self.metric_scorer = ELRGFMetricScorer(
+            self.metric_dim,
+            self.num_rel_cls,
+            self.metric_dim,
+            self.axis_dim,
+            elrgf_cfg.LOW_RANK,
+            self.axis_dropout,
+        )
+        if elrgf_cfg.INIT_PROTOTYPES_FROM_CLASSIFIER:
+            self.metric_scorer.init_from_classifier(self.rel_compress)
+
+        self.freq_bias = FrequencyBias(config, statistics) if self.use_bias else None
+        self._axis_predicate_map = self._build_axis_predicate_map(rel_classes)
+
+    def updata(self, mode):
+        return
+
+    def _build_axis_predicate_map(self, rel_classes):
+        axis_sets = [
+            {"on", "standing on", "sitting on", "lying on", "laying on", "mounted on", "parked on"},
+            {"on", "touching", "holding", "wearing", "wears", "carrying", "attached to", "covering", "covered in"},
+            {"in", "inside", "within", "covered in"},
+            {"behind", "in front of", "covered in", "covering", "under"},
+            {"above", "under", "behind", "in front of", "over", "between", "near", "against"},
+            {"riding", "sitting on", "standing on", "holding", "carrying", "wearing", "watching", "looking at", "playing", "using"},
+        ]
+        mapping = []
+        for axis_set in axis_sets:
+            ids = []
+            for idx, name in enumerate(rel_classes):
+                if name.lower() in axis_set:
+                    ids.append(idx)
+            mapping.append(ids)
+        return mapping
+
+    def _pair_geometry(self, proposal, pair_idx):
+        box_info = get_box_info(proposal.bbox, proposal=proposal)
+        sub_info = box_info[pair_idx[:, 0]]
+        obj_info = box_info[pair_idx[:, 1]]
+        return get_box_pair_info(sub_info, obj_info)
+
+    def _axis_targets_from_geometry(self, proposal, pair_idx, rel_labels_per_img):
+        num_pairs = pair_idx.size(0)
+        targets = proposal.bbox.new_full((num_pairs, self.num_axes), -1.0)
+        boxes = proposal.bbox
+        sub = boxes[pair_idx[:, 0]]
+        obj = boxes[pair_idx[:, 1]]
+
+        sub_w = (sub[:, 2] - sub[:, 0] + 1.0).clamp(min=1.0)
+        sub_h = (sub[:, 3] - sub[:, 1] + 1.0).clamp(min=1.0)
+        obj_w = (obj[:, 2] - obj[:, 0] + 1.0).clamp(min=1.0)
+        obj_h = (obj[:, 3] - obj[:, 1] + 1.0).clamp(min=1.0)
+        sub_area = sub_w * sub_h
+        obj_area = obj_w * obj_h
+
+        inter_x1 = torch.max(sub[:, 0], obj[:, 0])
+        inter_y1 = torch.max(sub[:, 1], obj[:, 1])
+        inter_x2 = torch.min(sub[:, 2], obj[:, 2])
+        inter_y2 = torch.min(sub[:, 3], obj[:, 3])
+        inter_w = (inter_x2 - inter_x1 + 1.0).clamp(min=0.0)
+        inter_h = (inter_y2 - inter_y1 + 1.0).clamp(min=0.0)
+        inter_area = inter_w * inter_h
+        x_overlap = inter_w / torch.min(sub_w, obj_w)
+        subj_inside_obj = inter_area / sub_area.clamp(min=1.0)
+
+        sub_cx = (sub[:, 0] + sub[:, 2]) * 0.5
+        sub_cy = (sub[:, 1] + sub[:, 3]) * 0.5
+        obj_cx = (obj[:, 0] + obj[:, 2]) * 0.5
+        obj_cy = (obj[:, 1] + obj[:, 3]) * 0.5
+
+        img_scale = float(max(max(proposal.size[0], proposal.size[1]), 100))
+        horizontal_gap = torch.max(torch.max(obj[:, 0] - sub[:, 2], sub[:, 0] - obj[:, 2]), sub[:, 0].new_zeros(num_pairs))
+        vertical_gap = torch.max(torch.max(obj[:, 1] - sub[:, 3], sub[:, 1] - obj[:, 3]), sub[:, 0].new_zeros(num_pairs))
+        edge_distance = torch.sqrt(horizontal_gap.pow(2) + vertical_gap.pow(2)) / img_scale
+
+        support_pos = (x_overlap > 0.25) & ((sub[:, 3] - obj[:, 1]).abs() / obj_h < 0.35) & (sub_cy < obj_cy)
+        support_neg = (x_overlap < 0.05) | (sub_cy > obj_cy)
+        targets[support_pos, 0] = 1.0
+        targets[support_neg, 0] = 0.0
+
+        contact_pos = (inter_area > 0) | (edge_distance < 0.03)
+        contact_neg = edge_distance > 0.20
+        targets[contact_pos, 1] = 1.0
+        targets[contact_neg, 1] = 0.0
+
+        containment_pos = subj_inside_obj > 0.70
+        containment_neg = subj_inside_obj < 0.05
+        targets[containment_pos, 2] = 1.0
+        targets[containment_neg, 2] = 0.0
+
+        occlusion_pos = (inter_area / torch.min(sub_area, obj_area).clamp(min=1.0)) > 0.35
+        occlusion_neg = inter_area == 0
+        targets[occlusion_pos, 3] = 1.0
+        targets[occlusion_neg, 3] = 0.0
+
+        relative_order_pos = ((sub_cx - obj_cx).abs() / obj_w > 0.25) | ((sub_cy - obj_cy).abs() / obj_h > 0.25)
+        targets[relative_order_pos, 4] = 1.0
+
+        if rel_labels_per_img is not None:
+            labels = rel_labels_per_img.to(proposal.bbox.device)
+            for axis_id, rel_ids in enumerate(self._axis_predicate_map):
+                if len(rel_ids) == 0:
+                    continue
+                rel_ids_tensor = torch.tensor(rel_ids, device=labels.device, dtype=labels.dtype)
+                matched = (labels[:, None] == rel_ids_tensor[None, :]).any(dim=1)
+                targets[matched, axis_id] = 1.0
+
+        return targets
+
+    def _axis_loss(self, axis_logits, axis_targets):
+        valid = axis_targets >= 0
+        if valid.sum() == 0:
+            return axis_logits.sum() * 0.0
+        loss = F.binary_cross_entropy_with_logits(axis_logits[valid], axis_targets[valid], reduction="none")
+        pos = axis_targets[valid] > 0.5
+        if pos.any() and (~pos).any():
+            pos_weight = torch.sqrt((~pos).float().sum() / pos.float().sum().clamp(min=1.0)).clamp(max=10.0)
+            loss = torch.where(pos, loss * pos_weight, loss)
+        return loss.mean()
+
+    def _axiom_loss(self, axis_logits):
+        axis_prob = torch.sigmoid(axis_logits)
+        support = axis_prob[:, 0]
+        contact = axis_prob[:, 1]
+        containment = axis_prob[:, 2]
+        return 0.5 * (F.relu(support - contact).mean() + F.relu(containment - contact).mean())
+
+    def _build_pair_rep(self, edge_ctx, proposals, rel_pair_idxs, union_features):
+        num_rels = [r.shape[0] for r in rel_pair_idxs]
+        num_objs = [len(b) for b in proposals]
+        edge_ctx = edge_ctx.split(num_objs, dim=0)
+        if self.use_union_features and union_features is not None:
+            union_splits = union_features.split(num_rels, dim=0)
+        else:
+            union_splits = [None] * len(num_rels)
+
+        pair_reps = []
+        for img_idx, pair_idx in enumerate(rel_pair_idxs):
+            sub_ctx = edge_ctx[img_idx][pair_idx[:, 0]]
+            obj_ctx = edge_ctx[img_idx][pair_idx[:, 1]]
+            geom_embed = self.geom_embed(self._pair_geometry(proposals[img_idx], pair_idx))
+            features = [sub_ctx, obj_ctx, geom_embed]
+            if self.use_union_features and union_splits[img_idx] is not None:
+                features.append(self.union_proj(union_splits[img_idx]))
+            pair_reps.append(torch.cat(features, dim=-1))
+        pair_reps = torch.cat(pair_reps, dim=0)
+        return self.pair_proj(pair_reps)
+
+    def forward(self, proposals, rel_pair_idxs, rel_labels, rel_binarys, roi_features, union_features, logger=None, img=None):
+        if self.attribute_on:
+            obj_dists, obj_preds, att_dists, edge_ctx = self.context_layer(roi_features, proposals, logger)
+        else:
+            obj_dists, obj_preds, edge_ctx = self.context_layer(roi_features, proposals, logger)
+
+        num_rels = [r.shape[0] for r in rel_pair_idxs]
+        num_objs = [len(b) for b in proposals]
+        assert len(num_rels) == len(num_objs)
+
+        pair_rep = self._build_pair_rep(edge_ctx, proposals, rel_pair_idxs, union_features)
+        base_logits = self.rel_compress(pair_rep)
+        axis_logits, axis_feat = self.axis_head(pair_rep)
+
+        metric_axis_feat = F.dropout(axis_feat, p=self.axis_dropout, training=self.training)
+        if self.detach_axis and self.training:
+            metric_axis_feat = metric_axis_feat.detach()
+        metric_logits, metric_reg = self.metric_scorer(pair_rep, metric_axis_feat)
+        if self.disable_bg_metric:
+            metric_logits[:, 0] = 0.0
+        if self.center_metric_logits:
+            metric_logits = metric_logits - metric_logits.mean(dim=-1, keepdim=True)
+        if self.disable_bg_metric:
+            metric_logits[:, 0] = 0.0
+
+        rel_logits = base_logits + self.metric_weight * metric_logits
+
+        if self.freq_bias is not None and self.freq_weight != 0:
+            obj_preds_split = obj_preds.split(num_objs, dim=0)
+            pair_obj_preds = []
+            for img_idx, pair_idx in enumerate(rel_pair_idxs):
+                pair_obj_preds.append(torch.stack((obj_preds_split[img_idx][pair_idx[:, 0]], obj_preds_split[img_idx][pair_idx[:, 1]]), dim=1))
+            pair_obj_preds = torch.cat(pair_obj_preds, dim=0)
+            rel_logits = rel_logits + self.freq_weight * self.freq_bias.index_with_labels(pair_obj_preds.long())
+
+        rel_dists = tuple(rel_logits.split(num_rels, dim=0))
+        obj_dists = obj_dists.split(num_objs, dim=0)
+
+        add_losses = {}
+        if self.training:
+            add_losses["loss_elrgf_metric_reg"] = self.metric_reg_weight * metric_reg
+            if self.axiom_loss_weight > 0:
+                add_losses["loss_elrgf_axiom"] = self.axiom_loss_weight * self._axiom_loss(axis_logits)
+            if self.use_axis_pseudo_labels and rel_labels is not None and self.axis_loss_weight > 0:
+                axis_targets = []
+                for img_idx, pair_idx in enumerate(rel_pair_idxs):
+                    axis_targets.append(self._axis_targets_from_geometry(proposals[img_idx], pair_idx, rel_labels[img_idx]))
+                axis_targets = torch.cat(axis_targets, dim=0)
+                add_losses["loss_elrgf_axis"] = self.axis_loss_weight * self._axis_loss(axis_logits, axis_targets)
+
+        return obj_dists, rel_dists, add_losses
+
+
 def make_roi_relation_predictor(cfg, in_channels):
     func = registry.ROI_RELATION_PREDICTOR[cfg.MODEL.ROI_RELATION_HEAD.PREDICTOR]
     return func(cfg, in_channels)
