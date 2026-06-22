@@ -55,7 +55,7 @@ class RelationLossComputation(object):
             self.criterion_loss = Label_Smoothing_Regression(e=0.01)
         else:
             self.criterion_loss = nn.CrossEntropyLoss()
-        self.loss=Loss(gamma=0.0, alpha=1, size_average=True,device=device)
+        self.loss=Loss(gamma=2.0, alpha=1, size_average=True,device=device)
         #self.focal_loss=MultiCEFocalLoss(class_num=25,device=device)
 
     def __call__(self, proposals, rel_labels, relation_logits, refine_logits):
@@ -198,7 +198,20 @@ class Loss(nn.Module):
         if zz.sum() == 0:
             return input.sum() * 0.0
         if input.dim() == 2:
-            return F.cross_entropy(input[zz].float(), target[zz].long())
+            logits = input[zz].float()
+            labels = target[zz].long()
+            log_probs = F.log_softmax(logits, dim=-1)
+            log_pt = log_probs.gather(1, labels.view(-1, 1)).squeeze(1)
+            pt = log_pt.exp()
+            loss = -torch.pow(1.0 - pt, self.gamma) * log_pt
+            if self.alpha is not None:
+                alpha = self.alpha
+                if not torch.is_tensor(alpha):
+                    alpha = logits.new_tensor(float(alpha))
+                loss = loss * alpha.to(device=logits.device, dtype=logits.dtype)
+            if self.size_average:
+                return loss.mean()
+            return loss.sum()
 
         input = input[zz].half()
         target = target[zz]

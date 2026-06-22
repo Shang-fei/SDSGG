@@ -676,6 +676,248 @@ class ClipPredictor(nn.Module):
         return obj_dists, rel_dists, add_losses
 
 
+@registry.ROI_RELATION_PREDICTOR.register("ClipReSAPredictor")
+class ClipReSAPredictor(ClipPredictor):
+    def __init__(self, config, in_channels):
+        super(ClipReSAPredictor, self).__init__(config, in_channels)
+
+        resa_cfg = config.MODEL.ROI_RELATION_HEAD.RESA
+        self.atom_dim = resa_cfg.ATOM_DIM
+        self.atom_weight = resa_cfg.ATOM_WEIGHT
+        self.recon_weight = resa_cfg.RECON_WEIGHT
+        self.sparse_weight = resa_cfg.SPARSE_WEIGHT
+        self.diversity_weight = resa_cfg.DIVERSITY_WEIGHT
+        self.consist_weight = resa_cfg.CONSIST_WEIGHT
+        self.contrast_weight = resa_cfg.CONTRAST_WEIGHT
+
+        self.atom_encoder = ReSASparseAtomEncoder(
+            512,
+            self.atom_dim,
+            config.MODEL.ROI_RELATION_HEAD.CONTEXT_DROPOUT_RATE,
+        ).to(self.device).half()
+        self.atom_dictionary = nn.Parameter(torch.empty(self.atom_dim, 512, device=self.device, dtype=torch.float16))
+        self.pred_atom_logits = nn.Parameter(torch.empty(self.num_rel_cls, self.atom_dim, device=self.device, dtype=torch.float16))
+        self.atom_logit_scale = nn.Parameter(torch.tensor(10.0, device=self.device, dtype=torch.float16))
+        nn.init.xavier_normal_(self.atom_dictionary)
+        nn.init.uniform_(self.pred_atom_logits, 0.0, 0.1)
+
+        if resa_cfg.INIT_PRED_ATOMS_FROM_TEXT:
+            rel_embed_vecs = obj_edge_vectors(self._all_rel_classes(), wv_dir=config.GLOVE_DIR, wv_dim=config.MODEL.ROI_RELATION_HEAD.EMBED_DIM)
+            self._init_pred_atoms_from_text(rel_embed_vecs)
+
+        self._confusable_groups = self._build_confusable_groups(self._all_rel_classes())
+        self._set_active_pred_ids("base")
+
+    def _all_rel_classes(self):
+        rel_classes = [None] * len(self.id_dict)
+        for name, idx in self.id_dict.items():
+            rel_classes[idx] = name
+        return rel_classes
+
+    def _set_active_pred_ids(self, mode):
+        if mode == "base":
+            active_ids = self.base
+        elif mode == "novel":
+            active_ids = self.novel
+        elif mode == "semantic":
+            active_ids = self.semantic
+        else:
+            active_ids = list(range(self.num_rel_cls))
+        self.active_pred_ids = torch.tensor(active_ids, device=self.device, dtype=torch.long)
+
+    def updata(self, mode):
+        super(ClipReSAPredictor, self).updata(mode)
+        self._set_active_pred_ids(mode)
+
+    def _init_pred_atoms_from_text(self, text_vectors):
+        if text_vectors.size(0) != self.num_rel_cls:
+            return
+        with torch.no_grad():
+            init = self.pred_atom_logits.new_zeros((self.num_rel_cls, self.atom_dim))
+            copy_dim = min(text_vectors.size(1), self.atom_dim)
+            init[:, :copy_dim] = text_vectors[:, :copy_dim].to(init.device, dtype=init.dtype)
+            init = init - init.min(dim=-1, keepdim=True)[0]
+            init = init / init.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+            init[0].zero_()
+            self.pred_atom_logits.copy_(init + 1e-3)
+
+    def _build_confusable_groups(self, rel_classes):
+        name_to_idx = {name.lower(): idx for idx, name in enumerate(rel_classes) if name is not None}
+        groups = [
+            ["on", "standing on", "sitting on", "laying on", "lying on", "mounted on", "parked on", "on back of"],
+            ["holding", "carrying", "wearing", "wears", "using", "attached to"],
+            ["above", "under", "over", "behind", "in front of", "near", "against", "between"],
+            ["in", "covered in", "covering", "part of", "of", "has"],
+            ["looking at", "watching", "playing", "eating", "riding", "walking on", "walking in"],
+        ]
+        confusable = {}
+        for group in groups:
+            ids = [name_to_idx[name] for name in group if name in name_to_idx]
+            for idx in ids:
+                confusable[idx] = [other for other in ids if other != idx]
+        return confusable
+
+    def _pred_atom_code(self):
+        pred_act = F.relu(self.pred_atom_logits.float())
+        pred_code = pred_act / pred_act.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+        pred_code = pred_code.clone()
+        pred_code[0].zero_()
+        return pred_code
+
+    def _atom_logits(self, atom_code):
+        pred_code = self._pred_atom_code()
+        atom_query = F.normalize(atom_code.float(), dim=-1)
+        atom_proto = F.normalize(pred_code, dim=-1)
+        return self.atom_logit_scale.float().clamp(1.0, 30.0) * torch.matmul(atom_query, atom_proto.t())
+
+    def _active_atom_logits(self, relation_feature, out_dtype):
+        atom_raw_logits, atom_act, atom_code = self.atom_encoder(relation_feature.half())
+        atom_logits = self._atom_logits(atom_code)
+        atom_logits = atom_logits.index_select(1, self.active_pred_ids)
+        return atom_logits.to(dtype=out_dtype)
+
+    def _diversity_loss(self):
+        dictionary = F.normalize(self.atom_dictionary.float(), dim=-1)
+        gram = torch.matmul(dictionary, dictionary.t())
+        eye = torch.eye(gram.size(0), device=gram.device, dtype=gram.dtype)
+        return (gram - eye).pow(2).mean()
+
+    def _sparse_loss(self, atom_code):
+        atom_code = atom_code.float()
+        entropy = -(atom_code * atom_code.clamp(min=1e-6).log()).sum(dim=-1)
+        return entropy.mean()
+
+    def _consistency_loss(self, atom_code, rel_labels):
+        if rel_labels is None:
+            return atom_code.float().sum() * 0.0
+        labels = torch.cat(rel_labels, dim=0).view(-1)
+        pos = labels > 0
+        if pos.sum() == 0:
+            return atom_code.float().sum() * 0.0
+        pred_code = self._pred_atom_code()
+        target_code = pred_code[labels[pos].long()]
+        return (1.0 - F.cosine_similarity(atom_code[pos].float(), target_code, dim=-1)).mean()
+
+    def _contrast_loss(self, atom_logits, rel_labels):
+        if rel_labels is None:
+            return atom_logits.sum() * 0.0
+        labels = torch.cat(rel_labels, dim=0).view(-1).long()
+        pos = labels > 0
+        if pos.sum() == 0:
+            return atom_logits.sum() * 0.0
+        losses = []
+        for label in labels[pos].unique():
+            label_int = int(label.item())
+            negatives = self._confusable_groups.get(label_int, None)
+            if not negatives:
+                continue
+            sample_mask = pos & (labels == label)
+            neg_ids = torch.tensor(negatives, device=atom_logits.device, dtype=torch.long)
+            pos_score = atom_logits[sample_mask, label_int].unsqueeze(1)
+            neg_score = atom_logits[sample_mask].index_select(1, neg_ids)
+            losses.append(F.relu(0.2 + neg_score - pos_score).mean())
+        if len(losses) == 0:
+            return atom_logits.sum() * 0.0
+        return torch.stack(losses).mean()
+
+    def _resa_losses(self, relation_features, rel_labels):
+        if len(relation_features) == 0:
+            zero = self.pred_atom_logits.float().sum() * 0.0
+            return {
+                "loss_resa_recon": zero,
+                "loss_resa_sparse": zero,
+                "loss_resa_diversity": zero,
+                "loss_resa_consist": zero,
+                "loss_resa_contrast": zero,
+            }
+        relation_features = torch.cat(relation_features, dim=0)
+        atom_raw_logits, atom_act, atom_code = self.atom_encoder(relation_features.half())
+        atom_logits = self._atom_logits(atom_code)
+        recon = torch.matmul(atom_code.float(), self.atom_dictionary.float())
+        return {
+            "loss_resa_recon": self.recon_weight * F.smooth_l1_loss(recon, relation_features.detach().float()),
+            "loss_resa_sparse": self.sparse_weight * self._sparse_loss(atom_code),
+            "loss_resa_diversity": self.diversity_weight * self._diversity_loss(),
+            "loss_resa_consist": self.consist_weight * self._consistency_loss(atom_code, rel_labels),
+            "loss_resa_contrast": self.contrast_weight * self._contrast_loss(atom_logits, rel_labels),
+        }
+
+    def forward(self, proposals, rel_pair_idxs, rel_labels, rel_binarys, roi_features, union_features, logger=None,img=None):
+        if self.attribute_on:
+            obj_dists, obj_preds, att_dists, edge_ctx = self.context_layer(roi_features, proposals, logger)
+        else:
+            obj_dists, obj_preds, edge_ctx = self.context_layer(roi_features, proposals, logger)
+
+        num_rels = [r.shape[0] for r in rel_pair_idxs]
+        num_objs = [len(b) for b in proposals]
+        assert len(num_rels) == len(num_objs)
+        obj_preds = obj_preds.split(num_objs, dim=0)
+
+        rel_dists = []
+        relation_features_for_loss = []
+        for i in range(len(num_rels)):
+            rel_dist_per_batch = []
+            image_tensor = []
+            with torch.no_grad():
+                for j in range(len(proposals[i].bbox)):
+                    union_img = crop_and_resize(img[i].unsqueeze(0), proposals[i].bbox[j], proposals[i].bbox[j])
+                    iimg = union_img[0].permute(1, 2, 0).detach().cpu().numpy() * 255
+                    iimg = Image.fromarray(np.uint8(iimg))
+                    union_img = self.clip_preprocess(iimg).unsqueeze(0).to(self.device)
+                    image_tensor.append(union_img)
+                image_tensor = torch.cat(image_tensor)
+                image_features = self.clip_model.encode_image(image_tensor)
+
+            for la_count, rel_index in enumerate(rel_pair_idxs[i]):
+                obj_n1, obj_n2 = obj_preds[i][rel_index[0]], obj_preds[i][rel_index[1]]
+
+                text_features1 = self.text_features1
+                text_features2 = self.text_features2
+                text_sub = self.text_features3[obj_n1]
+                text_obj = self.text_features4[obj_n2]
+
+                cross_output1 = self.adaper_clip1(image_features[rel_index[0]].unsqueeze(0), image_features[rel_index[1]].unsqueeze(0), text_sub)
+                cross_output2 = self.adaper_clip2(image_features[rel_index[1]].unsqueeze(0), image_features[rel_index[0]].unsqueeze(0), text_obj)
+                cross_output = (cross_output1 + cross_output2) / 2
+                relation_features_for_loss.append(cross_output)
+
+                similarity1 = ((cross_output / cross_output.norm(dim=-1, keepdim=True)) @ (text_features1 / text_features1.norm(dim=-1, keepdim=True)).T)
+                similarity2 = ((cross_output / cross_output.norm(dim=-1, keepdim=True)) @ (text_features2 / text_features2.norm(dim=-1, keepdim=True)).T)
+
+                if self.adaper_clip1.training:
+                    probs = (similarity1 - similarity2) / 0.05
+                    image_features_clip = (image_features[rel_index[0]][0].unsqueeze(0) + image_features[rel_index[1]][0].unsqueeze(0)) / 2
+                    similarit_origin_1 = ((image_features_clip / image_features_clip.norm(dim=-1, keepdim=True)) @
+                                 (text_features1 / text_features1.norm(dim=-1, keepdim=True)).T)
+                    similarit_origin_2 = ((image_features_clip / image_features_clip.norm(dim=-1, keepdim=True)) @
+                                   (text_features2 / text_features2.norm(dim=-1, keepdim=True)).T)
+                    similarit_origin = (similarit_origin_1 - similarit_origin_2) / 0.05
+                    probs = torch.cat([probs, similarit_origin]).unsqueeze(0)
+                else:
+                    similarity_delta = (similarity1 - similarity2) / 0.05
+                    probs = self.description_relation[:, obj_n1] * similarity_delta
+                    probs = probs.sum(-1).unsqueeze(0)
+
+                    text_features5 = torch.Tensor(self.texts5[obj_n1]).to(self.device).half()
+                    similarity31 = ((image_features[rel_index[0]][0].unsqueeze(0) / image_features[rel_index[0]][0].unsqueeze(0).norm(dim=-1, keepdim=True)) @ (text_features5 / text_features5.norm(dim=-1, keepdim=True)).T / 0.05)
+                    similarity32 = ((image_features[rel_index[1]][0].unsqueeze(0) / image_features[rel_index[1]][0].unsqueeze(0).norm(dim=-1, keepdim=True)) @ (text_features5 / text_features5.norm(dim=-1, keepdim=True)).T / 0.05)
+                    similarity3 = (similarity31 + similarity32) / 2
+                    probs = probs * 0.2 + similarity3 * 0.8
+                    probs = probs + self.atom_weight * self._active_atom_logits(cross_output, probs.dtype)
+                rel_dist_per_batch.append(probs)
+
+            rel_dist_per_batch = torch.cat(rel_dist_per_batch)
+            rel_dists.append(rel_dist_per_batch)
+
+        obj_dists = obj_dists.split(num_objs, dim=0)
+        rel_dists = tuple(rel_dists)
+
+        add_losses = {}
+        if self.training:
+            add_losses = self._resa_losses(relation_features_for_loss, rel_labels)
+        return obj_dists, rel_dists, add_losses
+
+
 
 class ELRGFAxisHead(nn.Module):
     def __init__(self, in_dim, hidden_dim, num_axes, dropout):
