@@ -548,7 +548,7 @@ class ClipPredictor(nn.Module):
             self.texts5=[]
 
             for obj in self.obj_names:
-                text5 = clip.tokenize(["a photo of " + tex for tex in list(self.sub_filter_novel[obj])]).to(
+                text5 = clip.tokenize(["a photo of " + tex + " relation" for tex in list(self.sub_filter_novel[obj])]).to(
                     self.device)
                 text_features5 = self.clip_model.encode_text(text5)
                 text_features5 = text_features5
@@ -567,6 +567,11 @@ class ClipPredictor(nn.Module):
         self.mtmAlignWeight = mtmConfig.ALIGN_WEIGHT
         self.mtmStructureWeight = mtmConfig.STRUCTURE_WEIGHT
         self.mtmMaxPairs = mtmConfig.MAX_PAIRS
+        self.mtmUseInference = mtmConfig.USE_INFERENCE
+        self.mtmInferenceMode = mtmConfig.INFERENCE_MODE
+        self.mtmInferenceWeight = mtmConfig.INFERENCE_WEIGHT
+        self.mtmFilterBlendWeight = mtmConfig.FILTER_BLEND_WEIGHT
+        self.mtmScoreTemperature = mtmConfig.SCORE_TEMPERATURE
         self.relationMtm = RelationModalityTransfer(
             mtmConfig.INPUT_DIM,
             mtmConfig.EMBED_DIM,
@@ -627,6 +632,30 @@ class ClipPredictor(nn.Module):
             "loss_mtm_structure": self.mtmLossWeight * self.mtmStructureWeight * structureLoss,
         }
 
+    def computeMtmInferenceScores(self, relationFeatures, outDtype, applyTemperature=False):
+        predictedEmbeddings = self.relationMtm(relationFeatures).float()
+        predictedEmbeddings = F.normalize(predictedEmbeddings, dim=-1)
+        predicateEmbeddings = self.predicateTextEmbeddings.to(predictedEmbeddings.device).float()
+        predicateEmbeddings = F.normalize(predicateEmbeddings, dim=-1)
+        scores = torch.matmul(predictedEmbeddings, predicateEmbeddings.t())
+        if applyTemperature:
+            scores = scores / max(float(self.mtmScoreTemperature), 1e-6)
+        return scores.to(dtype=outDtype)
+
+    def computeMtmFilterScores(self, relationFeatures, subjLabels, outShape, outDtype):
+        predictedEmbeddings = self.relationMtm(relationFeatures).float()
+        predictedEmbeddings = F.normalize(predictedEmbeddings, dim=-1)
+        scores = relationFeatures.new_zeros(outShape, dtype=torch.float32)
+        for label in subjLabels.unique():
+            mask = subjLabels == label
+            relPos = torch.nonzero(mask, as_tuple=False).view(-1)
+            textFeatures = torch.Tensor(self.texts5[int(label.item())]).to(self.device).float()
+            textFeatures = F.normalize(textFeatures, dim=-1)
+            labelScores = predictedEmbeddings.index_select(0, relPos) @ textFeatures.t()
+            labelScores = labelScores / max(float(self.mtmScoreTemperature), 1e-6)
+            scores.index_copy_(0, relPos, labelScores[:, :outShape[1]])
+        return scores.to(dtype=outDtype)
+
     def updata(self,mode):
         print("now is "+mode)
         self.description_relation = pd.read_csv(
@@ -671,7 +700,7 @@ class ClipPredictor(nn.Module):
             self.texts5=[]
 
             for obj in self.obj_names:
-                text5 = clip.tokenize(["a photo of " + tex for tex in list(self.sub_filter_novel[obj])]).to(
+                text5 = clip.tokenize(["a photo of " + tex + " relation" for tex in list(self.sub_filter_novel[obj])]).to(
                     self.device)
 
                 timing = []
@@ -781,7 +810,19 @@ class ClipPredictor(nn.Module):
                 similarity3 = rel_dist_per_batch.new_zeros(rel_dist_per_batch.shape)
                 for rel_pos, scores in filter_scores:
                     similarity3.index_copy_(0, rel_pos, scores.to(dtype=similarity3.dtype))
+                if self.mtmEnabled and self.mtmUseInference and self.mtmInferenceMode == "filter":
+                    mtmScores = self.computeMtmFilterScores(
+                        cross_output,
+                        obj_n1,
+                        similarity3.shape,
+                        similarity3.dtype,
+                    )
+                    blendWeight = max(0.0, min(float(self.mtmFilterBlendWeight), 1.0))
+                    similarity3 = similarity3 * (1.0 - blendWeight) + mtmScores * blendWeight
                 rel_dist_per_batch = rel_dist_per_batch * 0.2 + similarity3 * 0.8
+                if self.mtmEnabled and self.mtmUseInference and self.mtmInferenceMode == "late" and self.mtmInferenceWeight != 0:
+                    mtmScores = self.computeMtmInferenceScores(cross_output, rel_dist_per_batch.dtype)
+                    rel_dist_per_batch = rel_dist_per_batch + self.mtmInferenceWeight * mtmScores
 
             rel_dists.append(rel_dist_per_batch)
 
