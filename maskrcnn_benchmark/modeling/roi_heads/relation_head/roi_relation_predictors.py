@@ -332,7 +332,6 @@ class GQAClipPredictor(nn.Module):
         obj_preds = obj_preds.split(num_objs, dim=0)
 
         rel_dists=[]
-        relationFeaturesForMtm = []
         for i in range(len(num_rels)):
             rel_dist_per_batch=[]
             union_imges=[]
@@ -360,8 +359,6 @@ class GQAClipPredictor(nn.Module):
                 cross_output2=self.adaper_clip2(image_features[rel_index[1]].unsqueeze(0),image_features[rel_index[0]].unsqueeze(0),text_obj)
 
                 cross_output=(cross_output1+cross_output2)/2
-                if self.training and self.mtmEnabled:
-                    relationFeaturesForMtm.append(cross_output)
 
                 similarity1 = ((cross_output/ cross_output.norm(dim=-1, keepdim=True)) @ (text_features1/text_features1.norm(dim=-1, keepdim=True)).T)
 
@@ -578,7 +575,11 @@ class ClipPredictor(nn.Module):
             mtmConfig.NUM_HEADS,
             mtmConfig.DROPOUT,
         ).to(self.device)
-        self.register_buffer("predicateTextEmbeddings", self.buildPredicateTextEmbeddings(activeRelNames))
+        self.register_buffer(
+            "predicateTextEmbeddings",
+            self.buildPredicateTextEmbeddings(activeRelNames),
+            persistent=False,
+        )
 
     def buildPredicateTextEmbeddings(self, relNames):
         with torch.no_grad():
@@ -779,7 +780,7 @@ class ClipPredictor(nn.Module):
                     filter_scores.append((rel_pos, similarity3[:, :rel_dist_per_batch.size(1)]))
                 similarity3 = rel_dist_per_batch.new_zeros(rel_dist_per_batch.shape)
                 for rel_pos, scores in filter_scores:
-                    similarity3.index_copy_(0, rel_pos, scores)
+                    similarity3.index_copy_(0, rel_pos, scores.to(dtype=similarity3.dtype))
                 rel_dist_per_batch = rel_dist_per_batch * 0.2 + similarity3 * 0.8
 
             rel_dists.append(rel_dist_per_batch)
