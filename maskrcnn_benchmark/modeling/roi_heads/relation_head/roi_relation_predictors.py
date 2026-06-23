@@ -121,10 +121,11 @@ class MVA(nn.Module):
     def forward(self, sub_features,obj_features,text_fea=None):
         x = self.adapter(sub_features,obj_features)
         if text_fea is not None:
-            xx=[]
-            for i in range(x.shape[0]):
-                xx.append(torch.cat([x[i],text_fea]).unsqueeze(0))
-            x=torch.cat(xx)
+            if text_fea.dim() == 1:
+                text_fea = text_fea.unsqueeze(0).expand(x.shape[0], -1)
+            elif text_fea.shape[0] == 1 and x.shape[0] != 1:
+                text_fea = text_fea.expand(x.shape[0], -1)
+            x=torch.cat([x, text_fea.to(device=x.device, dtype=x.dtype)], dim=-1)
             x=self.linear(x)
             x=self.relu(x)
         ratio = 0.5
@@ -674,6 +675,422 @@ class ClipPredictor(nn.Module):
 
         add_losses = {}
         return obj_dists, rel_dists, add_losses
+
+
+class RIPHead(nn.Module):
+    def __init__(self, num_obj_cls, axis_dim, hidden_dim, obj_embed_dim, max_edit):
+        super(RIPHead, self).__init__()
+        self.max_edit = max_edit
+        self.obj_embed = nn.Embedding(num_obj_cls, obj_embed_dim)
+        self.state_encoder = nn.Sequential(
+            nn.Linear(axis_dim + obj_embed_dim * 2, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+        )
+        self.program_encoder = nn.Sequential(
+            nn.Linear(axis_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.edit = nn.Linear(hidden_dim, axis_dim)
+
+    def forward(self, evidence, programs, subj_labels, obj_labels):
+        evidence = evidence.float()
+        programs = programs.float()
+        subj_embed = self.obj_embed(subj_labels.long()).float()
+        obj_embed = self.obj_embed(obj_labels.long()).float()
+        state = self.state_encoder(torch.cat([evidence, subj_embed, obj_embed], dim=-1))
+        program_state = self.program_encoder(programs)
+        joint = torch.tanh(program_state + state.unsqueeze(1))
+        delta = self.max_edit * torch.tanh(self.edit(joint))
+        edited_evidence = evidence.unsqueeze(1) + delta
+        energy = (edited_evidence - programs).abs().sum(dim=-1)
+        return -energy, delta, energy
+
+
+@registry.ROI_RELATION_PREDICTOR.register("ClipRIPPredictor")
+class ClipRIPPredictor(ClipPredictor):
+    def __init__(self, config, in_channels):
+        super(ClipRIPPredictor, self).__init__(config, in_channels)
+
+        rip_cfg = config.MODEL.ROI_RELATION_HEAD.RIP
+        self.rip_logit_weight = rip_cfg.LOGIT_WEIGHT
+        self.rip_margin = rip_cfg.MARGIN
+        self.rip_hard_neg_topk = rip_cfg.HARD_NEG_TOPK
+        self.rip_detach_evidence = rip_cfg.DETACH_EVIDENCE
+        self.rip_energy_weight = rip_cfg.ENERGY_WEIGHT
+        self.rip_rank_weight = rip_cfg.RANK_WEIGHT
+        self.rip_cls_weight = rip_cfg.CLS_WEIGHT
+        self.rip_cls_gamma = rip_cfg.CLS_GAMMA
+        self.rip_sparse_weight = rip_cfg.SPARSE_WEIGHT
+        self.rip_anchor_weight = rip_cfg.ANCHOR_WEIGHT
+        self.rip_direction_weight = rip_cfg.DIRECTION_WEIGHT
+        self.rip_distill_weight = rip_cfg.DISTILL_WEIGHT
+        credo_cfg = config.MODEL.ROI_RELATION_HEAD.CREDO
+        self.credoDebug = credo_cfg.DEBUG
+        self.credoDebugPeriod = max(1, int(credo_cfg.DEBUG_PERIOD))
+        self.credoIter = 0
+
+        self.rip_head = RIPHead(
+            self.num_obj_cls,
+            22,
+            rip_cfg.HIDDEN_DIM,
+            rip_cfg.OBJ_EMBED_DIM,
+            rip_cfg.MAX_EDIT,
+        ).to(self.device)
+
+        rel_prop = torch.tensor([0.5] + list(config.MODEL.ROI_RELATION_HEAD.REL_PROP),
+                                device=self.device, dtype=torch.float32)
+        tail_weights = rel_prop.clamp(min=1e-6).pow(-rip_cfg.TAIL_WEIGHT_POWER)
+        tail_weights = tail_weights / tail_weights[1:].mean().clamp(min=1e-6)
+        tail_weights[0] = 0.0
+        self.register_buffer("rip_tail_weights", tail_weights)
+        self._set_active_pred_ids("base")
+
+    def _set_active_pred_ids(self, mode):
+        if mode == "base":
+            active_ids = self.base
+        elif mode == "novel":
+            active_ids = self.novel
+        elif mode == "semantic":
+            active_ids = self.semantic
+        else:
+            active_ids = list(range(self.num_rel_cls))
+        self.active_pred_ids = torch.tensor(active_ids, device=self.device, dtype=torch.long)
+        label_to_col = torch.full((self.num_rel_cls,), -1, device=self.device, dtype=torch.long)
+        label_to_col[self.active_pred_ids] = torch.arange(
+            len(active_ids), device=self.device, dtype=torch.long
+        )
+        self.active_label_to_col = label_to_col
+
+    def updata(self, mode):
+        super(ClipRIPPredictor, self).updata(mode)
+        self._set_active_pred_ids(mode)
+
+    def _clip_cls_features(self, image_features):
+        if image_features.dim() == 3:
+            return image_features[:, 0, :]
+        return image_features
+
+    def _active_programs(self, subj_labels):
+        programs = self.description_relation.index_select(1, subj_labels.long())
+        return programs.permute(1, 0, 2).contiguous()
+
+    def _center_scores(self, scores):
+        scores = scores.float()
+        return scores - scores.mean(dim=-1, keepdim=True)
+
+    def _program_score(self, programs, evidence):
+        return torch.einsum("rca,ra->rc", programs.float(), evidence.float())
+
+    def _filter_similarity(self, cls_features, sub_idx, obj_idx, subj_labels, num_preds):
+        out = cls_features.new_zeros((sub_idx.numel(), num_preds))
+        for label in subj_labels.unique():
+            mask = subj_labels == label
+            rel_pos = torch.nonzero(mask, as_tuple=False).view(-1)
+            text_features5 = torch.Tensor(self.texts5[int(label.item())]).to(self.device).half()
+            text_features5 = text_features5.to(dtype=cls_features.dtype)
+            sub_feat = cls_features.index_select(0, sub_idx.index_select(0, rel_pos))
+            obj_feat = cls_features.index_select(0, obj_idx.index_select(0, rel_pos))
+            text_norm = text_features5 / text_features5.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+            sub_norm = sub_feat / sub_feat.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+            obj_norm = obj_feat / obj_feat.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+            sim = ((sub_norm @ text_norm.t()) + (obj_norm @ text_norm.t())) / 2 / 0.05
+            out.index_copy_(0, rel_pos, sim[:, :num_preds])
+        return out
+
+    def _rip_losses(self, evidence, programs, base_scores, rip_scores, delta, energy, rel_labels):
+        zero = rip_scores.sum() * 0.0
+        labels = rel_labels.view(-1).long()
+        mapped = self.active_label_to_col.index_select(0, labels.clamp(min=0, max=self.num_rel_cls - 1))
+        pos = (labels > 0) & (mapped >= 0)
+        if pos.sum() == 0:
+            return {
+                "loss_rip_energy": zero,
+                "loss_rip_rank": zero,
+                "loss_rip_cls": zero,
+                "loss_rip_sparse": zero,
+                "loss_rip_anchor": zero,
+                "loss_rip_direction": zero,
+                "loss_rip_distill": zero,
+            }
+
+        pos_cols = mapped[pos]
+        pos_energy = energy[pos].gather(1, pos_cols.view(-1, 1)).squeeze(1)
+        pos_scores = rip_scores[pos].gather(1, pos_cols.view(-1, 1)).squeeze(1)
+
+        neg_scores = rip_scores[pos].clone()
+        neg_scores[:, 0] = -1e4
+        neg_scores.scatter_(1, pos_cols.view(-1, 1), -1e4)
+        topk = min(self.rip_hard_neg_topk, max(1, neg_scores.size(1) - 1))
+        hard_neg = neg_scores.topk(topk, dim=1)[0]
+        rank = F.relu(self.rip_margin + hard_neg - pos_scores.unsqueeze(1)).mean(dim=1)
+
+        sample_weights = self.rip_tail_weights.index_select(
+            0, labels[pos].clamp(min=0, max=self.rip_tail_weights.numel() - 1)
+        ).to(rank.device)
+        sample_weights = sample_weights / sample_weights.mean().clamp(min=1e-6)
+
+        log_probs = F.log_softmax(rip_scores[pos].float(), dim=-1)
+        log_pt = log_probs.gather(1, pos_cols.view(-1, 1)).squeeze(1)
+        pt = log_pt.exp()
+        cls_loss = -torch.pow(1.0 - pt, self.rip_cls_gamma) * log_pt
+
+        pos_delta = delta[pos].gather(
+            1, pos_cols.view(-1, 1, 1).expand(-1, 1, delta.size(-1))
+        ).squeeze(1)
+        pos_program = programs[pos].gather(
+            1, pos_cols.view(-1, 1, 1).expand(-1, 1, programs.size(-1))
+        ).squeeze(1)
+        direction = pos_program - evidence[pos].float()
+        direction_loss = F.relu(-(pos_delta * direction).sum(dim=-1)).mean()
+        centered_scores = self._center_scores(rip_scores)
+        distill_loss = F.smooth_l1_loss(
+            self._center_scores(rip_scores),
+            self._center_scores(base_scores.detach().float()),
+        )
+        return {
+            "loss_rip_energy": self.rip_energy_weight * (pos_energy * sample_weights).mean(),
+            "loss_rip_rank": self.rip_rank_weight * (rank * sample_weights).mean(),
+            "loss_rip_cls": self.rip_cls_weight * (cls_loss * sample_weights).mean(),
+            "loss_rip_sparse": self.rip_sparse_weight * pos_delta.abs().mean(),
+            "loss_rip_anchor": self.rip_anchor_weight * centered_scores.pow(2).mean(),
+            "loss_rip_direction": self.rip_direction_weight * direction_loss,
+            "loss_rip_distill": self.rip_distill_weight * distill_loss,
+        }
+
+    def _merge_losses(self, losses):
+        if len(losses) == 0:
+            zero = self.rip_head.edit.weight.sum() * 0.0
+            return {
+                "loss_rip_energy": zero,
+                "loss_rip_rank": zero,
+                "loss_rip_cls": zero,
+                "loss_rip_sparse": zero,
+                "loss_rip_anchor": zero,
+                "loss_rip_direction": zero,
+                "loss_rip_distill": zero,
+            }
+        return {
+            key: torch.stack([loss[key] for loss in losses]).mean()
+            for key in losses[0].keys()
+        }
+
+    def collectCredoDebug(self, baseScores, finalScores, energy, delta, relLabels):
+        labels = relLabels.view(-1).long()
+        mapped = self.active_label_to_col.index_select(0, labels.clamp(min=0, max=self.num_rel_cls - 1))
+        pos = (labels > 0) & (mapped >= 0)
+        stats = {
+            "num_rel": int(labels.numel()),
+            "active_predicates": int(baseScores.size(1)),
+            "base_mean": baseScores.detach().float().mean().item(),
+            "base_std": baseScores.detach().float().std().item() if baseScores.numel() > 1 else 0.0,
+            "final_mean": finalScores.detach().float().mean().item(),
+            "final_std": finalScores.detach().float().std().item() if finalScores.numel() > 1 else 0.0,
+            "verify_pos": 0.0,
+            "verify_neg": 0.0,
+            "verify_margin": 0.0,
+            "trans_pos": 0.0,
+            "trans_neg": 0.0,
+            "trans_margin": 0.0,
+            "gate_pos": 0.0,
+            "gate_neg": 0.0,
+            "gate_active_ratio": 0.0,
+            "edit_l1": delta.detach().float().abs().mean().item(),
+            "distill_l1": (finalScores.detach().float() - baseScores.detach().float()).abs().mean().item(),
+            "max_mem_mb": 0.0,
+            "nan_or_inf": False,
+        }
+        if torch.cuda.is_available():
+            stats["max_mem_mb"] = float(torch.cuda.max_memory_allocated() / 1024.0 / 1024.0)
+
+        tensors = [baseScores, finalScores, energy, delta]
+        stats["nan_or_inf"] = any(
+            not torch.isfinite(t.detach()).all().item()
+            for t in tensors
+        )
+
+        gateProb = torch.sigmoid(finalScores.detach().float() - baseScores.detach().float())
+        stats["gate_active_ratio"] = (gateProb > 0.5).float().mean().item()
+
+        if pos.sum() == 0:
+            return stats
+
+        posCols = mapped[pos]
+        posEnergy = energy[pos].gather(1, posCols.view(-1, 1)).squeeze(1).detach().float()
+        negEnergy = energy[pos].detach().float().clone()
+        negEnergy[:, 0] = 1e4
+        negEnergy.scatter_(1, posCols.view(-1, 1), 1e4)
+        negEnergy = negEnergy.min(dim=1)[0]
+        stats["verify_pos"] = posEnergy.mean().item()
+        stats["verify_neg"] = negEnergy.mean().item()
+        stats["verify_margin"] = (negEnergy - posEnergy).mean().item()
+
+        transEnergy = (energy.detach().float() + delta.detach().float().abs().sum(dim=-1))
+        posTrans = transEnergy[pos].gather(1, posCols.view(-1, 1)).squeeze(1)
+        negTrans = transEnergy[pos].clone()
+        negTrans[:, 0] = 1e4
+        negTrans.scatter_(1, posCols.view(-1, 1), 1e4)
+        negTrans = negTrans.min(dim=1)[0]
+        stats["trans_pos"] = posTrans.mean().item()
+        stats["trans_neg"] = negTrans.mean().item()
+        stats["trans_margin"] = (negTrans - posTrans).mean().item()
+
+        posGate = gateProb[pos].gather(1, posCols.view(-1, 1)).squeeze(1)
+        negGate = gateProb[pos].clone()
+        negGate[:, 0] = 0.0
+        negGate.scatter_(1, posCols.view(-1, 1), 0.0)
+        negGate = negGate.max(dim=1)[0]
+        stats["gate_pos"] = posGate.mean().item()
+        stats["gate_neg"] = negGate.mean().item()
+        return stats
+
+    def logCredoDebug(self, logger, debugStats):
+        if logger is None or len(debugStats) == 0:
+            return
+        keys = debugStats[0].keys()
+        merged = {}
+        for key in keys:
+            values = [stats[key] for stats in debugStats]
+            if key == "num_rel":
+                merged[key] = int(sum(values))
+            elif key == "active_predicates":
+                merged[key] = int(max(values))
+            elif key == "nan_or_inf":
+                merged[key] = any(values)
+            elif key == "max_mem_mb":
+                merged[key] = max(values)
+            else:
+                merged[key] = sum(values) / max(1, len(values))
+
+        message = (
+            "[CREDO DEBUG] "
+            "iter={iter} num_rel={num_rel} active_predicates={active_predicates} "
+            "base_mean={base_mean:.4f} base_std={base_std:.4f} "
+            "final_mean={final_mean:.4f} final_std={final_std:.4f} "
+            "verify_pos={verify_pos:.4f} verify_neg={verify_neg:.4f} verify_margin={verify_margin:.4f} "
+            "trans_pos={trans_pos:.4f} trans_neg={trans_neg:.4f} trans_margin={trans_margin:.4f} "
+            "gate_pos={gate_pos:.4f} gate_neg={gate_neg:.4f} gate_active_ratio={gate_active_ratio:.4f} "
+            "edit_l1={edit_l1:.4f} distill_l1={distill_l1:.4f} max_mem_mb={max_mem_mb:.1f}"
+        ).format(iter=self.credoIter, **merged)
+        logger.info(message)
+        if merged["nan_or_inf"]:
+            logger.info("[CREDO WARNING] nan_or_inf=True")
+
+    def forward(self, proposals, rel_pair_idxs, rel_labels, rel_binarys, roi_features, union_features, logger=None,img=None):
+        if self.training:
+            self.credoIter += 1
+
+        if self.attribute_on:
+            obj_dists, obj_preds, att_dists, edge_ctx = self.context_layer(roi_features, proposals, logger)
+        else:
+            obj_dists, obj_preds, edge_ctx = self.context_layer(roi_features, proposals, logger)
+
+        num_rels = [r.shape[0] for r in rel_pair_idxs]
+        num_objs = [len(b) for b in proposals]
+        assert len(num_rels) == len(num_objs)
+        obj_preds = obj_preds.split(num_objs, dim=0)
+
+        text_features1 = self.text_features1
+        text_features2 = self.text_features2
+        text1_norm = text_features1 / text_features1.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+        text2_norm = text_features2 / text_features2.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+
+        rel_dists = []
+        rip_losses = []
+        credoDebugStats = []
+        for i in range(len(num_rels)):
+            image_tensor = []
+            with torch.no_grad():
+                for j in range(len(proposals[i].bbox)):
+                    union_img = crop_and_resize(img[i].unsqueeze(0), proposals[i].bbox[j], proposals[i].bbox[j])
+                    iimg = union_img[0].permute(1, 2, 0).detach().cpu().numpy() * 255
+                    iimg = Image.fromarray(np.uint8(iimg))
+                    union_img = self.clip_preprocess(iimg).unsqueeze(0).to(self.device)
+                    image_tensor.append(union_img)
+                image_tensor = torch.cat(image_tensor)
+                image_features = self.clip_model.encode_image(image_tensor)
+
+            if rel_pair_idxs[i].numel() == 0:
+                if self.training:
+                    rel_dists.append(image_features.new_zeros((0, 2, 22)))
+                else:
+                    rel_dists.append(image_features.new_zeros((0, self.description_relation.size(0))))
+                continue
+
+            pair_idx = rel_pair_idxs[i].long()
+            sub_idx = pair_idx[:, 0]
+            obj_idx = pair_idx[:, 1]
+            subj_labels = obj_preds[i].index_select(0, sub_idx).long()
+            obj_labels = obj_preds[i].index_select(0, obj_idx).long()
+
+            sub_features = image_features.index_select(0, sub_idx)
+            obj_features = image_features.index_select(0, obj_idx)
+            text_sub = self.text_features3.index_select(0, subj_labels)
+            text_obj = self.text_features4.index_select(0, obj_labels)
+
+            cross_output1 = self.adaper_clip1(sub_features, obj_features, text_sub)
+            cross_output2 = self.adaper_clip2(obj_features, sub_features, text_obj)
+            cross_output = (cross_output1 + cross_output2) / 2
+
+            cross_norm = cross_output / cross_output.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+            similarity1 = cross_norm @ text1_norm.t()
+            similarity2 = cross_norm @ text2_norm.t()
+            evidence = (similarity1 - similarity2) / 0.05
+
+            cls_features = self._clip_cls_features(image_features)
+            cls_pair = (cls_features.index_select(0, sub_idx) + cls_features.index_select(0, obj_idx)) / 2
+            cls_pair_norm = cls_pair / cls_pair.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+            origin_1 = cls_pair_norm @ text1_norm.t()
+            origin_2 = cls_pair_norm @ text2_norm.t()
+            origin_evidence = (origin_1 - origin_2) / 0.05
+
+            if self.adaper_clip1.training:
+                probs = torch.stack([evidence, origin_evidence], dim=1)
+            else:
+                programs = self._active_programs(subj_labels)
+                program_score = self._program_score(programs, evidence)
+                similarity3 = self._filter_similarity(
+                    cls_features, sub_idx, obj_idx, subj_labels, programs.size(1)
+                )
+                probs = program_score * 0.2 + similarity3.float() * 0.8
+                rip_evidence = evidence.detach() if self.rip_detach_evidence else evidence
+                rip_scores, delta, energy = self.rip_head(
+                    rip_evidence, programs, subj_labels, obj_labels
+                )
+                probs = probs + self.rip_logit_weight * self._center_scores(rip_scores)
+                probs = probs.to(dtype=evidence.dtype)
+
+            if self.training:
+                programs = self._active_programs(subj_labels)
+                base_scores = self._program_score(programs, evidence)
+                rip_evidence = evidence.detach() if self.rip_detach_evidence else evidence
+                rip_scores, delta, energy = self.rip_head(
+                    rip_evidence, programs, subj_labels, obj_labels
+                )
+                final_scores = base_scores + self.rip_logit_weight * self._center_scores(rip_scores)
+                rip_losses.append(
+                    self._rip_losses(rip_evidence, programs, base_scores, rip_scores, delta, energy, rel_labels[i])
+                )
+                if self.credoDebug and self.credoIter % self.credoDebugPeriod == 0:
+                    credoDebugStats.append(
+                        self.collectCredoDebug(base_scores, final_scores, energy, delta, rel_labels[i])
+                    )
+
+            rel_dists.append(probs)
+
+        obj_dists = obj_dists.split(num_objs, dim=0)
+        rel_dists = tuple(rel_dists)
+        add_losses = self._merge_losses(rip_losses) if self.training else {}
+        if self.training and self.credoDebug and self.credoIter % self.credoDebugPeriod == 0:
+            self.logCredoDebug(logger, credoDebugStats)
+        return obj_dists, rel_dists, add_losses
+
+
+@registry.ROI_RELATION_PREDICTOR.register("ClipCREDOPredictor")
+class ClipCREDOPredictor(ClipRIPPredictor):
+    pass
 
 
 @registry.ROI_RELATION_PREDICTOR.register("ClipReSAPredictor")
