@@ -24,15 +24,21 @@ CUDA_VISIBLE_DEVICES=0 python -m torch.distributed.launch --master_port 10025 --
 CUDA_VISIBLE_DEVICES=0 python -m torch.distributed.launch --master_port 10025 --nproc_per_node=1 tools/relation_train_net.py --config-file "configs/e2e_relation_X_101_32_8_FPN_1x_total.yaml" MODEL.ROI_RELATION_HEAD.USE_GT_BOX True MODEL.ROI_RELATION_HEAD.USE_GT_OBJECT_LABEL True MODEL.ROI_RELATION_HEAD.PREDICTOR ClipPredictor SOLVER.IMS_PER_BATCH 4 TEST.IMS_PER_BATCH 2 DTYPE "float16" SOLVER.MAX_ITER 16000 SOLVER.VAL_PERIOD 4000 SOLVER.CHECKPOINT_PERIOD 4000 GLOVE_DIR ../glove  OUTPUT_DIR /workspace/ccloud/sf/SDSGG/output/ClipPredictor
 
 CUDA_VISIBLE_DEVICES=0 python -m torch.distributed.launch \
-  --master_port 10027 --nproc_per_node=1 tools/relation_test_net.py \
-  --config-file "configs/e2e_relation_X_101_32_8_FPN_1x_novel.yaml" \
+  --master_port 10025 \
+  --nproc_per_node=1 \
+  tools/relation_train_net.py \
+  --config-file "configs/e2e_relation_X_101_32_8_FPN_1x_total.yaml" \
   MODEL.ROI_RELATION_HEAD.USE_GT_BOX True \
   MODEL.ROI_RELATION_HEAD.USE_GT_OBJECT_LABEL True \
   MODEL.ROI_RELATION_HEAD.PREDICTOR ClipPredictor \
-  OV_SETTING.TEST_PART base \
-  DATASETS.TO_TEST test \
-  TEST.ALLOW_LOAD_FROM_CACHE False \
-  TEST.IMS_PER_BATCH 1 \
+  MODEL.ROI_RELATION_HEAD.MTM.ENABLED True \
+  MODEL.ROI_RELATION_HEAD.MTM.USE_INFERENCE True \
+  MODEL.ROI_RELATION_HEAD.MTM.INFERENCE_WEIGHT 0.02 \
+  SOLVER.IMS_PER_BATCH 4 \
+  TEST.IMS_PER_BATCH 2 \
   DTYPE "float16" \
+  SOLVER.MAX_ITER 16000 \
+  SOLVER.VAL_PERIOD 4000 \
+  SOLVER.CHECKPOINT_PERIOD 4000 \
   GLOVE_DIR ../glove \
-  OUTPUT_DIR /workspace/ccloud/sf/SDSGG/output/ClipPredictor
+  OUTPUT_DIR /path/checkpoint/sdsgg_triplet_mtm

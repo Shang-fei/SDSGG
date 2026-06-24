@@ -204,7 +204,7 @@ def train(cfg, local_rank, distributed, logger):
             checkpointer.save("model_final", **arguments)
 
         val_result = None # used for scheduler updating
-        if cfg.SOLVER.TO_VAL and iteration % cfg.SOLVER.VAL_PERIOD == 0 and iteration>=12000:
+        if cfg.SOLVER.TO_VAL and iteration % cfg.SOLVER.VAL_PERIOD == 0:
             logger.info("Start validating")
             test_result = run_test(cfg, model, distributed, logger)
             logger.info("Test Result: %.4f" % test_result)
