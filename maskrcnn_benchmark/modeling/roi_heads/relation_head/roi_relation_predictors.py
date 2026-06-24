@@ -160,6 +160,7 @@ class MTMRelationAdapter(nn.Module):
 class RelationModalityTransfer(nn.Module):
     def __init__(self, inputDim=512, embedDim=512, fcLayers=3, attentionLayers=3, numHeads=8, dropout=0.1):
         super(RelationModalityTransfer, self).__init__()
+        self.adapter = MTMRelationAdapter(inputDim, embedDim, dropout)
         layers = []
         currentDim = embedDim
         for _ in range(max(fcLayers - 1, 0)):
@@ -167,7 +168,6 @@ class RelationModalityTransfer(nn.Module):
             layers.append(nn.ReLU(inplace=True))
             layers.append(nn.Dropout(dropout))
             currentDim = embedDim
-        self.adapter = MTMRelationAdapter(inputDim, embedDim, dropout)
         self.fc = nn.Sequential(*layers)
         encoderLayer = nn.TransformerEncoderLayer(
             d_model=embedDim,
@@ -180,11 +180,17 @@ class RelationModalityTransfer(nn.Module):
         self.selfAttention = nn.TransformerEncoder(encoderLayer, num_layers=attentionLayers)
         self.norm = nn.LayerNorm(embedDim)
 
-    def forward(self, relationFeatures):
-        x = self.adapter(relationFeatures)
-        x = self.fc(x).unsqueeze(0)
+    def encode_visual(self, relationFeatures):
+        return self.adapter(relationFeatures)
+
+    def encode_text_space(self, visualFeatures):
+        x = self.fc(visualFeatures).unsqueeze(0)
         x = self.selfAttention(x).squeeze(0)
         return self.norm(x)
+
+    def forward(self, relationFeatures):
+        visualFeatures = self.encode_visual(relationFeatures)
+        return self.encode_text_space(visualFeatures)
 
 
 class RelationnessHead(nn.Module):
@@ -741,12 +747,13 @@ class ClipPredictor(nn.Module):
             subjLabels = subjLabels.index_select(0, sample_index)
             objLabels = objLabels.index_select(0, sample_index)
 
-        predicted_embeddings = self.relationMtm(relationFeatures)
+        adapted_visual_features = self.relationMtm.encode_visual(relationFeatures)
+        predicted_text_embeddings = self.relationMtm.encode_text_space(adapted_visual_features)
         target_texts = self.buildTargetTripletTexts(subjLabels, relationLabels, objLabels)
-        target_embeddings = self.encodeTripletTexts(target_texts).to(predicted_embeddings.device)
-        predicted_norm = F.normalize(predicted_embeddings.float(), dim=-1)
+        target_embeddings = self.encodeTripletTexts(target_texts).to(predicted_text_embeddings.device)
+        predicted_norm = F.normalize(predicted_text_embeddings.float(), dim=-1)
+        adapted_visual_norm = F.normalize(adapted_visual_features.float(), dim=-1)
         target_norm = F.normalize(target_embeddings.float(), dim=-1)
-        feature_norm = F.normalize(relationFeatures.float(), dim=-1)
 
         alignLoss = (1.0 - (predicted_norm * target_norm).sum(dim=-1)).mean()
         if predicted_norm.size(0) < 2:
@@ -754,14 +761,14 @@ class ClipPredictor(nn.Module):
             textStructureLoss = alignLoss * 0.0
         else:
             predictedSimilarity = torch.matmul(predicted_norm, predicted_norm.t())
-            featureSimilarity = torch.matmul(feature_norm, feature_norm.t())
+            adaptedVisualSimilarity = torch.matmul(adapted_visual_norm, adapted_visual_norm.t())
             targetSimilarity = torch.matmul(target_norm, target_norm.t())
             offDiagonal = ~torch.eye(
                 predictedSimilarity.size(0),
                 dtype=torch.bool,
                 device=predictedSimilarity.device,
             )
-            visualStructureLoss = (predictedSimilarity - featureSimilarity).abs()[offDiagonal].mean()
+            visualStructureLoss = (adaptedVisualSimilarity - predictedSimilarity).abs()[offDiagonal].mean()
             textStructureLoss = (predictedSimilarity - targetSimilarity).abs()[offDiagonal].mean()
         return {
             "loss_mtm_align": self.mtmLossWeight * self.mtmAlignWeight * alignLoss,
