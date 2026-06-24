@@ -578,6 +578,7 @@ class ClipPredictor(nn.Module):
             mtmConfig.DROPOUT,
         ).to(self.device)
         self.activeRelNames = activeRelNames
+        self.filteredTripletEmbeddingCache = {}
 
     def encodeTripletTexts(self, tripletTexts):
         with torch.no_grad():
@@ -607,6 +608,16 @@ class ClipPredictor(nn.Module):
             for relationName in candidateRelations:
                 texts.append("a photo of " + subjName + " " + relationName + " " + objName)
         return texts, len(candidateRelations)
+
+    def getFilteredTripletEmbeddings(self, subjLabel, objLabel):
+        cacheKey = (int(subjLabel), int(objLabel))
+        if cacheKey not in self.filteredTripletEmbeddingCache:
+            objLabels = torch.tensor([cacheKey[1]], device=self.device)
+            texts, numCandidateRelations = self.buildFilteredTripletTexts(cacheKey[0], objLabels)
+            embeddings = self.encodeTripletTexts(texts).cpu()
+            self.filteredTripletEmbeddingCache[cacheKey] = (embeddings, numCandidateRelations)
+        embeddings, numCandidateRelations = self.filteredTripletEmbeddingCache[cacheKey]
+        return embeddings.to(self.device), numCandidateRelations
 
     def computeMtmLosses(self, relationFeatures, relationLabels, subjLabels, objLabels):
         if not self.mtmEnabled or len(relationFeatures) == 0 or relationLabels is None:
@@ -665,8 +676,13 @@ class ClipPredictor(nn.Module):
             rel_pos = torch.nonzero(mask, as_tuple=False).view(-1)
             label_predicted_embeddings = predicted_embeddings.index_select(0, rel_pos)
             label_obj_labels = objLabels.index_select(0, rel_pos)
-            candidate_texts, num_candidate_relations = self.buildFilteredTripletTexts(label.item(), label_obj_labels)
-            candidate_embeddings = self.encodeTripletTexts(candidate_texts)
+            cached_embeddings = []
+            num_candidate_relations = None
+            for objLabel in label_obj_labels:
+                embeddings, candidate_count = self.getFilteredTripletEmbeddings(label.item(), objLabel.item())
+                cached_embeddings.append(embeddings)
+                num_candidate_relations = candidate_count
+            candidate_embeddings = torch.stack(cached_embeddings, dim=0)
             candidate_embeddings = candidate_embeddings.to(predicted_embeddings.device).float()
             candidate_embeddings = candidate_embeddings.view(rel_pos.size(0), num_candidate_relations, -1)
             label_scores = (label_predicted_embeddings.unsqueeze(1) * candidate_embeddings).sum(-1)
@@ -711,6 +727,7 @@ class ClipPredictor(nn.Module):
         self.description_relation = np.array([[np.array(item) for item in inner_list] for inner_list in self.description_relation])
         self.description_relation=torch.Tensor(self.description_relation).to(self.device)
         self.activeRelNames = activeRelNames
+        self.filteredTripletEmbeddingCache = {}
 
         with torch.no_grad():
             self.texts5=[]
