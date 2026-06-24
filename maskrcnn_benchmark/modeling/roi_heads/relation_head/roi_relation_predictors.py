@@ -187,6 +187,27 @@ class RelationModalityTransfer(nn.Module):
         return self.norm(x)
 
 
+class RelationnessHead(nn.Module):
+    def __init__(self, relationDim=512, spatialDim=32, hiddenDim=256, dropout=0.1):
+        super(RelationnessHead, self).__init__()
+        self.spatialProj = nn.Sequential(
+            nn.Linear(spatialDim, hiddenDim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+        )
+        self.classifier = nn.Sequential(
+            nn.Linear(relationDim + hiddenDim, hiddenDim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(hiddenDim, 1),
+        )
+
+    def forward(self, relationFeatures, spatialFeatures):
+        spatialFeatures = self.spatialProj(spatialFeatures.float())
+        features = torch.cat([relationFeatures.float(), spatialFeatures], dim=-1)
+        return self.classifier(features).squeeze(-1)
+
+
 @registry.ROI_RELATION_PREDICTOR.register("GQAClipPredictor")
 class GQAClipPredictor(nn.Module):
     def __init__(self, config, in_channels):
@@ -596,6 +617,7 @@ class ClipPredictor(nn.Module):
         self.mtmMaxPairs = mtmConfig.MAX_PAIRS
         self.mtmUseInference = mtmConfig.USE_INFERENCE
         self.mtmInferenceWeight = mtmConfig.INFERENCE_WEIGHT
+        self.relationnessLossWeight = getattr(mtmConfig, "RELATIONNESS_WEIGHT", 1.0)
         self.relationMtm = RelationModalityTransfer(
             mtmConfig.INPUT_DIM,
             mtmConfig.EMBED_DIM,
@@ -603,6 +625,11 @@ class ClipPredictor(nn.Module):
             mtmConfig.ATTENTION_LAYERS,
             mtmConfig.NUM_HEADS,
             mtmConfig.DROPOUT,
+        ).to(self.device)
+        self.relationnessHead = RelationnessHead(
+            relationDim=mtmConfig.EMBED_DIM,
+            hiddenDim=mtmConfig.EMBED_DIM // 2,
+            dropout=mtmConfig.DROPOUT,
         ).to(self.device)
         self.activeRelNames = self.trainRelNames
         self.filteredTripletEmbeddingCache = {}
@@ -653,6 +680,22 @@ class ClipPredictor(nn.Module):
             self.filteredTripletEmbeddingCache[cacheKey] = (embeddings, numCandidateRelations)
         embeddings, numCandidateRelations = self.filteredTripletEmbeddingCache[cacheKey]
         return embeddings.to(self.device), numCandidateRelations
+
+    def buildPairSpatialFeatures(self, proposal, pairIdx):
+        boxInfo = get_box_info(proposal.bbox, need_norm=True, proposal=proposal)
+        subjBoxInfo = boxInfo.index_select(0, pairIdx[:, 0])
+        objBoxInfo = boxInfo.index_select(0, pairIdx[:, 1])
+        return get_box_pair_info(subjBoxInfo, objBoxInfo)
+
+    def computeRelationnessLoss(self, relationnessLogits, relationLabels):
+        if len(relationnessLogits) == 0 or relationLabels is None:
+            zero = self.relationnessHead.classifier[-1].weight.sum() * 0.0
+            return {"loss_mtm_relationness": zero}
+        relationnessLogits = torch.cat(relationnessLogits, dim=0).float()
+        relationLabels = torch.cat(relationLabels, dim=0).view(-1).to(relationnessLogits.device)
+        relationnessTargets = (relationLabels > 0).float()
+        loss = F.binary_cross_entropy_with_logits(relationnessLogits, relationnessTargets)
+        return {"loss_mtm_relationness": self.mtmLossWeight * self.relationnessLossWeight * loss}
 
     def computeMtmLosses(self, relationFeatures, relationLabels, subjLabels, objLabels):
         if not self.mtmEnabled or len(relationFeatures) == 0 or relationLabels is None:
@@ -823,8 +866,11 @@ class ClipPredictor(nn.Module):
 
         rel_dists=[]
         relationFeaturesForMtm = []
+        relationLabelsForMtm = []
         subjLabelsForMtm = []
         objLabelsForMtm = []
+        relationnessLogitsForLoss = []
+        relationnessLabelsForLoss = []
         for i in range(len(num_rels)):
             image_tensor=[]
             with torch.no_grad():
@@ -864,38 +910,61 @@ class ClipPredictor(nn.Module):
             cross_output1 = self.adaper_clip1(sub_features, obj_features, text_sub)
             cross_output2 = self.adaper_clip2(obj_features, sub_features, text_obj)
             cross_output = (cross_output1 + cross_output2) / 2
+            pair_spatial_features = self.buildPairSpatialFeatures(proposals[i], pair_idx).to(
+                device=cross_output.device,
+                dtype=cross_output.dtype,
+            )
+            if self.mtmEnabled:
+                relationness_logits = self.relationnessHead(cross_output, pair_spatial_features)
+                relationness_scores = torch.sigmoid(relationness_logits).to(dtype=cross_output.dtype).unsqueeze(-1)
+            else:
+                relationness_logits = None
+                relationness_scores = cross_output.new_ones((cross_output.size(0), 1))
+            if self.training and self.mtmEnabled and rel_labels is not None:
+                relationnessLogitsForLoss.append(relationness_logits)
+                relationnessLabelsForLoss.append(rel_labels[i].to(relationness_logits.device))
 
             mtm_relation_features = None
             need_mtm_features = self.mtmEnabled and (
                 self.training or ((not self.training) and self.mtmUseInference and self.mtmInferenceWeight != 0)
             )
             if need_mtm_features:
+                mtm_pair_idx = pair_idx
+                mtm_feature_pos = None
+                if self.training and rel_labels is not None:
+                    mtm_feature_pos = torch.nonzero(
+                        rel_labels[i].to(pair_idx.device).view(-1) > 0,
+                        as_tuple=False,
+                    ).view(-1)
+                    mtm_pair_idx = pair_idx.index_select(0, mtm_feature_pos)
                 union_pair_tensors = []
-                with torch.no_grad():
-                    for rel_index in pair_idx:
-                        union_img = crop_and_resize(
-                            img[i].unsqueeze(0),
-                            proposals[i].bbox[rel_index[0]],
-                            proposals[i].bbox[rel_index[1]],
-                        )
-                        iimg = union_img[0].permute(1, 2, 0).detach().cpu().numpy() * 255
-                        iimg = Image.fromarray(np.uint8(iimg))
-                        union_img = self.clip_preprocess(iimg).unsqueeze(0).to(self.device)
-                        union_pair_tensors.append(union_img)
-                    union_pair_tensors = torch.cat(union_pair_tensors)
-                    mtm_relation_features = self.clip_model.encode_image(union_pair_tensors)
-                    if mtm_relation_features.dim() == 3:
-                        mtm_relation_features = mtm_relation_features[:, 0, :]
+                if mtm_pair_idx.numel() > 0:
+                    with torch.no_grad():
+                        for rel_index in mtm_pair_idx:
+                            union_img = crop_and_resize(
+                                img[i].unsqueeze(0),
+                                proposals[i].bbox[rel_index[0]],
+                                proposals[i].bbox[rel_index[1]],
+                            )
+                            iimg = union_img[0].permute(1, 2, 0).detach().cpu().numpy() * 255
+                            iimg = Image.fromarray(np.uint8(iimg))
+                            union_img = self.clip_preprocess(iimg).unsqueeze(0).to(self.device)
+                            union_pair_tensors.append(union_img)
+                        union_pair_tensors = torch.cat(union_pair_tensors)
+                        mtm_relation_features = self.clip_model.encode_image(union_pair_tensors)
+                        if mtm_relation_features.dim() == 3:
+                            mtm_relation_features = mtm_relation_features[:, 0, :]
 
-            if self.training and self.mtmEnabled:
+            if self.training and self.mtmEnabled and mtm_relation_features is not None:
                 relationFeaturesForMtm.append(mtm_relation_features)
+                relationLabelsForMtm.append(rel_labels[i].to(mtm_feature_pos.device).index_select(0, mtm_feature_pos))
                 if proposals[i].has_field("labels"):
                     gtObjLabels = proposals[i].get_field("labels").long()
-                    subjLabelsForMtm.append(gtObjLabels.index_select(0, sub_idx))
-                    objLabelsForMtm.append(gtObjLabels.index_select(0, obj_idx))
+                    subjLabelsForMtm.append(gtObjLabels.index_select(0, sub_idx).index_select(0, mtm_feature_pos))
+                    objLabelsForMtm.append(gtObjLabels.index_select(0, obj_idx).index_select(0, mtm_feature_pos))
                 else:
-                    subjLabelsForMtm.append(obj_n1)
-                    objLabelsForMtm.append(obj_n2)
+                    subjLabelsForMtm.append(obj_n1.index_select(0, mtm_feature_pos))
+                    objLabelsForMtm.append(obj_n2.index_select(0, mtm_feature_pos))
 
             cross_norm = cross_output / cross_output.norm(dim=-1, keepdim=True).clamp(min=1e-6)
             similarity1 = cross_norm @ text1_norm.t()
@@ -941,6 +1010,11 @@ class ClipPredictor(nn.Module):
                         rel_dist_per_batch.dtype,
                     )
                     rel_dist_per_batch = rel_dist_per_batch + self.mtmInferenceWeight * mtmScores
+                if self.mtmEnabled:
+                    relationness_prior = torch.log(
+                        relationness_scores.clamp(min=1e-6).to(dtype=rel_dist_per_batch.dtype)
+                    )
+                    rel_dist_per_batch = rel_dist_per_batch + relationness_prior
 
             rel_dists.append(rel_dist_per_batch)
 
@@ -951,7 +1025,8 @@ class ClipPredictor(nn.Module):
 
         add_losses = {}
         if self.training and self.mtmEnabled:
-            add_losses.update(self.computeMtmLosses(relationFeaturesForMtm, rel_labels, subjLabelsForMtm, objLabelsForMtm))
+            add_losses.update(self.computeMtmLosses(relationFeaturesForMtm, relationLabelsForMtm, subjLabelsForMtm, objLabelsForMtm))
+            add_losses.update(self.computeRelationnessLoss(relationnessLogitsForLoss, relationnessLabelsForLoss))
         return obj_dists, rel_dists, add_losses
 
 """
