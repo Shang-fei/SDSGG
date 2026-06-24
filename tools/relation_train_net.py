@@ -206,7 +206,8 @@ def train(cfg, local_rank, distributed, logger):
         val_result = None # used for scheduler updating
         if cfg.SOLVER.TO_VAL and iteration % cfg.SOLVER.VAL_PERIOD == 0 and iteration>=12000:
             logger.info("Start validating")
-            #run_test(cfg, model, distributed, logger)
+            test_result = run_test(cfg, model, distributed, logger)
+            logger.info("Test Result: %.4f" % test_result)
             val_result = run_val(cfg, model, val_data_loaders, distributed, logger)
             logger.info("Validation Result: %.4f" % val_result)
 
@@ -307,8 +308,9 @@ def run_test(cfg, model, distributed, logger):
             mkdir(output_folder)
             output_folders[idx] = output_folder
     data_loaders_val = make_data_loader(cfg, mode='test', is_distributed=distributed)
+    test_result = []
     for output_folder, dataset_name, data_loader_val in zip(output_folders, dataset_names, data_loaders_val):
-        inference(
+        dataset_result = inference(
             cfg,
             model,
             data_loader_val,
@@ -322,7 +324,16 @@ def run_test(cfg, model, distributed, logger):
             logger=logger,
         )
         synchronize()
+        test_result.append(dataset_result)
+    gathered_result = all_gather(torch.tensor(test_result).cpu())
+    gathered_result = [t.view(-1) for t in gathered_result]
+    gathered_result = torch.cat(gathered_result, dim=-1).view(-1)
+    valid_result = gathered_result[gathered_result>=0]
+    test_result = float(valid_result.mean())
+    del gathered_result, valid_result
+    torch.cuda.empty_cache()
     model.updata(cfg.OV_SETTING.TRAIN_PART)
+    return test_result
 
 
 def main():
