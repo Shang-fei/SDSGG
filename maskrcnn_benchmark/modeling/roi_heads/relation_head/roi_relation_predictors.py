@@ -649,7 +649,7 @@ class ClipPredictor(nn.Module):
         else:
             predictedSimilarity = torch.matmul(predicted_norm, predicted_norm.t())
             featureSimilarity = torch.matmul(feature_norm, feature_norm.t())
-            structureLoss = (predictedSimilarity - featureSimilarity.detach()).pow(2).mean()
+            structureLoss = (predictedSimilarity - featureSimilarity).pow(2).mean()
         return {
             "loss_mtm_align": self.mtmLossWeight * self.mtmAlignWeight * alignLoss,
             "loss_mtm_structure": self.mtmLossWeight * self.mtmStructureWeight * structureLoss,
