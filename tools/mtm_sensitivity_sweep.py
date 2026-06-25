@@ -81,6 +81,8 @@ def build_test_command(args, run_output_dir, split_name, part, mtm_inference, re
         split_name,
         "OV_SETTING.TEST_PART",
         part,
+        "MODEL.ROI_RELATION_HEAD.PREDICTOR",
+        args.predictor,
         "MODEL.ROI_RELATION_HEAD.MTM.USE_INFERENCE",
         str(mtm_inference),
         "MODEL.ROI_RELATION_HEAD.MTM.USE_RELATIONNESS_INFERENCE",
@@ -166,6 +168,7 @@ def main():
     parser.add_argument("--config-file", required=True)
     parser.add_argument("--weight", default="")
     parser.add_argument("--test-script", default="tools/relation_test_net.py")
+    parser.add_argument("--predictor", default="ClipPredictor")
     parser.add_argument("--output-dir", default="output/mtm_sensitivity")
     parser.add_argument("--mtm-inference", choices=["on", "off", "both"], default="both")
     parser.add_argument("--relationness", choices=["on", "off", "both"], default="both")
