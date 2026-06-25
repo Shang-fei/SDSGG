@@ -125,6 +125,7 @@ def train(cfg, local_rank, distributed, logger):
     start_iter = arguments["iteration"]
     start_training_time = time.time()
     end = time.time()
+    last_eval_iteration = None
     
     scaler = GradScaler()
     print_first_grad = True
@@ -210,6 +211,7 @@ def train(cfg, local_rank, distributed, logger):
             logger.info("Test Result: %.4f" % test_result)
             val_result = run_val(cfg, model, val_data_loaders, distributed, logger)
             logger.info("Validation Result: %.4f" % val_result)
+            last_eval_iteration = iteration
 
              
         # scheduler should be called after optimizer.step() in pytorch>=1.1.0
@@ -230,7 +232,7 @@ def train(cfg, local_rank, distributed, logger):
         )
     )
 
-    return model
+    return model, last_eval_iteration == arguments["iteration"]
 
 def fix_eval_modules(eval_modules):
     for module in eval_modules:
@@ -397,9 +399,9 @@ def main():
     # save overloaded model config in the output directory
     save_config(cfg, output_config_path)
 
-    model = train(cfg, args.local_rank, args.distributed, logger)
+    model, final_eval_done = train(cfg, args.local_rank, args.distributed, logger)
 
-    if not args.skip_test:
+    if not args.skip_test and not final_eval_done:
         run_test(cfg, model, args.distributed, logger)
 
 

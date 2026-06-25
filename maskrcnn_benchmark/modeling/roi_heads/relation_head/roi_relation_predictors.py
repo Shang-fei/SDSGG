@@ -342,7 +342,6 @@ class GQAClipPredictor(nn.Module):
         self.linear1=nn.Linear(1024,512, bias=False).to(self.device).half()
 
     def updata(self,mode):
-        print("now is "+mode)
         self.description_relation = pd.read_csv(
             curpath+"/description_relation_loss.csv")
         if mode=="base":
@@ -616,15 +615,19 @@ class ClipPredictor(nn.Module):
 
         self.linear1=nn.Linear(1024,512, bias=False).to(self.device).half()
         mtmConfig = config.MODEL.ROI_RELATION_HEAD.MTM
+        relationnessConfig = config.MODEL.ROI_RELATION_HEAD.RELATIONNESS
         self.mtmEnabled = mtmConfig.ENABLED
+        self.mtmLossEnabled = mtmConfig.ENABLED and mtmConfig.LOSS_ENABLED
         self.mtmLossWeight = mtmConfig.LOSS_WEIGHT
         self.mtmAlignWeight = mtmConfig.ALIGN_WEIGHT
         self.mtmStructureWeight = mtmConfig.STRUCTURE_WEIGHT
         self.mtmMaxPairs = mtmConfig.MAX_PAIRS
-        self.mtmUseInference = mtmConfig.USE_INFERENCE
+        self.mtmUseInference = mtmConfig.ENABLED and mtmConfig.USE_INFERENCE
         self.mtmInferenceWeight = mtmConfig.INFERENCE_WEIGHT
-        self.relationnessLossWeight = getattr(mtmConfig, "RELATIONNESS_WEIGHT", 1.0)
-        self.useRelationnessInference = getattr(mtmConfig, "USE_RELATIONNESS_INFERENCE", True)
+        self.relationnessEnabled = relationnessConfig.ENABLED
+        self.relationnessLossEnabled = relationnessConfig.ENABLED and relationnessConfig.LOSS_ENABLED
+        self.relationnessLossWeight = relationnessConfig.LOSS_WEIGHT
+        self.useRelationnessInference = relationnessConfig.ENABLED and relationnessConfig.USE_INFERENCE
         self.relationMtm = RelationModalityTransfer(
             mtmConfig.INPUT_DIM,
             mtmConfig.EMBED_DIM,
@@ -705,7 +708,7 @@ class ClipPredictor(nn.Module):
         return {"loss_mtm_relationness": self.mtmLossWeight * self.relationnessLossWeight * loss}
 
     def computeMtmLosses(self, relationFeatures, relationLabels, subjLabels, objLabels):
-        if not self.mtmEnabled or len(relationFeatures) == 0 or relationLabels is None:
+        if not self.mtmLossEnabled or len(relationFeatures) == 0 or relationLabels is None:
             zero = self.relationMtm.norm.weight.sum() * 0.0
             return {
                 "loss_mtm_align": zero,
@@ -799,7 +802,6 @@ class ClipPredictor(nn.Module):
         return scores.to(dtype=outDtype)
 
     def updata(self,mode):
-        print("now is "+mode)
         self.description_relation = pd.read_csv(
             curpath+"/description_relation.csv")
         if mode == "base":
@@ -828,8 +830,6 @@ class ClipPredictor(nn.Module):
             self.sub_filter_novel = pd.read_csv(
                 curpath+"/filter_total.csv").iloc[
                                     self.semantic, 1:]
-
-        print(self.description_relation)
 
         self.description_relation=self.description_relation.applymap(lambda x: [int(s) for s in x.split(',')])
         self.description_relation=np.array(self.description_relation)
@@ -922,19 +922,20 @@ class ClipPredictor(nn.Module):
                 device=cross_output.device,
                 dtype=cross_output.dtype,
             )
-            if self.mtmEnabled:
-                relationness_logits = self.relationnessHead(cross_output, pair_spatial_features)
+            if self.relationnessEnabled:
+                relationness_logits = self.relationnessHead(cross_output.detach(), pair_spatial_features)
                 relationness_scores = torch.sigmoid(relationness_logits).to(dtype=cross_output.dtype).unsqueeze(-1)
             else:
                 relationness_logits = None
                 relationness_scores = cross_output.new_ones((cross_output.size(0), 1))
-            if self.training and self.mtmEnabled and rel_labels is not None:
+            if self.training and self.relationnessLossEnabled and rel_labels is not None:
                 relationnessLogitsForLoss.append(relationness_logits)
                 relationnessLabelsForLoss.append(rel_labels[i].to(relationness_logits.device))
 
             mtm_relation_features = None
-            need_mtm_features = self.mtmEnabled and (
-                self.training or ((not self.training) and self.mtmUseInference and self.mtmInferenceWeight != 0)
+            need_mtm_features = (
+                (self.training and self.mtmLossEnabled)
+                or ((not self.training) and self.mtmUseInference and self.mtmInferenceWeight != 0)
             )
             if need_mtm_features:
                 mtm_pair_idx = pair_idx
@@ -963,7 +964,7 @@ class ClipPredictor(nn.Module):
                         if mtm_relation_features.dim() == 3:
                             mtm_relation_features = mtm_relation_features[:, 0, :]
 
-            if self.training and self.mtmEnabled and mtm_relation_features is not None:
+            if self.training and self.mtmLossEnabled and mtm_relation_features is not None:
                 relationFeaturesForMtm.append(mtm_relation_features)
                 relationLabelsForMtm.append(rel_labels[i].to(mtm_feature_pos.device).index_select(0, mtm_feature_pos))
                 if proposals[i].has_field("labels"):
@@ -1009,7 +1010,7 @@ class ClipPredictor(nn.Module):
                 for rel_pos, scores in grouped_filter_scores:
                     filter_scores.index_copy_(0, rel_pos, scores.to(dtype=filter_scores.dtype))
                 rel_dist_per_batch = description_scores * 0.2 + filter_scores * 0.8
-                if self.mtmEnabled and self.mtmUseInference and self.mtmInferenceWeight != 0:
+                if self.mtmUseInference and self.mtmInferenceWeight != 0:
                     mtmScores = self.computeMtmInferenceScores(
                         mtm_relation_features,
                         obj_n1,
@@ -1018,7 +1019,7 @@ class ClipPredictor(nn.Module):
                         rel_dist_per_batch.dtype,
                     )
                     rel_dist_per_batch = rel_dist_per_batch + self.mtmInferenceWeight * mtmScores
-                if self.mtmEnabled and self.useRelationnessInference:
+                if self.useRelationnessInference:
                     relationness_prior = torch.log(
                         relationness_scores.clamp(min=1e-6).to(dtype=rel_dist_per_batch.dtype)
                     )
@@ -1032,8 +1033,9 @@ class ClipPredictor(nn.Module):
         rel_dists = tuple(rel_dists)
 
         add_losses = {}
-        if self.training and self.mtmEnabled:
+        if self.training and self.mtmLossEnabled:
             add_losses.update(self.computeMtmLosses(relationFeaturesForMtm, relationLabelsForMtm, subjLabelsForMtm, objLabelsForMtm))
+        if self.training and self.relationnessLossEnabled:
             add_losses.update(self.computeRelationnessLoss(relationnessLogitsForLoss, relationnessLabelsForLoss))
         return obj_dists, rel_dists, add_losses
 
