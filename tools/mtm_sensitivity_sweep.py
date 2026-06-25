@@ -94,6 +94,8 @@ def build_test_command(args, run_output_dir, split_name, part, mtm_inference, re
     ]
     if args.weight:
         command.extend(["MODEL.WEIGHT", args.weight])
+    if args.glove_dir:
+        command.extend(["GLOVE_DIR", args.glove_dir])
     command.extend(args.opts)
     return command
 
@@ -167,6 +169,7 @@ def main():
     )
     parser.add_argument("--config-file", required=True)
     parser.add_argument("--weight", default="")
+    parser.add_argument("--glove-dir", default="")
     parser.add_argument("--test-script", default="tools/relation_test_net.py")
     parser.add_argument("--predictor", default="ClipPredictor")
     parser.add_argument("--output-dir", default="output/mtm_sensitivity")
