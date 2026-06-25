@@ -624,6 +624,7 @@ class ClipPredictor(nn.Module):
         self.mtmUseInference = mtmConfig.USE_INFERENCE
         self.mtmInferenceWeight = mtmConfig.INFERENCE_WEIGHT
         self.relationnessLossWeight = getattr(mtmConfig, "RELATIONNESS_WEIGHT", 1.0)
+        self.useRelationnessInference = getattr(mtmConfig, "USE_RELATIONNESS_INFERENCE", True)
         self.relationMtm = RelationModalityTransfer(
             mtmConfig.INPUT_DIM,
             mtmConfig.EMBED_DIM,
@@ -1017,11 +1018,11 @@ class ClipPredictor(nn.Module):
                         rel_dist_per_batch.dtype,
                     )
                     rel_dist_per_batch = rel_dist_per_batch + self.mtmInferenceWeight * mtmScores
-                if self.mtmEnabled:
+                if self.mtmEnabled and self.useRelationnessInference:
                     relationness_prior = torch.log(
                         relationness_scores.clamp(min=1e-6).to(dtype=rel_dist_per_batch.dtype)
                     )
-                    rel_dist_per_batch = rel_dist_per_batch + relationness_prior * 0.0
+                    rel_dist_per_batch = rel_dist_per_batch + relationness_prior
 
             rel_dists.append(rel_dist_per_batch)
 
