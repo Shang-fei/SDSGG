@@ -705,7 +705,7 @@ class ClipPredictor(nn.Module):
         relationLabels = torch.cat(relationLabels, dim=0).view(-1).to(relationnessLogits.device)
         relationnessTargets = (relationLabels > 0).float()
         loss = F.binary_cross_entropy_with_logits(relationnessLogits, relationnessTargets)
-        return {"loss_mtm_relationness": self.mtmLossWeight * self.relationnessLossWeight * loss}
+        return {"loss_mtm_relationness": self.relationnessLossWeight * loss}
 
     def computeMtmLosses(self, relationFeatures, relationLabels, subjLabels, objLabels):
         if not self.mtmLossEnabled or len(relationFeatures) == 0 or relationLabels is None:
