@@ -842,7 +842,7 @@ class ClipPredictor(nn.Module):
             self.texts5=[]
 
             for obj in self.obj_names:
-                text5 = clip.tokenize(["a photo of " + tex + " relation" for tex in list(self.sub_filter_novel[obj])]).to(
+                text5 = clip.tokenize(["a photo of " + tex for tex in list(self.sub_filter_novel[obj])]).to(
                     self.device)
 
                 timing = []
