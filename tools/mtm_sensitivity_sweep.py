@@ -220,6 +220,7 @@ def main():
                         + str(mtm_weight).replace(".", "p")
                     )
                     run_output_dir = os.path.join(sweep_dir, run_name, "model_output")
+                    os.makedirs(run_output_dir, exist_ok=True)
                     log_path = os.path.join(sweep_dir, run_name, "eval.log")
                     command = build_test_command(
                         args,
