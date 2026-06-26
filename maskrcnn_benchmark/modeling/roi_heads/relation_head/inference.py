@@ -100,6 +100,13 @@ class PostProcessor(nn.Module):
             # sorting triples according to score production
             obj_scores0 = obj_scores[rel_pair_idx[:, 0]]
             obj_scores1 = obj_scores[rel_pair_idx[:, 1]]
+            if box.has_field("relationness_scores"):
+                relationness_scores = box.get_field("relationness_scores").to(
+                    device=rel_logit.device,
+                    dtype=rel_logit.dtype,
+                )
+            else:
+                relationness_scores = rel_logit.new_ones(rel_logit.size(0))
 
             """"""
 
@@ -112,11 +119,12 @@ class PostProcessor(nn.Module):
             rel_scores, rel_class = rel_class_prob[:, 1:].max(dim=1)
             rel_class = rel_class + 1
             # TODO Kaihua: how about using weighted some here?  e.g. rel*1 + obj *0.8 + obj*0.8
-            triple_scores = rel_scores * obj_scores0 * obj_scores1
+            triple_scores = rel_scores * obj_scores0 * obj_scores1 * relationness_scores
             _, sorting_idx = torch.sort(triple_scores.view(-1), dim=0, descending=True)
             rel_pair_idx = rel_pair_idx[sorting_idx]
             rel_class_prob = rel_class_prob[sorting_idx]
             rel_labels = rel_class[sorting_idx]
+            relationness_scores = relationness_scores[sorting_idx]
 
             rel_logit = rel_logit[sorting_idx]
 
@@ -127,6 +135,7 @@ class PostProcessor(nn.Module):
             boxlist.add_field('rel_pair_idxs', rel_pair_idx) # (#rel, 2)
             boxlist.add_field('pred_rel_scores', rel_class_prob) # (#rel, #rel_class)
             boxlist.add_field('pred_rel_labels', rel_labels) # (#rel, )
+            boxlist.add_field('relationness_scores', relationness_scores) # (#rel, )
             # should have fields : rel_pair_idxs, pred_rel_class_prob, pred_rel_labels, pred_labels, pred_scores
             # Note
             boxlist.add_field('pred_rel_logit', rel_logit)

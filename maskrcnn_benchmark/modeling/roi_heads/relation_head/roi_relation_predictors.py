@@ -704,7 +704,12 @@ class ClipPredictor(nn.Module):
         relationnessLogits = torch.cat(relationnessLogits, dim=0).float()
         relationLabels = torch.cat(relationLabels, dim=0).view(-1).to(relationnessLogits.device)
         relationnessTargets = (relationLabels > 0).float()
-        loss = F.binary_cross_entropy_with_logits(relationnessLogits, relationnessTargets)
+        relationnessProb = torch.sigmoid(relationnessLogits).clamp(min=1e-6, max=1.0 - 1e-6)
+        gamma = 2.0
+        positiveLoss = -relationnessTargets * torch.log(relationnessProb) * (1.0 - relationnessProb).pow(gamma)
+        negativeLoss = -(1.0 - relationnessTargets) * torch.log(1.0 - relationnessProb) * relationnessProb.pow(gamma)
+        normalizer = relationnessTargets.sum().clamp(min=1.0)
+        loss = (positiveLoss + negativeLoss).sum() / normalizer
         return {"loss_mtm_relationness": self.relationnessLossWeight * loss}
 
     def computeMtmLosses(self, relationFeatures, relationLabels, subjLabels, objLabels):
@@ -1020,10 +1025,7 @@ class ClipPredictor(nn.Module):
                     )
                     rel_dist_per_batch = rel_dist_per_batch + self.mtmInferenceWeight * mtmScores
                 if self.useRelationnessInference:
-                    relationness_prior = torch.log(
-                        relationness_scores.clamp(min=1e-6).to(dtype=rel_dist_per_batch.dtype)
-                    )
-                    rel_dist_per_batch = rel_dist_per_batch + relationness_prior
+                    proposals[i].add_field("relationness_scores", relationness_scores.squeeze(-1).detach())
 
             rel_dists.append(rel_dist_per_batch)
 
