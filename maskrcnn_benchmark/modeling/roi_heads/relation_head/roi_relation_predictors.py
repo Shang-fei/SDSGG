@@ -624,6 +624,8 @@ class ClipPredictor(nn.Module):
         self.mtmStructureWeight = mtmConfig.STRUCTURE_WEIGHT
         self.mtmVisualStructureWeight = mtmConfig.VISUAL_STRUCTURE_WEIGHT
         self.mtmTextStructureWeight = mtmConfig.TEXT_STRUCTURE_WEIGHT
+        self.mtmStructureLossType = str(mtmConfig.STRUCTURE_LOSS_TYPE).lower()
+        self.mtmStructureTemperature = mtmConfig.STRUCTURE_TEMPERATURE
         self.mtmMaxPairs = mtmConfig.MAX_PAIRS
         self.mtmUseInference = mtmConfig.ENABLED and mtmConfig.USE_INFERENCE
         self.mtmInferenceWeight = mtmConfig.INFERENCE_WEIGHT
@@ -633,11 +635,10 @@ class ClipPredictor(nn.Module):
         self.mtmDebugStep = 0
         prototypeConfig = mtmConfig.PROTOTYPE
         self.mtmPrototypeEnabled = mtmConfig.ENABLED and prototypeConfig.ENABLED
-        self.mtmPrototypePath = prototypeConfig.PATH
         self.mtmPrototypeWeight = prototypeConfig.WEIGHT
         self.mtmPrototypeTransferTemperature = prototypeConfig.TRANSFER_TEMPERATURE
-        self.mtmPrototypeMinInstances = prototypeConfig.MIN_INSTANCES_PER_PREDICATE
-        self.mtmPrototypeBank = None
+        self.mtmPrototypeMomentum = prototypeConfig.MOMENTUM
+        self.mtmPrototypeMinCount = prototypeConfig.MIN_COUNT
         self.relationnessEnabled = relationnessConfig.ENABLED
         self.relationnessLossEnabled = relationnessConfig.ENABLED and relationnessConfig.LOSS_ENABLED
         self.relationnessLossWeight = relationnessConfig.LOSS_WEIGHT
@@ -655,9 +656,17 @@ class ClipPredictor(nn.Module):
             hiddenDim=mtmConfig.EMBED_DIM // 2,
             dropout=mtmConfig.DROPOUT,
         ).to(self.device)
+        self.relNameToIndex = {name: idx for idx, name in enumerate(self.relNames)}
+        self.register_buffer(
+            "mtmPrototypeBank",
+            torch.zeros((len(self.relNames), mtmConfig.EMBED_DIM), dtype=torch.float32, device=self.device),
+        )
+        self.register_buffer(
+            "mtmPrototypeCounts",
+            torch.zeros(len(self.relNames), dtype=torch.float32, device=self.device),
+        )
         self.activeRelNames = self.trainRelNames
         self.filteredTripletEmbeddingCache = {}
-        self.loadMtmPrototypeBank()
 
     def encodeTripletTexts(self, tripletTexts):
         with torch.no_grad():
@@ -669,51 +678,101 @@ class ClipPredictor(nn.Module):
         texts = ["a photo of relation " + predicateName for predicateName in predicateNames]
         return self.encodeTripletTexts(texts)
 
-    def loadMtmPrototypeBank(self):
-        self.mtmPrototypeBank = None
-        if not self.mtmPrototypeEnabled or not self.mtmPrototypePath:
+    def updateMtmPrototypeBank(self, visualFeatures, relationLabels):
+        if not self.mtmPrototypeEnabled or visualFeatures.numel() == 0:
             return
-        if not os.path.exists(self.mtmPrototypePath):
-            print("MTM prototype file not found: " + str(self.mtmPrototypePath))
-            return
-        prototypeData = torch.load(self.mtmPrototypePath, map_location=self.device)
-        baseNames = list(prototypeData["predicate_names"])
-        basePrototypes = prototypeData["prototypes"].to(self.device).float()
-        baseCounts = prototypeData.get("counts", torch.ones(len(baseNames))).to(self.device)
+        with torch.no_grad():
+            momentum = float(self.mtmPrototypeMomentum)
+            for relationLabel in relationLabels.unique():
+                labelIndex = int(relationLabel.item())
+                if labelIndex <= 0 or labelIndex >= len(self.activeRelNames):
+                    continue
+                relationName = self.activeRelNames[labelIndex]
+                globalIndex = self.relNameToIndex.get(relationName)
+                if globalIndex is None:
+                    continue
+                mask = relationLabels == relationLabel
+                prototype = F.normalize(visualFeatures[mask].mean(dim=0, keepdim=True), dim=-1).squeeze(0)
+                if self.mtmPrototypeCounts[globalIndex] > 0:
+                    updated = self.mtmPrototypeBank[globalIndex] * momentum + prototype * (1.0 - momentum)
+                    self.mtmPrototypeBank[globalIndex].copy_(F.normalize(updated, dim=0))
+                else:
+                    self.mtmPrototypeBank[globalIndex].copy_(prototype)
+                self.mtmPrototypeCounts[globalIndex] += mask.sum().to(self.mtmPrototypeCounts.dtype)
 
-        validBase = baseCounts >= int(self.mtmPrototypeMinInstances)
-        if validBase.sum() == 0:
-            return
-        baseNames = [name for name, valid in zip(baseNames, validBase.detach().cpu().tolist()) if valid]
-        basePrototypes = F.normalize(basePrototypes[validBase], dim=-1)
-        baseNameToIndex = {name: idx for idx, name in enumerate(baseNames)}
+    def buildActiveMtmPrototypeBank(self, device):
+        if not self.mtmPrototypeEnabled:
+            return None
 
-        activeNames = list(self.activeRelNames)
-        activePrototypes = basePrototypes.new_zeros((len(activeNames), basePrototypes.size(1)))
+        validGlobal = self.mtmPrototypeCounts >= float(self.mtmPrototypeMinCount)
+        validGlobal = validGlobal & (torch.arange(len(self.relNames), device=self.mtmPrototypeCounts.device) > 0)
+        if validGlobal.sum() == 0:
+            return None
+
+        sourceIndices = torch.nonzero(validGlobal, as_tuple=False).view(-1)
+        sourceNames = [self.relNames[int(idx)] for idx in sourceIndices.detach().cpu().tolist()]
+        sourcePrototypes = F.normalize(self.mtmPrototypeBank.index_select(0, sourceIndices).to(device).float(), dim=-1)
+
+        activePrototypes = sourcePrototypes.new_zeros((len(self.activeRelNames), sourcePrototypes.size(1)))
         missingPositions = []
         missingNames = []
-        for idx, name in enumerate(activeNames):
-            if name == "__background__":
+        for activeIndex, relationName in enumerate(self.activeRelNames):
+            if activeIndex == 0 or relationName == "__background__":
                 continue
-            if name in baseNameToIndex:
-                activePrototypes[idx] = basePrototypes[baseNameToIndex[name]]
+            globalIndex = self.relNameToIndex.get(relationName)
+            if globalIndex is not None and self.mtmPrototypeCounts[globalIndex] >= float(self.mtmPrototypeMinCount):
+                activePrototypes[activeIndex] = self.mtmPrototypeBank[globalIndex].to(device).float()
             else:
-                missingPositions.append(idx)
-                missingNames.append(name)
+                missingPositions.append(activeIndex)
+                missingNames.append(relationName)
 
         if len(missingNames) > 0:
             with torch.no_grad():
-                missingText = self.encodePredicateTexts(missingNames)
-                baseText = self.encodePredicateTexts(baseNames)
-                similarity = torch.matmul(missingText, baseText.t())
+                missingText = self.encodePredicateTexts(missingNames).to(device)
+                sourceText = self.encodePredicateTexts(sourceNames).to(device)
+                similarity = torch.matmul(missingText, sourceText.t())
                 temperature = max(float(self.mtmPrototypeTransferTemperature), 1e-6)
                 weights = F.softmax(similarity / temperature, dim=1)
-                transferred = torch.matmul(weights, basePrototypes)
-                transferred = F.normalize(transferred, dim=-1)
-                for row, idx in enumerate(missingPositions):
-                    activePrototypes[idx] = transferred[row]
+                transferred = F.normalize(torch.matmul(weights, sourcePrototypes), dim=-1)
+                for row, activeIndex in enumerate(missingPositions):
+                    activePrototypes[activeIndex] = transferred[row]
 
-        self.mtmPrototypeBank = F.normalize(activePrototypes, dim=-1)
+        return F.normalize(activePrototypes, dim=-1)
+
+    def computeMtmStructureLosses(self, predicted_norm, adapted_visual_norm, target_norm, alignLoss):
+        if predicted_norm.size(0) < 2:
+            return alignLoss * 0.0, alignLoss * 0.0
+
+        predictedSimilarity = torch.matmul(predicted_norm, predicted_norm.t())
+        adaptedVisualSimilarity = torch.matmul(adapted_visual_norm, adapted_visual_norm.t())
+        targetSimilarity = torch.matmul(target_norm, target_norm.t())
+        offDiagonal = ~torch.eye(
+            predictedSimilarity.size(0),
+            dtype=torch.bool,
+            device=predictedSimilarity.device,
+        )
+
+        if self.mtmStructureLossType == "l1":
+            visualStructureLoss = (adaptedVisualSimilarity - predictedSimilarity).abs()[offDiagonal].mean()
+            textStructureLoss = (predictedSimilarity - targetSimilarity).abs()[offDiagonal].mean()
+            return visualStructureLoss, textStructureLoss
+
+        if self.mtmStructureLossType == "kl":
+            temperature = max(float(self.mtmStructureTemperature), 1e-6)
+            predictedLogProb = F.log_softmax(predictedSimilarity.masked_fill(~offDiagonal, -1e4) / temperature, dim=1)
+            visualProb = F.softmax(
+                adaptedVisualSimilarity.detach().masked_fill(~offDiagonal, -1e4) / temperature,
+                dim=1,
+            )
+            textProb = F.softmax(
+                targetSimilarity.detach().masked_fill(~offDiagonal, -1e4) / temperature,
+                dim=1,
+            )
+            visualStructureLoss = F.kl_div(predictedLogProb, visualProb, reduction="batchmean")
+            textStructureLoss = F.kl_div(predictedLogProb, textProb, reduction="batchmean")
+            return visualStructureLoss, textStructureLoss
+
+        raise ValueError("Unsupported MTM structure loss type: " + str(self.mtmStructureLossType))
 
     def buildTargetTripletTexts(self, subjLabels, relationLabels, objLabels):
         texts = []
@@ -901,20 +960,13 @@ class ClipPredictor(nn.Module):
         target_norm = F.normalize(target_embeddings.float(), dim=-1)
 
         alignLoss = (1.0 - (predicted_norm * target_norm).sum(dim=-1)).mean()
-        if predicted_norm.size(0) < 2:
-            visualStructureLoss = alignLoss * 0.0
-            textStructureLoss = alignLoss * 0.0
-        else:
-            predictedSimilarity = torch.matmul(predicted_norm, predicted_norm.t())
-            adaptedVisualSimilarity = torch.matmul(adapted_visual_norm, adapted_visual_norm.t())
-            targetSimilarity = torch.matmul(target_norm, target_norm.t())
-            offDiagonal = ~torch.eye(
-                predictedSimilarity.size(0),
-                dtype=torch.bool,
-                device=predictedSimilarity.device,
-            )
-            visualStructureLoss = (adaptedVisualSimilarity - predictedSimilarity).abs()[offDiagonal].mean()
-            textStructureLoss = (predictedSimilarity - targetSimilarity).abs()[offDiagonal].mean()
+        self.updateMtmPrototypeBank(adapted_visual_norm.detach(), relationLabels)
+        visualStructureLoss, textStructureLoss = self.computeMtmStructureLosses(
+            predicted_norm,
+            adapted_visual_norm,
+            target_norm,
+            alignLoss,
+        )
         if self.mtmDebugger is not None:
             self.maybeRecordTripletPromptSimilarity(target_norm, subjLabels, relationLabels, objLabels)
         return {
@@ -934,11 +986,11 @@ class ClipPredictor(nn.Module):
         }
 
     def computeMtmPrototypeScores(self, relationFeatures, outShape, outDtype):
-        if self.mtmPrototypeBank is None:
+        prototypeBank = self.buildActiveMtmPrototypeBank(relationFeatures.device)
+        if prototypeBank is None:
             return relationFeatures.new_zeros(outShape, dtype=outDtype)
         adaptedVisual = self.relationMtm.encode_visual(relationFeatures)
         adaptedVisual = F.normalize(adaptedVisual.float(), dim=-1)
-        prototypeBank = self.mtmPrototypeBank.to(adaptedVisual.device).float()
         scores = torch.matmul(adaptedVisual, prototypeBank.t())
         return scores[:, :outShape[1]].to(dtype=outDtype)
 
@@ -999,7 +1051,6 @@ class ClipPredictor(nn.Module):
         self.description_relation=torch.Tensor(self.description_relation).to(self.device)
         self.activeRelNames = self.trainRelNames if mode == self.trainPart else activeRelNames
         self.filteredTripletEmbeddingCache = {}
-        self.loadMtmPrototypeBank()
 
         with torch.no_grad():
             self.texts5=[]
