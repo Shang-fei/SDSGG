@@ -718,18 +718,28 @@ class ClipPredictor(nn.Module):
         loss = (positiveLoss + negativeLoss).sum() / normalizer
         return {"loss_mtm_relationness": self.relationnessLossWeight * loss}
 
-    def computeMtmContrastiveAlignLoss(self, predicted_norm, target_norm):
+    def computeMtmContrastiveAlignLoss(self, predicted_norm, target_norm, positiveMask):
         if predicted_norm.size(0) == 0:
             return predicted_norm.sum() * 0.0
         if predicted_norm.size(0) < 2:
             return (1.0 - (predicted_norm * target_norm).sum(dim=-1)).mean()
         temperature = max(float(self.mtmAlignTemperature), 1e-6)
-        labels = torch.arange(predicted_norm.size(0), device=predicted_norm.device)
         logits_i2t = torch.matmul(predicted_norm, target_norm.t()) / temperature
         logits_t2i = torch.matmul(target_norm, predicted_norm.t()) / temperature
-        loss_i2t = F.cross_entropy(logits_i2t, labels)
-        loss_t2i = F.cross_entropy(logits_t2i, labels)
+
+        logProb_i2t = F.log_softmax(logits_i2t, dim=1)
+        logProb_t2i = F.log_softmax(logits_t2i, dim=1)
+        positiveMask = positiveMask.to(device=predicted_norm.device, dtype=logProb_i2t.dtype)
+        normalizer = positiveMask.sum(dim=1).clamp(min=1.0)
+        loss_i2t = -(logProb_i2t * positiveMask).sum(dim=1) / normalizer
+        loss_t2i = -(logProb_t2i * positiveMask).sum(dim=1) / normalizer
+        loss_i2t = loss_i2t.mean()
+        loss_t2i = loss_t2i.mean()
         return 0.5 * (loss_i2t + loss_t2i)
+
+    def buildMtmPositiveMask(self, subjLabels, relationLabels, objLabels):
+        tripletLabels = torch.stack([subjLabels, relationLabels, objLabels], dim=1)
+        return (tripletLabels.unsqueeze(1) == tripletLabels.unsqueeze(0)).all(dim=-1)
 
     def computeMtmLosses(self, relationFeatures, relationLabels, subjLabels, objLabels):
         if not self.mtmLossEnabled or len(relationFeatures) == 0 or relationLabels is None:
@@ -783,7 +793,8 @@ class ClipPredictor(nn.Module):
         adapted_visual_norm = F.normalize(adapted_visual_features.float(), dim=-1)
         target_norm = F.normalize(target_embeddings.float(), dim=-1)
 
-        alignLoss = self.computeMtmContrastiveAlignLoss(predicted_norm, target_norm)
+        positiveMask = self.buildMtmPositiveMask(subjLabels, relationLabels, objLabels)
+        alignLoss = self.computeMtmContrastiveAlignLoss(predicted_norm, target_norm, positiveMask)
         if predicted_norm.size(0) < 2:
             visualStructureLoss = alignLoss * 0.0
             textStructureLoss = alignLoss * 0.0
@@ -799,7 +810,7 @@ class ClipPredictor(nn.Module):
             visualStructureLoss = (adaptedVisualSimilarity - predictedSimilarity).abs()[offDiagonal].mean()
             textStructureLoss = (predictedSimilarity - targetSimilarity).abs()[offDiagonal].mean()
         if self.mtmDebugger is not None:
-            self.mtmDebugger.record_alignment(predicted_norm, target_norm)
+            self.mtmDebugger.record_alignment(predicted_norm, target_norm, positiveMask)
             self.mtmDebugger.record_structure(adapted_visual_norm, predicted_norm, target_norm)
         return {
             "loss_mtm_align": self.mtmLossWeight * self.mtmAlignWeight * alignLoss,

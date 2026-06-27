@@ -28,32 +28,37 @@ class MTMDebugger(object):
         values = tensor.detach().float().view(-1)
         return values.std(unbiased=False).item()
 
-    def record_alignment(self, predicted_norm, target_norm):
+    def record_alignment(self, predicted_norm, target_norm, positive_mask=None):
         if predicted_norm.size(0) == 0:
             return
         with torch.no_grad():
             similarity = torch.matmul(predicted_norm.detach().float(), target_norm.detach().float().t())
-            labels = torch.arange(similarity.size(0), device=similarity.device)
-            pos_cos = similarity.diag()
-            self._update("alignment", "pos_cos", pos_cos.mean().item(), pos_cos.numel())
-
-            if similarity.size(0) > 1:
-                off_diagonal = ~torch.eye(
+            if positive_mask is None:
+                positive_mask = torch.eye(
                     similarity.size(0),
                     dtype=torch.bool,
                     device=similarity.device,
                 )
-                neg_cos = similarity[off_diagonal]
-                neg_mean = neg_cos.mean().item()
-                self._update("alignment", "neg_cos", neg_mean, neg_cos.numel())
-                self._update("alignment", "margin", pos_cos.mean().item() - neg_mean, pos_cos.numel())
+            else:
+                positive_mask = positive_mask.to(device=similarity.device, dtype=torch.bool)
+            pos_cos = similarity.diag()
+            self._update("alignment", "pos_cos", pos_cos.mean().item(), pos_cos.numel())
+
+            if similarity.size(0) > 1:
+                negative_mask = ~positive_mask
+                if negative_mask.any():
+                    neg_cos = similarity[negative_mask]
+                    neg_mean = neg_cos.mean().item()
+                    self._update("alignment", "neg_cos", neg_mean, neg_cos.numel())
+                    self._update("alignment", "margin", pos_cos.mean().item() - neg_mean, pos_cos.numel())
 
             top1 = similarity.argmax(dim=1)
-            self._update("alignment", "top1_acc", (top1 == labels).float().mean().item(), labels.numel())
+            top1_hit = positive_mask.gather(1, top1.view(-1, 1)).squeeze(1).float()
+            self._update("alignment", "top1_acc", top1_hit.mean().item(), top1_hit.numel())
             topk = min(5, similarity.size(1))
             top5 = similarity.topk(topk, dim=1)[1]
-            top5_hit = top5.eq(labels.view(-1, 1)).any(dim=1).float()
-            self._update("alignment", "top5_acc", top5_hit.mean().item(), labels.numel())
+            top5_hit = positive_mask.gather(1, top5).any(dim=1).float()
+            self._update("alignment", "top5_acc", top5_hit.mean().item(), top5_hit.numel())
         self.write()
 
     def record_structure(self, adapted_visual_norm, predicted_norm, target_norm):
