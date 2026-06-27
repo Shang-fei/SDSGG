@@ -624,11 +624,9 @@ class ClipPredictor(nn.Module):
         self.mtmStructureWeight = mtmConfig.STRUCTURE_WEIGHT
         self.mtmVisualStructureWeight = mtmConfig.VISUAL_STRUCTURE_WEIGHT
         self.mtmTextStructureWeight = mtmConfig.TEXT_STRUCTURE_WEIGHT
-        self.mtmAlignTemperature = mtmConfig.ALIGN_TEMPERATURE
         self.mtmMaxPairs = mtmConfig.MAX_PAIRS
         self.mtmUseInference = mtmConfig.ENABLED and mtmConfig.USE_INFERENCE
         self.mtmInferenceWeight = mtmConfig.INFERENCE_WEIGHT
-        self.mtmUseInferenceCalibration = mtmConfig.USE_INFERENCE_CALIBRATION
         self.mtmDebugger = MTMDebugger(config.OUTPUT_DIR) if mtmConfig.DEBUG else None
         self.mtmDebugTripletInterval = mtmConfig.DEBUG_TRIPLET_INTERVAL
         self.mtmDebugTripletMaxSamples = mtmConfig.DEBUG_TRIPLET_MAX_SAMPLES
@@ -815,29 +813,6 @@ class ClipPredictor(nn.Module):
         loss = (positiveLoss + negativeLoss).sum() / normalizer
         return {"loss_mtm_relationness": self.relationnessLossWeight * loss}
 
-    def computeMtmContrastiveAlignLoss(self, predicted_norm, target_norm, positiveMask):
-        if predicted_norm.size(0) == 0:
-            return predicted_norm.sum() * 0.0
-        if predicted_norm.size(0) < 2:
-            return (1.0 - (predicted_norm * target_norm).sum(dim=-1)).mean()
-        temperature = max(float(self.mtmAlignTemperature), 1e-6)
-        logits_i2t = torch.matmul(predicted_norm, target_norm.t()) / temperature
-        logits_t2i = torch.matmul(target_norm, predicted_norm.t()) / temperature
-
-        logProb_i2t = F.log_softmax(logits_i2t, dim=1)
-        logProb_t2i = F.log_softmax(logits_t2i, dim=1)
-        positiveMask = positiveMask.to(device=predicted_norm.device, dtype=logProb_i2t.dtype)
-        normalizer = positiveMask.sum(dim=1).clamp(min=1.0)
-        loss_i2t = -(logProb_i2t * positiveMask).sum(dim=1) / normalizer
-        loss_t2i = -(logProb_t2i * positiveMask).sum(dim=1) / normalizer
-        loss_i2t = loss_i2t.mean()
-        loss_t2i = loss_t2i.mean()
-        return 0.5 * (loss_i2t + loss_t2i)
-
-    def buildMtmPositiveMask(self, subjLabels, relationLabels, objLabels):
-        tripletLabels = torch.stack([subjLabels, relationLabels, objLabels], dim=1)
-        return (tripletLabels.unsqueeze(1) == tripletLabels.unsqueeze(0)).all(dim=-1)
-
     def maybeRecordTripletPromptSimilarity(self, target_norm, subjLabels, relationLabels, objLabels):
         if self.mtmDebugger is None or self.mtmDebugTripletInterval <= 0:
             return
@@ -925,8 +900,7 @@ class ClipPredictor(nn.Module):
         adapted_visual_norm = F.normalize(adapted_visual_features.float(), dim=-1)
         target_norm = F.normalize(target_embeddings.float(), dim=-1)
 
-        positiveMask = self.buildMtmPositiveMask(subjLabels, relationLabels, objLabels)
-        alignLoss = self.computeMtmContrastiveAlignLoss(predicted_norm, target_norm, positiveMask)
+        alignLoss = (1.0 - (predicted_norm * target_norm).sum(dim=-1)).mean()
         if predicted_norm.size(0) < 2:
             visualStructureLoss = alignLoss * 0.0
             textStructureLoss = alignLoss * 0.0
@@ -942,8 +916,6 @@ class ClipPredictor(nn.Module):
             visualStructureLoss = (adaptedVisualSimilarity - predictedSimilarity).abs()[offDiagonal].mean()
             textStructureLoss = (predictedSimilarity - targetSimilarity).abs()[offDiagonal].mean()
         if self.mtmDebugger is not None:
-            self.mtmDebugger.record_alignment(predicted_norm, target_norm, positiveMask)
-            self.mtmDebugger.record_structure(adapted_visual_norm, predicted_norm, target_norm)
             self.maybeRecordTripletPromptSimilarity(target_norm, subjLabels, relationLabels, objLabels)
         return {
             "loss_mtm_align": self.mtmLossWeight * self.mtmAlignWeight * alignLoss,
@@ -960,12 +932,6 @@ class ClipPredictor(nn.Module):
                 * textStructureLoss
             ),
         }
-
-    def calibrateMtmScores(self, scores):
-        scoreMean = scores.mean(dim=1, keepdim=True)
-        centeredScores = scores - scoreMean
-        scoreStd = torch.sqrt(centeredScores.pow(2).mean(dim=1, keepdim=True).clamp(min=1e-6))
-        return centeredScores / scoreStd
 
     def computeMtmPrototypeScores(self, relationFeatures, outShape, outDtype):
         if self.mtmPrototypeBank is None:
@@ -1133,6 +1099,7 @@ class ClipPredictor(nn.Module):
             need_mtm_features = (
                 (self.training and self.mtmLossEnabled)
                 or ((not self.training) and self.mtmUseInference and self.mtmInferenceWeight != 0)
+                or ((not self.training) and self.mtmPrototypeEnabled and self.mtmPrototypeWeight != 0)
             )
             if need_mtm_features:
                 mtm_pair_idx = pair_idx
@@ -1215,26 +1182,13 @@ class ClipPredictor(nn.Module):
                         rel_dist_per_batch.shape,
                         rel_dist_per_batch.dtype,
                     )
-                    mtmScores = rawMtmScores
-                    if self.mtmUseInferenceCalibration:
-                        mtmScores = self.calibrateMtmScores(rawMtmScores)
-                    baseRelDist = rel_dist_per_batch
-                    rel_dist_per_batch = rel_dist_per_batch + self.mtmInferenceWeight * mtmScores
-                    if self.mtmDebugger is not None:
-                        self.mtmDebugger.record_fusion(
-                            baseRelDist,
-                            rawMtmScores,
-                            mtmScores,
-                            rel_dist_per_batch,
-                        )
+                    rel_dist_per_batch = rel_dist_per_batch + self.mtmInferenceWeight * rawMtmScores
                 if self.mtmPrototypeEnabled and self.mtmPrototypeWeight != 0 and mtm_relation_features is not None:
                     prototypeScores = self.computeMtmPrototypeScores(
                         mtm_relation_features,
                         rel_dist_per_batch.shape,
                         rel_dist_per_batch.dtype,
                     )
-                    if self.mtmUseInferenceCalibration:
-                        prototypeScores = self.calibrateMtmScores(prototypeScores)
                     rel_dist_per_batch = rel_dist_per_batch + self.mtmPrototypeWeight * prototypeScores
                 if self.useRelationnessInference:
                     proposals[i].add_field("relationness_scores", relationness_scores.squeeze(-1).detach())

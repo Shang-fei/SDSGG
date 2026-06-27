@@ -83,28 +83,6 @@ class MTMDebugger(object):
             self._update("structure", "text_structure_error", text_error.mean().item(), text_error.numel())
         self.write()
 
-    def record_fusion(self, base_scores, mtm_scores, calibrated_scores, fused_scores):
-        if mtm_scores is None or mtm_scores.numel() == 0:
-            return
-        with torch.no_grad():
-            mtm_values = mtm_scores.detach().float().view(-1)
-            calibrated_values = calibrated_scores.detach().float().view(-1)
-            self._update("fusion", "mtm_score_mean", mtm_values.mean().item(), mtm_values.numel())
-            self._update("fusion", "mtm_score_std", self._std(mtm_values), 1)
-            self._update(
-                "fusion",
-                "mtm_score_calibrated_mean",
-                calibrated_values.mean().item(),
-                calibrated_values.numel(),
-            )
-            self._update("fusion", "mtm_score_calibrated_std", self._std(calibrated_values), 1)
-            if base_scores is not None and fused_scores is not None and base_scores.numel() > 0:
-                base_top1 = base_scores.detach().float().argmax(dim=1)
-                fused_top1 = fused_scores.detach().float().argmax(dim=1)
-                changed = (base_top1 != fused_top1).float()
-                self._update("fusion", "top1_changed", changed.mean().item(), changed.numel())
-        self.write()
-
     def record_triplet_similarity(
         self,
         step,
