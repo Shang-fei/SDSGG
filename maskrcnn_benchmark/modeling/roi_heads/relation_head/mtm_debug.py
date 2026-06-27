@@ -102,10 +102,22 @@ class MTMDebugger(object):
                 canonical_embeddings.detach().float(),
                 canonical_embeddings.detach().float().t(),
             )
+            selected_indices = [int(index) for index in selected_indices]
+            selected_tensor = torch.tensor(selected_indices, dtype=torch.long, device=canonical_similarity.device)
+            selected_similarity = canonical_similarity.index_select(0, selected_tensor).index_select(1, selected_tensor)
+            selected_triplets = [
+                {
+                    "index": index,
+                    "prompt": triplet_records[index]["prompt"],
+                    "subject": triplet_records[index]["subject"],
+                    "relation": triplet_records[index]["relation"],
+                    "object": triplet_records[index]["object"],
+                }
+                for index in selected_indices
+            ]
             entries = []
             variant_offset = 0
             for selected_index in selected_indices:
-                selected_index = int(selected_index)
                 row = canonical_similarity[selected_index]
                 other_mask = torch.ones(row.size(0), dtype=torch.bool, device=row.device)
                 other_mask[selected_index] = False
@@ -174,6 +186,8 @@ class MTMDebugger(object):
                 handle.write(json.dumps({
                     "step": int(step),
                     "num_triplets": len(triplet_records),
+                    "selected_triplets": selected_triplets,
+                    "selected_triplet_similarity_matrix": selected_similarity.detach().cpu().tolist(),
                     "entries": entries,
                 }, sort_keys=True) + "\n")
 
