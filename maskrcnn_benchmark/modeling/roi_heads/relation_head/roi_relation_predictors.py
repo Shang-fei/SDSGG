@@ -17,6 +17,7 @@ from .utils_motifs import obj_edge_vectors
 from .model_motifs_with_attribute import AttributeLSTMContext
 from .model_transformer import TransformerContext
 from .utils_relation import layer_init, get_box_info, get_box_pair_info
+from .mtm_debug import MTMDebugger
 from maskrcnn_benchmark.data import get_dataset_statistics
 from CLIP import clip
 import time
@@ -621,9 +622,14 @@ class ClipPredictor(nn.Module):
         self.mtmLossWeight = mtmConfig.LOSS_WEIGHT
         self.mtmAlignWeight = mtmConfig.ALIGN_WEIGHT
         self.mtmStructureWeight = mtmConfig.STRUCTURE_WEIGHT
+        self.mtmVisualStructureWeight = mtmConfig.VISUAL_STRUCTURE_WEIGHT
+        self.mtmTextStructureWeight = mtmConfig.TEXT_STRUCTURE_WEIGHT
+        self.mtmAlignTemperature = mtmConfig.ALIGN_TEMPERATURE
         self.mtmMaxPairs = mtmConfig.MAX_PAIRS
         self.mtmUseInference = mtmConfig.ENABLED and mtmConfig.USE_INFERENCE
         self.mtmInferenceWeight = mtmConfig.INFERENCE_WEIGHT
+        self.mtmUseInferenceCalibration = mtmConfig.USE_INFERENCE_CALIBRATION
+        self.mtmDebugger = MTMDebugger(config.OUTPUT_DIR) if mtmConfig.DEBUG else None
         self.relationnessEnabled = relationnessConfig.ENABLED
         self.relationnessLossEnabled = relationnessConfig.ENABLED and relationnessConfig.LOSS_ENABLED
         self.relationnessLossWeight = relationnessConfig.LOSS_WEIGHT
@@ -712,6 +718,19 @@ class ClipPredictor(nn.Module):
         loss = (positiveLoss + negativeLoss).sum() / normalizer
         return {"loss_mtm_relationness": self.relationnessLossWeight * loss}
 
+    def computeMtmContrastiveAlignLoss(self, predicted_norm, target_norm):
+        if predicted_norm.size(0) == 0:
+            return predicted_norm.sum() * 0.0
+        if predicted_norm.size(0) < 2:
+            return (1.0 - (predicted_norm * target_norm).sum(dim=-1)).mean()
+        temperature = max(float(self.mtmAlignTemperature), 1e-6)
+        labels = torch.arange(predicted_norm.size(0), device=predicted_norm.device)
+        logits_i2t = torch.matmul(predicted_norm, target_norm.t()) / temperature
+        logits_t2i = torch.matmul(target_norm, predicted_norm.t()) / temperature
+        loss_i2t = F.cross_entropy(logits_i2t, labels)
+        loss_t2i = F.cross_entropy(logits_t2i, labels)
+        return 0.5 * (loss_i2t + loss_t2i)
+
     def computeMtmLosses(self, relationFeatures, relationLabels, subjLabels, objLabels):
         if not self.mtmLossEnabled or len(relationFeatures) == 0 or relationLabels is None:
             zero = self.relationMtm.norm.weight.sum() * 0.0
@@ -764,7 +783,7 @@ class ClipPredictor(nn.Module):
         adapted_visual_norm = F.normalize(adapted_visual_features.float(), dim=-1)
         target_norm = F.normalize(target_embeddings.float(), dim=-1)
 
-        alignLoss = (1.0 - (predicted_norm * target_norm).sum(dim=-1)).mean()
+        alignLoss = self.computeMtmContrastiveAlignLoss(predicted_norm, target_norm)
         if predicted_norm.size(0) < 2:
             visualStructureLoss = alignLoss * 0.0
             textStructureLoss = alignLoss * 0.0
@@ -779,11 +798,30 @@ class ClipPredictor(nn.Module):
             )
             visualStructureLoss = (adaptedVisualSimilarity - predictedSimilarity).abs()[offDiagonal].mean()
             textStructureLoss = (predictedSimilarity - targetSimilarity).abs()[offDiagonal].mean()
+        if self.mtmDebugger is not None:
+            self.mtmDebugger.record_alignment(predicted_norm, target_norm)
+            self.mtmDebugger.record_structure(adapted_visual_norm, predicted_norm, target_norm)
         return {
             "loss_mtm_align": self.mtmLossWeight * self.mtmAlignWeight * alignLoss,
-            "loss_mtm_visual_structure": self.mtmLossWeight * self.mtmStructureWeight * visualStructureLoss,
-            "loss_mtm_text_structure": self.mtmLossWeight * self.mtmStructureWeight * textStructureLoss,
+            "loss_mtm_visual_structure": (
+                self.mtmLossWeight
+                * self.mtmStructureWeight
+                * self.mtmVisualStructureWeight
+                * visualStructureLoss
+            ),
+            "loss_mtm_text_structure": (
+                self.mtmLossWeight
+                * self.mtmStructureWeight
+                * self.mtmTextStructureWeight
+                * textStructureLoss
+            ),
         }
+
+    def calibrateMtmScores(self, scores):
+        scoreMean = scores.mean(dim=1, keepdim=True)
+        centeredScores = scores - scoreMean
+        scoreStd = torch.sqrt(centeredScores.pow(2).mean(dim=1, keepdim=True).clamp(min=1e-6))
+        return centeredScores / scoreStd
 
     def computeMtmInferenceScores(self, relationFeatures, subjLabels, objLabels, outShape, outDtype):
         predicted_embeddings = F.normalize(self.relationMtm(relationFeatures).float(), dim=-1)
@@ -1016,14 +1054,25 @@ class ClipPredictor(nn.Module):
                     filter_scores.index_copy_(0, rel_pos, scores.to(dtype=filter_scores.dtype))
                 rel_dist_per_batch = description_scores * 0.2 + filter_scores * 0.8
                 if self.mtmUseInference and self.mtmInferenceWeight != 0:
-                    mtmScores = self.computeMtmInferenceScores(
+                    rawMtmScores = self.computeMtmInferenceScores(
                         mtm_relation_features,
                         obj_n1,
                         obj_n2,
                         rel_dist_per_batch.shape,
                         rel_dist_per_batch.dtype,
                     )
+                    mtmScores = rawMtmScores
+                    if self.mtmUseInferenceCalibration:
+                        mtmScores = self.calibrateMtmScores(rawMtmScores)
+                    baseRelDist = rel_dist_per_batch
                     rel_dist_per_batch = rel_dist_per_batch + self.mtmInferenceWeight * mtmScores
+                    if self.mtmDebugger is not None:
+                        self.mtmDebugger.record_fusion(
+                            baseRelDist,
+                            rawMtmScores,
+                            mtmScores,
+                            rel_dist_per_batch,
+                        )
                 if self.useRelationnessInference:
                     proposals[i].add_field("relationness_scores", relationness_scores.squeeze(-1).detach())
 
