@@ -10,6 +10,7 @@ class MTMDebugger(object):
     def __init__(self, output_dir):
         self.output_dir = output_dir or "."
         self.output_path = os.path.join(self.output_dir, "mtm_debug_summary.json")
+        self.triplet_similarity_path = os.path.join(self.output_dir, "mtm_triplet_similarity.jsonl")
         self.stats = {}
 
     def _update(self, group, name, value, count=1):
@@ -104,6 +105,100 @@ class MTMDebugger(object):
                 self._update("fusion", "top1_changed", changed.mean().item(), changed.numel())
         self.write()
 
+    def record_triplet_similarity(
+        self,
+        step,
+        triplet_records,
+        canonical_embeddings,
+        variant_embeddings,
+        variant_counts,
+        selected_indices,
+    ):
+        if not is_main_process():
+            return
+        if canonical_embeddings.size(0) < 2 or len(selected_indices) == 0:
+            return
+
+        with torch.no_grad():
+            canonical_similarity = torch.matmul(
+                canonical_embeddings.detach().float(),
+                canonical_embeddings.detach().float().t(),
+            )
+            entries = []
+            variant_offset = 0
+            for selected_index in selected_indices:
+                selected_index = int(selected_index)
+                row = canonical_similarity[selected_index]
+                other_mask = torch.ones(row.size(0), dtype=torch.bool, device=row.device)
+                other_mask[selected_index] = False
+                other_scores = row[other_mask]
+                other_indices = torch.nonzero(other_mask, as_tuple=False).view(-1)
+
+                max_pos = other_scores.argmax().item()
+                min_pos = other_scores.argmin().item()
+                most_index = int(other_indices[max_pos].item())
+                least_index = int(other_indices[min_pos].item())
+
+                variant_count = int(variant_counts[selected_index])
+                variant_slice = variant_embeddings[variant_offset: variant_offset + variant_count]
+                variant_offset += variant_count
+                canonical_vector = canonical_embeddings[selected_index:selected_index + 1].detach().float()
+                variant_scores = torch.matmul(variant_slice.detach().float(), canonical_vector.t()).view(-1)
+                variant_pair_similarity = torch.matmul(
+                    variant_slice.detach().float(),
+                    variant_slice.detach().float().t(),
+                )
+                if variant_count > 1:
+                    variant_off_diagonal = ~torch.eye(
+                        variant_count,
+                        dtype=torch.bool,
+                        device=variant_pair_similarity.device,
+                    )
+                    variant_pair_scores = variant_pair_similarity[variant_off_diagonal]
+                    variant_pair_mean = variant_pair_scores.mean().item()
+                    variant_pair_std = self._std(variant_pair_scores)
+                else:
+                    variant_pair_mean = 1.0
+                    variant_pair_std = 0.0
+
+                record = triplet_records[selected_index]
+                entries.append({
+                    "index": selected_index,
+                    "subject": record["subject"],
+                    "relation": record["relation"],
+                    "object": record["object"],
+                    "prompt": record["prompt"],
+                    "other_prompt_similarity_mean": other_scores.mean().item(),
+                    "other_prompt_similarity_std": self._std(other_scores),
+                    "most_similar": {
+                        "index": most_index,
+                        "prompt": triplet_records[most_index]["prompt"],
+                        "similarity": other_scores[max_pos].item(),
+                    },
+                    "least_similar": {
+                        "index": least_index,
+                        "prompt": triplet_records[least_index]["prompt"],
+                        "similarity": other_scores[min_pos].item(),
+                    },
+                    "prompt_variants": [
+                        {
+                            "prompt": prompt,
+                            "similarity_to_canonical": variant_scores[i].item(),
+                        }
+                        for i, prompt in enumerate(record["variants"])
+                    ],
+                    "variant_pair_similarity_mean": variant_pair_mean,
+                    "variant_pair_similarity_std": variant_pair_std,
+                })
+
+            self._ensure_output_dir()
+            with open(self.triplet_similarity_path, "a") as handle:
+                handle.write(json.dumps({
+                    "step": int(step),
+                    "num_triplets": len(triplet_records),
+                    "entries": entries,
+                }, sort_keys=True) + "\n")
+
     def summary(self):
         output = {}
         for group, values in self.stats.items():
@@ -118,7 +213,10 @@ class MTMDebugger(object):
     def write(self):
         if not is_main_process():
             return
-        if not os.path.isdir(self.output_dir):
-            os.makedirs(self.output_dir)
+        self._ensure_output_dir()
         with open(self.output_path, "w") as handle:
             json.dump(self.summary(), handle, indent=2, sort_keys=True)
+
+    def _ensure_output_dir(self):
+        if not os.path.isdir(self.output_dir):
+            os.makedirs(self.output_dir)

@@ -630,6 +630,16 @@ class ClipPredictor(nn.Module):
         self.mtmInferenceWeight = mtmConfig.INFERENCE_WEIGHT
         self.mtmUseInferenceCalibration = mtmConfig.USE_INFERENCE_CALIBRATION
         self.mtmDebugger = MTMDebugger(config.OUTPUT_DIR) if mtmConfig.DEBUG else None
+        self.mtmDebugTripletInterval = mtmConfig.DEBUG_TRIPLET_INTERVAL
+        self.mtmDebugTripletMaxSamples = mtmConfig.DEBUG_TRIPLET_MAX_SAMPLES
+        self.mtmDebugStep = 0
+        prototypeConfig = mtmConfig.PROTOTYPE
+        self.mtmPrototypeEnabled = mtmConfig.ENABLED and prototypeConfig.ENABLED
+        self.mtmPrototypePath = prototypeConfig.PATH
+        self.mtmPrototypeWeight = prototypeConfig.WEIGHT
+        self.mtmPrototypeTransferTemperature = prototypeConfig.TRANSFER_TEMPERATURE
+        self.mtmPrototypeMinInstances = prototypeConfig.MIN_INSTANCES_PER_PREDICATE
+        self.mtmPrototypeBank = None
         self.relationnessEnabled = relationnessConfig.ENABLED
         self.relationnessLossEnabled = relationnessConfig.ENABLED and relationnessConfig.LOSS_ENABLED
         self.relationnessLossWeight = relationnessConfig.LOSS_WEIGHT
@@ -649,12 +659,63 @@ class ClipPredictor(nn.Module):
         ).to(self.device)
         self.activeRelNames = self.trainRelNames
         self.filteredTripletEmbeddingCache = {}
+        self.loadMtmPrototypeBank()
 
     def encodeTripletTexts(self, tripletTexts):
         with torch.no_grad():
             tripletTokens = clip.tokenize(tripletTexts).to(self.device)
             tripletTextFeatures = self.clip_model.encode_text(tripletTokens).float()
             return F.normalize(tripletTextFeatures, dim=-1)
+
+    def encodePredicateTexts(self, predicateNames):
+        texts = ["a photo of relation " + predicateName for predicateName in predicateNames]
+        return self.encodeTripletTexts(texts)
+
+    def loadMtmPrototypeBank(self):
+        self.mtmPrototypeBank = None
+        if not self.mtmPrototypeEnabled or not self.mtmPrototypePath:
+            return
+        if not os.path.exists(self.mtmPrototypePath):
+            print("MTM prototype file not found: " + str(self.mtmPrototypePath))
+            return
+        prototypeData = torch.load(self.mtmPrototypePath, map_location=self.device)
+        baseNames = list(prototypeData["predicate_names"])
+        basePrototypes = prototypeData["prototypes"].to(self.device).float()
+        baseCounts = prototypeData.get("counts", torch.ones(len(baseNames))).to(self.device)
+
+        validBase = baseCounts >= int(self.mtmPrototypeMinInstances)
+        if validBase.sum() == 0:
+            return
+        baseNames = [name for name, valid in zip(baseNames, validBase.detach().cpu().tolist()) if valid]
+        basePrototypes = F.normalize(basePrototypes[validBase], dim=-1)
+        baseNameToIndex = {name: idx for idx, name in enumerate(baseNames)}
+
+        activeNames = list(self.activeRelNames)
+        activePrototypes = basePrototypes.new_zeros((len(activeNames), basePrototypes.size(1)))
+        missingPositions = []
+        missingNames = []
+        for idx, name in enumerate(activeNames):
+            if name == "__background__":
+                continue
+            if name in baseNameToIndex:
+                activePrototypes[idx] = basePrototypes[baseNameToIndex[name]]
+            else:
+                missingPositions.append(idx)
+                missingNames.append(name)
+
+        if len(missingNames) > 0:
+            with torch.no_grad():
+                missingText = self.encodePredicateTexts(missingNames)
+                baseText = self.encodePredicateTexts(baseNames)
+                similarity = torch.matmul(missingText, baseText.t())
+                temperature = max(float(self.mtmPrototypeTransferTemperature), 1e-6)
+                weights = F.softmax(similarity / temperature, dim=1)
+                transferred = torch.matmul(weights, basePrototypes)
+                transferred = F.normalize(transferred, dim=-1)
+                for row, idx in enumerate(missingPositions):
+                    activePrototypes[idx] = transferred[row]
+
+        self.mtmPrototypeBank = F.normalize(activePrototypes, dim=-1)
 
     def buildTargetTripletTexts(self, subjLabels, relationLabels, objLabels):
         texts = []
@@ -676,6 +737,42 @@ class ClipPredictor(nn.Module):
             objName = self.obj_names[int(objLabel)]
             texts.append("a photo of a " + subjName + " " + relationName + " a " + objName)
         return texts
+
+    def buildTripletPromptVariants(self, subjName, relationName, objName):
+        return [
+            "a photo of a " + subjName + " " + relationName + " a " + objName,
+            "a scene where a " + subjName + " is " + relationName + " a " + objName,
+            "a visual relation of " + subjName + " " + relationName + " " + objName,
+            "a " + subjName + " and a " + objName + " with relation " + relationName,
+        ]
+
+    def buildTargetTripletRecords(self, subjLabels, relationLabels, objLabels):
+        records = []
+        for subjLabel, relationLabel, objLabel in zip(
+            subjLabels.detach().cpu().tolist(),
+            relationLabels.detach().cpu().tolist(),
+            objLabels.detach().cpu().tolist(),
+        ):
+            subjName = self.obj_names[int(subjLabel)]
+            relIndex = int(relationLabel)
+            if relIndex >= len(self.activeRelNames):
+                raise ValueError(
+                    "MTM relation label {} is outside active relation names length {}. "
+                    "The dataset relation labels and MTM relation-name table are misaligned.".format(
+                        relIndex, len(self.activeRelNames)
+                    )
+                )
+            relationName = self.activeRelNames[relIndex]
+            objName = self.obj_names[int(objLabel)]
+            variants = self.buildTripletPromptVariants(subjName, relationName, objName)
+            records.append({
+                "subject": subjName,
+                "relation": relationName,
+                "object": objName,
+                "prompt": variants[0],
+                "variants": variants,
+            })
+        return records
 
     def buildFilteredTripletTexts(self, subjLabel, objLabels):
         texts = []
@@ -740,6 +837,41 @@ class ClipPredictor(nn.Module):
     def buildMtmPositiveMask(self, subjLabels, relationLabels, objLabels):
         tripletLabels = torch.stack([subjLabels, relationLabels, objLabels], dim=1)
         return (tripletLabels.unsqueeze(1) == tripletLabels.unsqueeze(0)).all(dim=-1)
+
+    def maybeRecordTripletPromptSimilarity(self, target_norm, subjLabels, relationLabels, objLabels):
+        if self.mtmDebugger is None or self.mtmDebugTripletInterval <= 0:
+            return
+        self.mtmDebugStep += 1
+        if self.mtmDebugStep % self.mtmDebugTripletInterval != 0:
+            return
+        if target_norm.size(0) < 2:
+            return
+
+        records = self.buildTargetTripletRecords(subjLabels, relationLabels, objLabels)
+        maxSamples = max(int(self.mtmDebugTripletMaxSamples), 1)
+        if target_norm.size(0) <= maxSamples:
+            selectedIndices = list(range(target_norm.size(0)))
+        else:
+            selectedIndices = torch.linspace(
+                0,
+                target_norm.size(0) - 1,
+                steps=maxSamples,
+                device=target_norm.device,
+            ).long().detach().cpu().tolist()
+
+        variantTexts = []
+        variantCounts = [len(record["variants"]) for record in records]
+        for selectedIndex in selectedIndices:
+            variantTexts.extend(records[int(selectedIndex)]["variants"])
+        variantEmbeddings = self.encodeTripletTexts(variantTexts).to(target_norm.device)
+        self.mtmDebugger.record_triplet_similarity(
+            self.mtmDebugStep,
+            records,
+            target_norm,
+            variantEmbeddings,
+            variantCounts,
+            selectedIndices,
+        )
 
     def computeMtmLosses(self, relationFeatures, relationLabels, subjLabels, objLabels):
         if not self.mtmLossEnabled or len(relationFeatures) == 0 or relationLabels is None:
@@ -812,6 +944,7 @@ class ClipPredictor(nn.Module):
         if self.mtmDebugger is not None:
             self.mtmDebugger.record_alignment(predicted_norm, target_norm, positiveMask)
             self.mtmDebugger.record_structure(adapted_visual_norm, predicted_norm, target_norm)
+            self.maybeRecordTripletPromptSimilarity(target_norm, subjLabels, relationLabels, objLabels)
         return {
             "loss_mtm_align": self.mtmLossWeight * self.mtmAlignWeight * alignLoss,
             "loss_mtm_visual_structure": (
@@ -833,6 +966,15 @@ class ClipPredictor(nn.Module):
         centeredScores = scores - scoreMean
         scoreStd = torch.sqrt(centeredScores.pow(2).mean(dim=1, keepdim=True).clamp(min=1e-6))
         return centeredScores / scoreStd
+
+    def computeMtmPrototypeScores(self, relationFeatures, outShape, outDtype):
+        if self.mtmPrototypeBank is None:
+            return relationFeatures.new_zeros(outShape, dtype=outDtype)
+        adaptedVisual = self.relationMtm.encode_visual(relationFeatures)
+        adaptedVisual = F.normalize(adaptedVisual.float(), dim=-1)
+        prototypeBank = self.mtmPrototypeBank.to(adaptedVisual.device).float()
+        scores = torch.matmul(adaptedVisual, prototypeBank.t())
+        return scores[:, :outShape[1]].to(dtype=outDtype)
 
     def computeMtmInferenceScores(self, relationFeatures, subjLabels, objLabels, outShape, outDtype):
         predicted_embeddings = F.normalize(self.relationMtm(relationFeatures).float(), dim=-1)
@@ -891,6 +1033,7 @@ class ClipPredictor(nn.Module):
         self.description_relation=torch.Tensor(self.description_relation).to(self.device)
         self.activeRelNames = self.trainRelNames if mode == self.trainPart else activeRelNames
         self.filteredTripletEmbeddingCache = {}
+        self.loadMtmPrototypeBank()
 
         with torch.no_grad():
             self.texts5=[]
@@ -1084,6 +1227,15 @@ class ClipPredictor(nn.Module):
                             mtmScores,
                             rel_dist_per_batch,
                         )
+                if self.mtmPrototypeEnabled and self.mtmPrototypeWeight != 0 and mtm_relation_features is not None:
+                    prototypeScores = self.computeMtmPrototypeScores(
+                        mtm_relation_features,
+                        rel_dist_per_batch.shape,
+                        rel_dist_per_batch.dtype,
+                    )
+                    if self.mtmUseInferenceCalibration:
+                        prototypeScores = self.calibrateMtmScores(prototypeScores)
+                    rel_dist_per_batch = rel_dist_per_batch + self.mtmPrototypeWeight * prototypeScores
                 if self.useRelationnessInference:
                     proposals[i].add_field("relationness_scores", relationness_scores.squeeze(-1).detach())
 
