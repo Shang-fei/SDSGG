@@ -752,13 +752,16 @@ class ClipPredictor(nn.Module):
             device=predictedSimilarity.device,
         )
 
+        temperature = max(float(self.mtmStructureTemperature), 1e-6)
         if self.mtmStructureLossType == "l1":
+            predictedSimilarity = predictedSimilarity / temperature
+            adaptedVisualSimilarity = adaptedVisualSimilarity / temperature
+            targetSimilarity = targetSimilarity / temperature
             visualStructureLoss = (adaptedVisualSimilarity - predictedSimilarity).abs()[offDiagonal].mean()
             textStructureLoss = (predictedSimilarity - targetSimilarity).abs()[offDiagonal].mean()
             return visualStructureLoss, textStructureLoss
 
         if self.mtmStructureLossType == "kl":
-            temperature = max(float(self.mtmStructureTemperature), 1e-6)
             predictedLogProb = F.log_softmax(predictedSimilarity.masked_fill(~offDiagonal, -1e4) / temperature, dim=1)
             visualProb = F.softmax(
                 adaptedVisualSimilarity.detach().masked_fill(~offDiagonal, -1e4) / temperature,
