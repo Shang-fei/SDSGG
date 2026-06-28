@@ -83,6 +83,38 @@ class MTMDebugger(object):
             self._update("structure", "text_structure_error", text_error.mean().item(), text_error.numel())
         self.write()
 
+    def record_factorized_prompt_distribution(
+        self,
+        sub_mu,
+        obj_mu,
+        pred_mu,
+        triplet_mu,
+        sub_sigma,
+        obj_sigma,
+        pred_sigma,
+    ):
+        if sub_mu.size(0) == 0:
+            return
+
+        def update_similarity(name, features):
+            if features.size(0) < 2:
+                return
+            similarity = torch.matmul(features.detach().float(), features.detach().float().t())
+            off_diagonal = ~torch.eye(similarity.size(0), dtype=torch.bool, device=similarity.device)
+            values = similarity[off_diagonal]
+            self._update("factorized_prompt", name + "_similarity_mean", values.mean().item(), values.numel())
+            self._update("factorized_prompt", name + "_similarity_std", self._std(values), values.numel())
+
+        with torch.no_grad():
+            update_similarity("sub", sub_mu)
+            update_similarity("obj", obj_mu)
+            update_similarity("predicate", pred_mu)
+            update_similarity("triplet", triplet_mu)
+            self._update("factorized_prompt", "sub_sigma_mean", sub_sigma.detach().float().mean().item(), sub_sigma.numel())
+            self._update("factorized_prompt", "obj_sigma_mean", obj_sigma.detach().float().mean().item(), obj_sigma.numel())
+            self._update("factorized_prompt", "predicate_sigma_mean", pred_sigma.detach().float().mean().item(), pred_sigma.numel())
+        self.write()
+
     def record_triplet_similarity(
         self,
         step,

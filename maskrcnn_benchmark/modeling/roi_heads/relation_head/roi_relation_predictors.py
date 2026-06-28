@@ -194,6 +194,60 @@ class RelationModalityTransfer(nn.Module):
         return self.encode_text_space(visualFeatures)
 
 
+class PromptDistributionLearner(nn.Module):
+    def __init__(self, clipModel, promptNum=4, ctxLen=4, initStd=0.02, device="cuda"):
+        super(PromptDistributionLearner, self).__init__()
+        self.clipModel = clipModel
+        self.promptNum = int(promptNum)
+        self.ctxLen = int(ctxLen)
+        width = clipModel.token_embedding.embedding_dim
+        if self.ctxLen > 0:
+            self.context = nn.Parameter(torch.empty(self.promptNum, self.ctxLen, width))
+            nn.init.normal_(self.context, std=float(initStd))
+        else:
+            self.context = nn.Parameter(torch.empty(self.promptNum, 0, width))
+        self.device = device
+
+    def _soft_texts(self, labels):
+        prefix = " ".join(["X"] * self.ctxLen)
+        if prefix:
+            return [prefix + " " + str(label) for label in labels]
+        return [str(label) for label in labels]
+
+    def _encode_tokens_with_context(self, tokens):
+        dtype = self.clipModel.dtype
+        tokenEmbeddings = self.clipModel.token_embedding(tokens).type(dtype)
+        batchSize = tokenEmbeddings.size(0)
+        repeated = tokenEmbeddings.unsqueeze(0).repeat(self.promptNum, 1, 1, 1).clone()
+        if self.ctxLen > 0:
+            context = self.context[:, None, :, :].expand(-1, batchSize, -1, -1).to(dtype=dtype, device=tokens.device)
+            repeated[:, :, 1: 1 + self.ctxLen, :] = context
+        flat = repeated.view(self.promptNum * batchSize, repeated.size(2), repeated.size(3))
+        flatTokens = tokens.unsqueeze(0).repeat(self.promptNum, 1, 1).view(self.promptNum * batchSize, -1)
+
+        x = flat + self.clipModel.positional_embedding.type(dtype)
+        x = x.permute(1, 0, 2)
+        x = self.clipModel.transformer(x)
+        x = x.permute(1, 0, 2)
+        x = self.clipModel.ln_final(x).type(dtype)
+        x = x[torch.arange(x.shape[0], device=x.device), flatTokens.argmax(dim=-1)] @ self.clipModel.text_projection
+        x = F.normalize(x.float(), dim=-1)
+        return x.view(self.promptNum, batchSize, -1).permute(1, 0, 2)
+
+    def forward(self, labels):
+        if len(labels) == 0:
+            empty = self.context.new_zeros((0, self.clipModel.text_projection.size(1)))
+            return empty, empty
+        tokens = clip.tokenize(self._soft_texts(labels)).to(self.device)
+        samples = self._encode_tokens_with_context(tokens)
+        mean = F.normalize(samples.mean(dim=1), dim=-1)
+        if samples.size(1) <= 1:
+            sigma = samples.new_zeros(mean.shape)
+        else:
+            sigma = samples.std(dim=1, unbiased=False)
+        return mean, sigma
+
+
 class RelationnessHead(nn.Module):
     def __init__(self, relationDim=512, spatialDim=32, hiddenDim=256, dropout=0.1):
         super(RelationnessHead, self).__init__()
@@ -238,6 +292,8 @@ class GQAClipPredictor(nn.Module):
         self.trainRelNames = list(rel_classes)
         self.trainPart = config.OV_SETTING.TRAIN_PART
         self.clip_model, self.clip_preprocess = clip.load("ViT-B/32", device=self.device)
+        for parameter in self.clip_model.parameters():
+            parameter.requires_grad_(False)
 
         self.adaper_clip1 = MVA()
         self.adaper_clip2 = MVA()
@@ -487,6 +543,8 @@ class ClipPredictor(nn.Module):
         self.trainRelNames = list(rel_classes)
         self.trainPart = config.OV_SETTING.TRAIN_PART
         self.clip_model, self.clip_preprocess = clip.load("ViT-B/32", device=self.device)
+        for parameter in self.clip_model.parameters():
+            parameter.requires_grad_(False)
 
         self.adaper_clip1 = MVA()
         self.adaper_clip2 = MVA()
@@ -626,6 +684,17 @@ class ClipPredictor(nn.Module):
         self.mtmTextStructureWeight = mtmConfig.TEXT_STRUCTURE_WEIGHT
         self.mtmStructureLossType = str(mtmConfig.STRUCTURE_LOSS_TYPE).lower()
         self.mtmStructureTemperature = mtmConfig.STRUCTURE_TEMPERATURE
+        self.mtmFactorizedEnabled = mtmConfig.FACTORIZED_ENABLED
+        self.mtmEntityAlignWeight = mtmConfig.ENTITY_ALIGN_WEIGHT
+        self.mtmRelAlignWeight = mtmConfig.REL_ALIGN_WEIGHT
+        self.mtmEntityStructureWeight = mtmConfig.ENTITY_STRUCTURE_WEIGHT
+        self.mtmRelStructureWeight = mtmConfig.REL_STRUCTURE_WEIGHT
+        self.mtmPromptAnchorWeight = mtmConfig.PROMPT_ANCHOR_WEIGHT
+        self.mtmTripletSubjectWeight = mtmConfig.TRIPLET_SUBJECT_WEIGHT
+        self.mtmTripletPredicateWeight = mtmConfig.TRIPLET_PREDICATE_WEIGHT
+        self.mtmTripletObjectWeight = mtmConfig.TRIPLET_OBJECT_WEIGHT
+        self.mtmDetachMvaText = mtmConfig.DETACH_MVA_TEXT
+        self.mtmDetachMvaFeatureForMtm = mtmConfig.DETACH_MVA_FEATURE_FOR_MTM
         self.mtmMaxPairs = mtmConfig.MAX_PAIRS
         self.mtmUseInference = mtmConfig.ENABLED and mtmConfig.USE_INFERENCE
         self.mtmInferenceWeight = mtmConfig.INFERENCE_WEIGHT
@@ -650,6 +719,28 @@ class ClipPredictor(nn.Module):
             mtmConfig.ATTENTION_LAYERS,
             mtmConfig.NUM_HEADS,
             mtmConfig.DROPOUT,
+        ).to(self.device)
+        self.entityMtm = RelationModalityTransfer(
+            mtmConfig.INPUT_DIM,
+            mtmConfig.EMBED_DIM,
+            mtmConfig.FC_LAYERS,
+            mtmConfig.ATTENTION_LAYERS,
+            mtmConfig.NUM_HEADS,
+            mtmConfig.DROPOUT,
+        ).to(self.device)
+        self.entityPromptLearner = PromptDistributionLearner(
+            self.clip_model,
+            mtmConfig.SOFT_PROMPT_NUM,
+            mtmConfig.SOFT_PROMPT_CTX_LEN,
+            mtmConfig.SOFT_PROMPT_INIT_STD,
+            self.device,
+        ).to(self.device)
+        self.predicatePromptLearner = PromptDistributionLearner(
+            self.clip_model,
+            mtmConfig.SOFT_PROMPT_NUM,
+            mtmConfig.SOFT_PROMPT_CTX_LEN,
+            mtmConfig.SOFT_PROMPT_INIT_STD,
+            self.device,
         ).to(self.device)
         self.relationnessHead = RelationnessHead(
             relationDim=mtmConfig.EMBED_DIM,
@@ -677,6 +768,90 @@ class ClipPredictor(nn.Module):
     def encodePredicateTexts(self, predicateNames):
         texts = ["a photo of relation " + predicateName for predicateName in predicateNames]
         return self.encodeTripletTexts(texts)
+
+    def clipFeatureToVector(self, features):
+        if features.dim() == 3:
+            return features[:, 0, :]
+        return features
+
+    def labelsToObjectNames(self, labels):
+        return [self.obj_names[int(label)] for label in labels.detach().cpu().tolist()]
+
+    def labelsToPredicateNames(self, labels):
+        names = []
+        for label in labels.detach().cpu().tolist():
+            relIndex = int(label)
+            if relIndex >= len(self.activeRelNames):
+                raise ValueError(
+                    "MTM received relation label {} but active relation names only has {} entries.".format(
+                        relIndex, len(self.activeRelNames)
+                    )
+                )
+            names.append(self.activeRelNames[relIndex])
+        return names
+
+    def encodeHardEntityTexts(self, names):
+        return self.encodeTripletTexts(["a photo of " + name for name in names])
+
+    def encodeHardPredicateTexts(self, names):
+        return self.encodeTripletTexts(["a photo of relation " + name for name in names])
+
+    def getEntityTextMuSigma(self, labels):
+        names = self.labelsToObjectNames(labels)
+        mu, sigma = self.entityPromptLearner(names)
+        return mu, sigma
+
+    def getPredicateTextMuSigma(self, labels):
+        names = self.labelsToPredicateNames(labels)
+        mu, sigma = self.predicatePromptLearner(names)
+        return mu, sigma
+
+    def getEntityTextDistribution(self, labels):
+        names = self.labelsToObjectNames(labels)
+        mu, sigma = self.entityPromptLearner(names)
+        with torch.no_grad():
+            anchor = self.encodeHardEntityTexts(names).to(mu.device)
+        return mu, sigma, anchor
+
+    def getPredicateTextDistribution(self, labels):
+        names = self.labelsToPredicateNames(labels)
+        mu, sigma = self.predicatePromptLearner(names)
+        with torch.no_grad():
+            anchor = self.encodeHardPredicateTexts(names).to(mu.device)
+        return mu, sigma, anchor
+
+    def composeTripletTeacher(self, subjMu, predMu, objMu):
+        teacher = (
+            float(self.mtmTripletSubjectWeight) * subjMu
+            + float(self.mtmTripletPredicateWeight) * predMu
+            + float(self.mtmTripletObjectWeight) * objMu
+        )
+        return F.normalize(teacher, dim=-1)
+
+    def computeVisualStructureLoss(self, projectedNorm, visualNorm, referenceLoss):
+        if projectedNorm.size(0) < 2:
+            return referenceLoss * 0.0
+
+        projectedSimilarity = torch.matmul(projectedNorm, projectedNorm.t())
+        visualSimilarity = torch.matmul(visualNorm.detach(), visualNorm.detach().t())
+        offDiagonal = ~torch.eye(
+            projectedSimilarity.size(0),
+            dtype=torch.bool,
+            device=projectedSimilarity.device,
+        )
+
+        temperature = max(float(self.mtmStructureTemperature), 1e-6)
+        if self.mtmStructureLossType == "l1":
+            projectedSimilarity = projectedSimilarity / temperature
+            visualSimilarity = visualSimilarity / temperature
+            return (visualSimilarity - projectedSimilarity).abs()[offDiagonal].mean()
+
+        if self.mtmStructureLossType == "kl":
+            projectedLogProb = F.log_softmax(projectedSimilarity.masked_fill(~offDiagonal, -1e4) / temperature, dim=1)
+            visualProb = F.softmax(visualSimilarity.masked_fill(~offDiagonal, -1e4) / temperature, dim=1)
+            return F.kl_div(projectedLogProb, visualProb, reduction="batchmean")
+
+        raise ValueError("Unsupported MTM structure loss type: " + str(self.mtmStructureLossType))
 
     def updateMtmPrototypeBank(self, visualFeatures, relationLabels):
         if not self.mtmPrototypeEnabled or visualFeatures.numel() == 0:
@@ -910,6 +1085,136 @@ class ClipPredictor(nn.Module):
             selectedIndices,
         )
 
+    def computeFactorizedMtmLosses(self, subFeatures, objFeatures, relFeatures, relationLabels, subjLabels, objLabels):
+        if (
+            not self.mtmLossEnabled
+            or len(relFeatures) == 0
+            or relationLabels is None
+        ):
+            zero = self.relationMtm.norm.weight.sum() * 0.0 + self.entityMtm.norm.weight.sum() * 0.0
+            return {
+                "loss_mtm_sub_align": zero,
+                "loss_mtm_obj_align": zero,
+                "loss_mtm_rel_align": zero,
+                "loss_mtm_sub_visual_structure": zero,
+                "loss_mtm_obj_visual_structure": zero,
+                "loss_mtm_rel_visual_structure": zero,
+                "loss_mtm_prompt_anchor": zero,
+            }
+
+        subFeatures = self.clipFeatureToVector(torch.cat(subFeatures, dim=0)).float()
+        objFeatures = self.clipFeatureToVector(torch.cat(objFeatures, dim=0)).float()
+        relFeatures = self.clipFeatureToVector(torch.cat(relFeatures, dim=0)).float()
+        relationLabels = torch.cat(relationLabels, dim=0).view(-1).long().to(relFeatures.device)
+        subjLabels = torch.cat(subjLabels, dim=0).view(-1).long().to(relFeatures.device)
+        objLabels = torch.cat(objLabels, dim=0).view(-1).long().to(relFeatures.device)
+
+        positive = relationLabels > 0
+        if positive.any() and relationLabels[positive].max().item() >= len(self.activeRelNames):
+            raise ValueError(
+                "MTM received relation label {} but active relation names only has {} entries.".format(
+                    relationLabels[positive].max().item(), len(self.activeRelNames)
+                )
+            )
+        if positive.sum() == 0:
+            zero = relFeatures.sum() * 0.0
+            return {
+                "loss_mtm_sub_align": zero,
+                "loss_mtm_obj_align": zero,
+                "loss_mtm_rel_align": zero,
+                "loss_mtm_sub_visual_structure": zero,
+                "loss_mtm_obj_visual_structure": zero,
+                "loss_mtm_rel_visual_structure": zero,
+                "loss_mtm_prompt_anchor": zero,
+            }
+
+        subFeatures = subFeatures[positive]
+        objFeatures = objFeatures[positive]
+        relFeatures = relFeatures[positive]
+        relationLabels = relationLabels[positive]
+        subjLabels = subjLabels[positive]
+        objLabels = objLabels[positive]
+
+        if self.mtmMaxPairs > 0 and relFeatures.size(0) > self.mtmMaxPairs:
+            sampleIndex = torch.linspace(
+                0,
+                relFeatures.size(0) - 1,
+                steps=self.mtmMaxPairs,
+                device=relFeatures.device,
+            ).long()
+            subFeatures = subFeatures.index_select(0, sampleIndex)
+            objFeatures = objFeatures.index_select(0, sampleIndex)
+            relFeatures = relFeatures.index_select(0, sampleIndex)
+            relationLabels = relationLabels.index_select(0, sampleIndex)
+            subjLabels = subjLabels.index_select(0, sampleIndex)
+            objLabels = objLabels.index_select(0, sampleIndex)
+
+        subVisual = self.entityMtm.encode_visual(subFeatures)
+        objVisual = self.entityMtm.encode_visual(objFeatures)
+        relVisual = self.relationMtm.encode_visual(relFeatures)
+        subPred = self.entityMtm.encode_text_space(subVisual)
+        objPred = self.entityMtm.encode_text_space(objVisual)
+        relPred = self.relationMtm.encode_text_space(relVisual)
+
+        subMu, subSigma, subAnchor = self.getEntityTextDistribution(subjLabels)
+        objMu, objSigma, objAnchor = self.getEntityTextDistribution(objLabels)
+        predMu, predSigma, predAnchor = self.getPredicateTextDistribution(relationLabels)
+        tripletMu = self.composeTripletTeacher(subMu, predMu, objMu)
+
+        subPredNorm = F.normalize(subPred.float(), dim=-1)
+        objPredNorm = F.normalize(objPred.float(), dim=-1)
+        relPredNorm = F.normalize(relPred.float(), dim=-1)
+        subVisualNorm = F.normalize(subVisual.float(), dim=-1)
+        objVisualNorm = F.normalize(objVisual.float(), dim=-1)
+        relVisualNorm = F.normalize(relVisual.float(), dim=-1)
+
+        subAlign = (1.0 - (subPredNorm * subMu).sum(dim=-1)).mean()
+        objAlign = (1.0 - (objPredNorm * objMu).sum(dim=-1)).mean()
+        relAlign = (1.0 - (relPredNorm * tripletMu).sum(dim=-1)).mean()
+
+        subStructure = self.computeVisualStructureLoss(subPredNorm, subVisualNorm, subAlign)
+        objStructure = self.computeVisualStructureLoss(objPredNorm, objVisualNorm, objAlign)
+        relStructure = self.computeVisualStructureLoss(relPredNorm, relVisualNorm, relAlign)
+
+        entityAnchor = (
+            (1.0 - (subMu * subAnchor).sum(dim=-1)).mean()
+            + (1.0 - (objMu * objAnchor).sum(dim=-1)).mean()
+        ) * 0.5
+        predAnchorLoss = (1.0 - (predMu * predAnchor).sum(dim=-1)).mean()
+        promptAnchor = 0.5 * entityAnchor + 0.5 * predAnchorLoss
+        if self.mtmDebugger is not None:
+            self.mtmDebugger.record_factorized_prompt_distribution(
+                subMu,
+                objMu,
+                predMu,
+                tripletMu,
+                subSigma,
+                objSigma,
+                predSigma,
+            )
+
+        return {
+            "loss_mtm_sub_align": (
+                self.mtmLossWeight * self.mtmAlignWeight * self.mtmEntityAlignWeight * subAlign
+            ),
+            "loss_mtm_obj_align": (
+                self.mtmLossWeight * self.mtmAlignWeight * self.mtmEntityAlignWeight * objAlign
+            ),
+            "loss_mtm_rel_align": (
+                self.mtmLossWeight * self.mtmAlignWeight * self.mtmRelAlignWeight * relAlign
+            ),
+            "loss_mtm_sub_visual_structure": (
+                self.mtmLossWeight * self.mtmStructureWeight * self.mtmEntityStructureWeight * subStructure
+            ),
+            "loss_mtm_obj_visual_structure": (
+                self.mtmLossWeight * self.mtmStructureWeight * self.mtmEntityStructureWeight * objStructure
+            ),
+            "loss_mtm_rel_visual_structure": (
+                self.mtmLossWeight * self.mtmStructureWeight * self.mtmRelStructureWeight * relStructure
+            ),
+            "loss_mtm_prompt_anchor": self.mtmLossWeight * self.mtmPromptAnchorWeight * promptAnchor,
+        }
+
     def computeMtmLosses(self, relationFeatures, relationLabels, subjLabels, objLabels):
         if not self.mtmLossEnabled or len(relationFeatures) == 0 or relationLabels is None:
             zero = self.relationMtm.norm.weight.sum() * 0.0
@@ -995,6 +1300,23 @@ class ClipPredictor(nn.Module):
         adaptedVisual = self.relationMtm.encode_visual(relationFeatures)
         adaptedVisual = F.normalize(adaptedVisual.float(), dim=-1)
         scores = torch.matmul(adaptedVisual, prototypeBank.t())
+        return scores[:, :outShape[1]].to(dtype=outDtype)
+
+    def computeFactorizedMtmInferenceScores(self, relationFeatures, subjLabels, objLabels, outShape, outDtype):
+        relationFeatures = self.clipFeatureToVector(relationFeatures).float()
+        predicted = F.normalize(self.relationMtm(relationFeatures).float(), dim=-1)
+        subjMu, _ = self.getEntityTextMuSigma(subjLabels.to(relationFeatures.device))
+        objMu, _ = self.getEntityTextMuSigma(objLabels.to(relationFeatures.device))
+        predicateNames = list(self.activeRelNames)[:outShape[1]]
+        predMu, _ = self.predicatePromptLearner(predicateNames)
+        predMu = predMu.to(predicted.device)
+        tripletMu = (
+            float(self.mtmTripletSubjectWeight) * subjMu.unsqueeze(1)
+            + float(self.mtmTripletPredicateWeight) * predMu.unsqueeze(0)
+            + float(self.mtmTripletObjectWeight) * objMu.unsqueeze(1)
+        )
+        tripletMu = F.normalize(tripletMu, dim=-1)
+        scores = (predicted.unsqueeze(1) * tripletMu).sum(dim=-1)
         return scores[:, :outShape[1]].to(dtype=outDtype)
 
     def computeMtmInferenceScores(self, relationFeatures, subjLabels, objLabels, outShape, outDtype):
@@ -1091,6 +1413,9 @@ class ClipPredictor(nn.Module):
 
         rel_dists=[]
         relationFeaturesForMtm = []
+        subFeaturesForMtm = []
+        objFeaturesForMtm = []
+        relFeaturesForMtm = []
         relationLabelsForMtm = []
         subjLabelsForMtm = []
         objLabelsForMtm = []
@@ -1129,8 +1454,15 @@ class ClipPredictor(nn.Module):
 
             sub_features = image_features.index_select(0, sub_idx)
             obj_features = image_features.index_select(0, obj_idx)
-            text_sub = self.text_features3.index_select(0, obj_n1)
-            text_obj = self.text_features4.index_select(0, obj_n2)
+            if self.mtmFactorizedEnabled:
+                text_sub, _ = self.getEntityTextMuSigma(obj_n1)
+                text_obj, _ = self.getEntityTextMuSigma(obj_n2)
+                if self.mtmDetachMvaText:
+                    text_sub = text_sub.detach()
+                    text_obj = text_obj.detach()
+            else:
+                text_sub = self.text_features3.index_select(0, obj_n1)
+                text_obj = self.text_features4.index_select(0, obj_n2)
 
             cross_output1 = self.adaper_clip1(sub_features, obj_features, text_sub)
             cross_output2 = self.adaper_clip2(obj_features, sub_features, text_obj)
@@ -1149,11 +1481,35 @@ class ClipPredictor(nn.Module):
                 relationnessLogitsForLoss.append(relationness_logits)
                 relationnessLabelsForLoss.append(rel_labels[i].to(relationness_logits.device))
 
+            if self.training and self.mtmLossEnabled and self.mtmFactorizedEnabled and rel_labels is not None:
+                mtm_feature_pos = torch.nonzero(
+                    rel_labels[i].to(pair_idx.device).view(-1) > 0,
+                    as_tuple=False,
+                ).view(-1)
+                if mtm_feature_pos.numel() > 0:
+                    subFeaturesForMtm.append(sub_features.index_select(0, mtm_feature_pos))
+                    objFeaturesForMtm.append(obj_features.index_select(0, mtm_feature_pos))
+                    relFeatureForMtm = cross_output.index_select(0, mtm_feature_pos)
+                    if self.mtmDetachMvaFeatureForMtm:
+                        relFeatureForMtm = relFeatureForMtm.detach()
+                    relFeaturesForMtm.append(relFeatureForMtm)
+                    relationLabelsForMtm.append(rel_labels[i].to(mtm_feature_pos.device).index_select(0, mtm_feature_pos))
+                    if proposals[i].has_field("labels"):
+                        gtObjLabels = proposals[i].get_field("labels").long()
+                        subjLabelsForMtm.append(gtObjLabels.index_select(0, sub_idx).index_select(0, mtm_feature_pos))
+                        objLabelsForMtm.append(gtObjLabels.index_select(0, obj_idx).index_select(0, mtm_feature_pos))
+                    else:
+                        subjLabelsForMtm.append(obj_n1.index_select(0, mtm_feature_pos))
+                        objLabelsForMtm.append(obj_n2.index_select(0, mtm_feature_pos))
+
             mtm_relation_features = None
             need_mtm_features = (
-                (self.training and self.mtmLossEnabled)
-                or ((not self.training) and self.mtmUseInference and self.mtmInferenceWeight != 0)
-                or ((not self.training) and self.mtmPrototypeEnabled and self.mtmPrototypeWeight != 0)
+                (not self.mtmFactorizedEnabled)
+                and (
+                    (self.training and self.mtmLossEnabled)
+                    or ((not self.training) and self.mtmUseInference and self.mtmInferenceWeight != 0)
+                    or ((not self.training) and self.mtmPrototypeEnabled and self.mtmPrototypeWeight != 0)
+                )
             )
             if need_mtm_features:
                 mtm_pair_idx = pair_idx
@@ -1182,7 +1538,12 @@ class ClipPredictor(nn.Module):
                         if mtm_relation_features.dim() == 3:
                             mtm_relation_features = mtm_relation_features[:, 0, :]
 
-            if self.training and self.mtmLossEnabled and mtm_relation_features is not None:
+            if (
+                self.training
+                and self.mtmLossEnabled
+                and (not self.mtmFactorizedEnabled)
+                and mtm_relation_features is not None
+            ):
                 relationFeaturesForMtm.append(mtm_relation_features)
                 relationLabelsForMtm.append(rel_labels[i].to(mtm_feature_pos.device).index_select(0, mtm_feature_pos))
                 if proposals[i].has_field("labels"):
@@ -1229,15 +1590,29 @@ class ClipPredictor(nn.Module):
                     filter_scores.index_copy_(0, rel_pos, scores.to(dtype=filter_scores.dtype))
                 rel_dist_per_batch = description_scores * 0.2 + filter_scores * 0.8
                 if self.mtmUseInference and self.mtmInferenceWeight != 0:
-                    rawMtmScores = self.computeMtmInferenceScores(
-                        mtm_relation_features,
-                        obj_n1,
-                        obj_n2,
-                        rel_dist_per_batch.shape,
-                        rel_dist_per_batch.dtype,
-                    )
+                    if self.mtmFactorizedEnabled:
+                        rawMtmScores = self.computeFactorizedMtmInferenceScores(
+                            cross_output,
+                            obj_n1,
+                            obj_n2,
+                            rel_dist_per_batch.shape,
+                            rel_dist_per_batch.dtype,
+                        )
+                    else:
+                        rawMtmScores = self.computeMtmInferenceScores(
+                            mtm_relation_features,
+                            obj_n1,
+                            obj_n2,
+                            rel_dist_per_batch.shape,
+                            rel_dist_per_batch.dtype,
+                        )
                     rel_dist_per_batch = rel_dist_per_batch + self.mtmInferenceWeight * rawMtmScores
-                if self.mtmPrototypeEnabled and self.mtmPrototypeWeight != 0 and mtm_relation_features is not None:
+                if (
+                    (not self.mtmFactorizedEnabled)
+                    and self.mtmPrototypeEnabled
+                    and self.mtmPrototypeWeight != 0
+                    and mtm_relation_features is not None
+                ):
                     prototypeScores = self.computeMtmPrototypeScores(
                         mtm_relation_features,
                         rel_dist_per_batch.shape,
@@ -1256,7 +1631,26 @@ class ClipPredictor(nn.Module):
 
         add_losses = {}
         if self.training and self.mtmLossEnabled:
-            add_losses.update(self.computeMtmLosses(relationFeaturesForMtm, relationLabelsForMtm, subjLabelsForMtm, objLabelsForMtm))
+            if self.mtmFactorizedEnabled:
+                add_losses.update(
+                    self.computeFactorizedMtmLosses(
+                        subFeaturesForMtm,
+                        objFeaturesForMtm,
+                        relFeaturesForMtm,
+                        relationLabelsForMtm,
+                        subjLabelsForMtm,
+                        objLabelsForMtm,
+                    )
+                )
+            else:
+                add_losses.update(
+                    self.computeMtmLosses(
+                        relationFeaturesForMtm,
+                        relationLabelsForMtm,
+                        subjLabelsForMtm,
+                        objLabelsForMtm,
+                    )
+                )
         if self.training and self.relationnessLossEnabled:
             add_losses.update(self.computeRelationnessLoss(relationnessLogitsForLoss, relationnessLabelsForLoss))
         return obj_dists, rel_dists, add_losses
