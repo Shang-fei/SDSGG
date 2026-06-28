@@ -1272,11 +1272,7 @@ class ClipPredictor(nn.Module):
             cross_output2 = self.adaper_clip2(obj_features, sub_features, text_obj)
             cross_output = (cross_output1 + cross_output2) / 2
 
-            mtm_text_sub = text_sub.detach()
-            mtm_text_obj = text_obj.detach()
-            mtm_cross_output1 = self.mtm_adaper_clip1(sub_features, obj_features, mtm_text_sub)
-            mtm_cross_output2 = self.mtm_adaper_clip2(obj_features, sub_features, mtm_text_obj)
-            mtm_cross_output = (mtm_cross_output1 + mtm_cross_output2) / 2
+            mtm_cross_output = None
             pair_spatial_features = self.buildPairSpatialFeatures(proposals[i], pair_idx).to(
                 device=cross_output.device,
                 dtype=cross_output.dtype,
@@ -1297,9 +1293,15 @@ class ClipPredictor(nn.Module):
                     as_tuple=False,
                 ).view(-1)
                 if mtm_feature_pos.numel() > 0:
-                    subFeaturesForMtm.append(sub_features.index_select(0, mtm_feature_pos))
-                    objFeaturesForMtm.append(obj_features.index_select(0, mtm_feature_pos))
-                    relFeatureForMtm = mtm_cross_output.index_select(0, mtm_feature_pos)
+                    subFeatureForMtm = sub_features.index_select(0, mtm_feature_pos)
+                    objFeatureForMtm = obj_features.index_select(0, mtm_feature_pos)
+                    textSubForMtm = text_sub.index_select(0, mtm_feature_pos).detach()
+                    textObjForMtm = text_obj.index_select(0, mtm_feature_pos).detach()
+                    mtmCrossOutput1 = self.mtm_adaper_clip1(subFeatureForMtm, objFeatureForMtm, textSubForMtm)
+                    mtmCrossOutput2 = self.mtm_adaper_clip2(objFeatureForMtm, subFeatureForMtm, textObjForMtm)
+                    relFeatureForMtm = (mtmCrossOutput1 + mtmCrossOutput2) / 2
+                    subFeaturesForMtm.append(subFeatureForMtm)
+                    objFeaturesForMtm.append(objFeatureForMtm)
                     relFeaturesForMtm.append(relFeatureForMtm)
                     relationLabelsForMtm.append(rel_labels[i].to(mtm_feature_pos.device).index_select(0, mtm_feature_pos))
                     if proposals[i].has_field("labels"):
@@ -1346,6 +1348,11 @@ class ClipPredictor(nn.Module):
                     filter_scores.index_copy_(0, rel_pos, scores.to(dtype=filter_scores.dtype))
                 rel_dist_per_batch = description_scores * 0.2 + filter_scores * 0.8
                 if self.mtmUseInference and self.mtmInferenceWeight != 0:
+                    mtm_text_sub = text_sub.detach()
+                    mtm_text_obj = text_obj.detach()
+                    mtm_cross_output1 = self.mtm_adaper_clip1(sub_features, obj_features, mtm_text_sub)
+                    mtm_cross_output2 = self.mtm_adaper_clip2(obj_features, sub_features, mtm_text_obj)
+                    mtm_cross_output = (mtm_cross_output1 + mtm_cross_output2) / 2
                     rawMtmScores = self.computeFactorizedMtmInferenceScores(
                         mtm_cross_output,
                         obj_n1,
