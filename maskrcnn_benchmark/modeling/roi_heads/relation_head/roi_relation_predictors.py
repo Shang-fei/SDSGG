@@ -692,6 +692,9 @@ class ClipPredictor(nn.Module):
         self.mtmTripletSubjectWeight = mtmConfig.TRIPLET_SUBJECT_WEIGHT
         self.mtmTripletPredicateWeight = mtmConfig.TRIPLET_PREDICATE_WEIGHT
         self.mtmTripletObjectWeight = mtmConfig.TRIPLET_OBJECT_WEIGHT
+        self.mtmUseDistributionSampling = mtmConfig.USE_DISTRIBUTION_SAMPLING
+        self.mtmSampleNum = mtmConfig.SAMPLE_NUM
+        self.mtmSampleGamma = mtmConfig.SAMPLE_GAMMA
         self.mtmMaxPairs = mtmConfig.MAX_PAIRS
         self.mtmUseInference = mtmConfig.ENABLED and mtmConfig.USE_INFERENCE
         self.mtmInferenceWeight = mtmConfig.INFERENCE_WEIGHT
@@ -809,6 +812,37 @@ class ClipPredictor(nn.Module):
             + float(self.mtmTripletObjectWeight) * objMu
         )
         return F.normalize(teacher, dim=-1)
+
+    def sampleTripletTeachers(self, subjMu, subjSigma, predMu, predSigma, objMu, objSigma):
+        sampleNum = max(int(self.mtmSampleNum), 1)
+        gamma = float(self.mtmSampleGamma)
+        subjSamples = subjMu.unsqueeze(1) + gamma * torch.randn(
+            subjMu.size(0),
+            sampleNum,
+            subjMu.size(1),
+            device=subjMu.device,
+            dtype=subjMu.dtype,
+        ) * subjSigma.unsqueeze(1)
+        predSamples = predMu.unsqueeze(1) + gamma * torch.randn(
+            predMu.size(0),
+            sampleNum,
+            predMu.size(1),
+            device=predMu.device,
+            dtype=predMu.dtype,
+        ) * predSigma.unsqueeze(1)
+        objSamples = objMu.unsqueeze(1) + gamma * torch.randn(
+            objMu.size(0),
+            sampleNum,
+            objMu.size(1),
+            device=objMu.device,
+            dtype=objMu.dtype,
+        ) * objSigma.unsqueeze(1)
+        tripletSamples = (
+            float(self.mtmTripletSubjectWeight) * subjSamples
+            + float(self.mtmTripletPredicateWeight) * predSamples
+            + float(self.mtmTripletObjectWeight) * objSamples
+        )
+        return F.normalize(tripletSamples, dim=-1)
 
     def computeVisualStructureLoss(self, projectedNorm, visualNorm, referenceLoss):
         if projectedNorm.size(0) < 2:
@@ -1091,7 +1125,11 @@ class ClipPredictor(nn.Module):
 
         subAlign = (1.0 - (subPredNorm * subMu).sum(dim=-1)).mean()
         objAlign = (1.0 - (objPredNorm * objMu).sum(dim=-1)).mean()
-        relAlign = (1.0 - (relPredNorm * tripletMu).sum(dim=-1)).mean()
+        if self.mtmUseDistributionSampling:
+            tripletSamples = self.sampleTripletTeachers(subMu, subSigma, predMu, predSigma, objMu, objSigma)
+            relAlign = (1.0 - (relPredNorm.unsqueeze(1) * tripletSamples).sum(dim=-1)).mean()
+        else:
+            relAlign = (1.0 - (relPredNorm * tripletMu).sum(dim=-1)).mean()
 
         subStructure = self.computeVisualStructureLoss(subPredNorm, subVisualNorm, subAlign)
         objStructure = self.computeVisualStructureLoss(objPredNorm, objVisualNorm, objAlign)
