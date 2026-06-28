@@ -693,6 +693,7 @@ class ClipPredictor(nn.Module):
         self.mtmTripletPredicateWeight = mtmConfig.TRIPLET_PREDICATE_WEIGHT
         self.mtmTripletObjectWeight = mtmConfig.TRIPLET_OBJECT_WEIGHT
         self.mtmUseDistributionSampling = mtmConfig.USE_DISTRIBUTION_SAMPLING
+        self.mtmUseEntityDistributionSampling = mtmConfig.USE_ENTITY_DISTRIBUTION_SAMPLING
         self.mtmSampleNum = mtmConfig.SAMPLE_NUM
         self.mtmSampleGamma = mtmConfig.SAMPLE_GAMMA
         self.mtmMaxPairs = mtmConfig.MAX_PAIRS
@@ -813,30 +814,22 @@ class ClipPredictor(nn.Module):
         )
         return F.normalize(teacher, dim=-1)
 
-    def sampleTripletTeachers(self, subjMu, subjSigma, predMu, predSigma, objMu, objSigma):
+    def sampleTextDistribution(self, mu, sigma):
         sampleNum = max(int(self.mtmSampleNum), 1)
         gamma = float(self.mtmSampleGamma)
-        subjSamples = subjMu.unsqueeze(1) + gamma * torch.randn(
-            subjMu.size(0),
+        noise = torch.randn(
+            mu.size(0),
             sampleNum,
-            subjMu.size(1),
-            device=subjMu.device,
-            dtype=subjMu.dtype,
-        ) * subjSigma.unsqueeze(1)
-        predSamples = predMu.unsqueeze(1) + gamma * torch.randn(
-            predMu.size(0),
-            sampleNum,
-            predMu.size(1),
-            device=predMu.device,
-            dtype=predMu.dtype,
-        ) * predSigma.unsqueeze(1)
-        objSamples = objMu.unsqueeze(1) + gamma * torch.randn(
-            objMu.size(0),
-            sampleNum,
-            objMu.size(1),
-            device=objMu.device,
-            dtype=objMu.dtype,
-        ) * objSigma.unsqueeze(1)
+            mu.size(1),
+            device=mu.device,
+            dtype=mu.dtype,
+        )
+        return F.normalize(mu.unsqueeze(1) + gamma * noise * sigma.unsqueeze(1), dim=-1)
+
+    def sampleTripletTeachers(self, subjMu, subjSigma, predMu, predSigma, objMu, objSigma):
+        subjSamples = self.sampleTextDistribution(subjMu, subjSigma)
+        predSamples = self.sampleTextDistribution(predMu, predSigma)
+        objSamples = self.sampleTextDistribution(objMu, objSigma)
         tripletSamples = (
             float(self.mtmTripletSubjectWeight) * subjSamples
             + float(self.mtmTripletPredicateWeight) * predSamples
@@ -1123,8 +1116,14 @@ class ClipPredictor(nn.Module):
         objVisualNorm = F.normalize(objVisual.float(), dim=-1)
         relVisualNorm = F.normalize(relVisual.float(), dim=-1)
 
-        subAlign = (1.0 - (subPredNorm * subMu).sum(dim=-1)).mean()
-        objAlign = (1.0 - (objPredNorm * objMu).sum(dim=-1)).mean()
+        if self.mtmUseEntityDistributionSampling:
+            subSamples = self.sampleTextDistribution(subMu, subSigma)
+            objSamples = self.sampleTextDistribution(objMu, objSigma)
+            subAlign = (1.0 - (subPredNorm.unsqueeze(1) * subSamples).sum(dim=-1)).mean()
+            objAlign = (1.0 - (objPredNorm.unsqueeze(1) * objSamples).sum(dim=-1)).mean()
+        else:
+            subAlign = (1.0 - (subPredNorm * subMu).sum(dim=-1)).mean()
+            objAlign = (1.0 - (objPredNorm * objMu).sum(dim=-1)).mean()
         if self.mtmUseDistributionSampling:
             tripletSamples = self.sampleTripletTeachers(subMu, subSigma, predMu, predSigma, objMu, objSigma)
             relAlign = (1.0 - (relPredNorm.unsqueeze(1) * tripletSamples).sum(dim=-1)).mean()
