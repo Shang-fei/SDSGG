@@ -1295,10 +1295,8 @@ class ClipPredictor(nn.Module):
                 if mtm_feature_pos.numel() > 0:
                     subFeatureForMtm = sub_features.index_select(0, mtm_feature_pos)
                     objFeatureForMtm = obj_features.index_select(0, mtm_feature_pos)
-                    textSubForMtm = text_sub.index_select(0, mtm_feature_pos).detach()
-                    textObjForMtm = text_obj.index_select(0, mtm_feature_pos).detach()
-                    mtmCrossOutput1 = self.mtm_adaper_clip1(subFeatureForMtm, objFeatureForMtm, textSubForMtm)
-                    mtmCrossOutput2 = self.mtm_adaper_clip2(objFeatureForMtm, subFeatureForMtm, textObjForMtm)
+                    mtmCrossOutput1 = self.mtm_adaper_clip1(subFeatureForMtm, objFeatureForMtm)
+                    mtmCrossOutput2 = self.mtm_adaper_clip2(objFeatureForMtm, subFeatureForMtm)
                     relFeatureForMtm = (mtmCrossOutput1 + mtmCrossOutput2) / 2
                     subFeaturesForMtm.append(subFeatureForMtm)
                     objFeaturesForMtm.append(objFeatureForMtm)
@@ -1348,10 +1346,8 @@ class ClipPredictor(nn.Module):
                     filter_scores.index_copy_(0, rel_pos, scores.to(dtype=filter_scores.dtype))
                 rel_dist_per_batch = description_scores * 0.2 + filter_scores * 0.8
                 if self.mtmUseInference and self.mtmInferenceWeight != 0:
-                    mtm_text_sub = text_sub.detach()
-                    mtm_text_obj = text_obj.detach()
-                    mtm_cross_output1 = self.mtm_adaper_clip1(sub_features, obj_features, mtm_text_sub)
-                    mtm_cross_output2 = self.mtm_adaper_clip2(obj_features, sub_features, mtm_text_obj)
+                    mtm_cross_output1 = self.mtm_adaper_clip1(sub_features, obj_features)
+                    mtm_cross_output2 = self.mtm_adaper_clip2(obj_features, sub_features)
                     mtm_cross_output = (mtm_cross_output1 + mtm_cross_output2) / 2
                     rawMtmScores = self.computeFactorizedMtmInferenceScores(
                         mtm_cross_output,
