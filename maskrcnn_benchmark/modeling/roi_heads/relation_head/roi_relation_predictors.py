@@ -548,6 +548,8 @@ class ClipPredictor(nn.Module):
 
         self.adaper_clip1 = MVA()
         self.adaper_clip2 = MVA()
+        self.mtm_adaper_clip1 = MVA()
+        self.mtm_adaper_clip2 = MVA()
         self.obj_names = obj_classes
         a=time.time()
         self.texts1=[]
@@ -680,11 +682,8 @@ class ClipPredictor(nn.Module):
         self.mtmLossWeight = mtmConfig.LOSS_WEIGHT
         self.mtmAlignWeight = mtmConfig.ALIGN_WEIGHT
         self.mtmStructureWeight = mtmConfig.STRUCTURE_WEIGHT
-        self.mtmVisualStructureWeight = mtmConfig.VISUAL_STRUCTURE_WEIGHT
-        self.mtmTextStructureWeight = mtmConfig.TEXT_STRUCTURE_WEIGHT
         self.mtmStructureLossType = str(mtmConfig.STRUCTURE_LOSS_TYPE).lower()
         self.mtmStructureTemperature = mtmConfig.STRUCTURE_TEMPERATURE
-        self.mtmFactorizedEnabled = mtmConfig.FACTORIZED_ENABLED
         self.mtmEntityAlignWeight = mtmConfig.ENTITY_ALIGN_WEIGHT
         self.mtmRelAlignWeight = mtmConfig.REL_ALIGN_WEIGHT
         self.mtmEntityStructureWeight = mtmConfig.ENTITY_STRUCTURE_WEIGHT
@@ -693,8 +692,6 @@ class ClipPredictor(nn.Module):
         self.mtmTripletSubjectWeight = mtmConfig.TRIPLET_SUBJECT_WEIGHT
         self.mtmTripletPredicateWeight = mtmConfig.TRIPLET_PREDICATE_WEIGHT
         self.mtmTripletObjectWeight = mtmConfig.TRIPLET_OBJECT_WEIGHT
-        self.mtmDetachMvaText = mtmConfig.DETACH_MVA_TEXT
-        self.mtmDetachMvaFeatureForMtm = mtmConfig.DETACH_MVA_FEATURE_FOR_MTM
         self.mtmMaxPairs = mtmConfig.MAX_PAIRS
         self.mtmUseInference = mtmConfig.ENABLED and mtmConfig.USE_INFERENCE
         self.mtmInferenceWeight = mtmConfig.INFERENCE_WEIGHT
@@ -702,12 +699,6 @@ class ClipPredictor(nn.Module):
         self.mtmDebugTripletInterval = mtmConfig.DEBUG_TRIPLET_INTERVAL
         self.mtmDebugTripletMaxSamples = mtmConfig.DEBUG_TRIPLET_MAX_SAMPLES
         self.mtmDebugStep = 0
-        prototypeConfig = mtmConfig.PROTOTYPE
-        self.mtmPrototypeEnabled = mtmConfig.ENABLED and prototypeConfig.ENABLED
-        self.mtmPrototypeWeight = prototypeConfig.WEIGHT
-        self.mtmPrototypeTransferTemperature = prototypeConfig.TRANSFER_TEMPERATURE
-        self.mtmPrototypeMomentum = prototypeConfig.MOMENTUM
-        self.mtmPrototypeMinCount = prototypeConfig.MIN_COUNT
         self.relationnessEnabled = relationnessConfig.ENABLED
         self.relationnessLossEnabled = relationnessConfig.ENABLED and relationnessConfig.LOSS_ENABLED
         self.relationnessLossWeight = relationnessConfig.LOSS_WEIGHT
@@ -747,15 +738,6 @@ class ClipPredictor(nn.Module):
             hiddenDim=mtmConfig.EMBED_DIM // 2,
             dropout=mtmConfig.DROPOUT,
         ).to(self.device)
-        self.relNameToIndex = {name: idx for idx, name in enumerate(self.relNames)}
-        self.register_buffer(
-            "mtmPrototypeBank",
-            torch.zeros((len(self.relNames), mtmConfig.EMBED_DIM), dtype=torch.float32, device=self.device),
-        )
-        self.register_buffer(
-            "mtmPrototypeCounts",
-            torch.zeros(len(self.relNames), dtype=torch.float32, device=self.device),
-        )
         self.activeRelNames = self.trainRelNames
         self.filteredTripletEmbeddingCache = {}
 
@@ -833,7 +815,7 @@ class ClipPredictor(nn.Module):
             return referenceLoss * 0.0
 
         projectedSimilarity = torch.matmul(projectedNorm, projectedNorm.t())
-        visualSimilarity = torch.matmul(visualNorm.detach(), visualNorm.detach().t())
+        visualSimilarity = torch.matmul(visualNorm, visualNorm.t())
         offDiagonal = ~torch.eye(
             projectedSimilarity.size(0),
             dtype=torch.bool,
@@ -852,67 +834,6 @@ class ClipPredictor(nn.Module):
             return F.kl_div(projectedLogProb, visualProb, reduction="batchmean")
 
         raise ValueError("Unsupported MTM structure loss type: " + str(self.mtmStructureLossType))
-
-    def updateMtmPrototypeBank(self, visualFeatures, relationLabels):
-        if not self.mtmPrototypeEnabled or visualFeatures.numel() == 0:
-            return
-        with torch.no_grad():
-            momentum = float(self.mtmPrototypeMomentum)
-            for relationLabel in relationLabels.unique():
-                labelIndex = int(relationLabel.item())
-                if labelIndex <= 0 or labelIndex >= len(self.activeRelNames):
-                    continue
-                relationName = self.activeRelNames[labelIndex]
-                globalIndex = self.relNameToIndex.get(relationName)
-                if globalIndex is None:
-                    continue
-                mask = relationLabels == relationLabel
-                prototype = F.normalize(visualFeatures[mask].mean(dim=0, keepdim=True), dim=-1).squeeze(0)
-                if self.mtmPrototypeCounts[globalIndex] > 0:
-                    updated = self.mtmPrototypeBank[globalIndex] * momentum + prototype * (1.0 - momentum)
-                    self.mtmPrototypeBank[globalIndex].copy_(F.normalize(updated, dim=0))
-                else:
-                    self.mtmPrototypeBank[globalIndex].copy_(prototype)
-                self.mtmPrototypeCounts[globalIndex] += mask.sum().to(self.mtmPrototypeCounts.dtype)
-
-    def buildActiveMtmPrototypeBank(self, device):
-        if not self.mtmPrototypeEnabled:
-            return None
-
-        validGlobal = self.mtmPrototypeCounts >= float(self.mtmPrototypeMinCount)
-        validGlobal = validGlobal & (torch.arange(len(self.relNames), device=self.mtmPrototypeCounts.device) > 0)
-        if validGlobal.sum() == 0:
-            return None
-
-        sourceIndices = torch.nonzero(validGlobal, as_tuple=False).view(-1)
-        sourceNames = [self.relNames[int(idx)] for idx in sourceIndices.detach().cpu().tolist()]
-        sourcePrototypes = F.normalize(self.mtmPrototypeBank.index_select(0, sourceIndices).to(device).float(), dim=-1)
-
-        activePrototypes = sourcePrototypes.new_zeros((len(self.activeRelNames), sourcePrototypes.size(1)))
-        missingPositions = []
-        missingNames = []
-        for activeIndex, relationName in enumerate(self.activeRelNames):
-            if activeIndex == 0 or relationName == "__background__":
-                continue
-            globalIndex = self.relNameToIndex.get(relationName)
-            if globalIndex is not None and self.mtmPrototypeCounts[globalIndex] >= float(self.mtmPrototypeMinCount):
-                activePrototypes[activeIndex] = self.mtmPrototypeBank[globalIndex].to(device).float()
-            else:
-                missingPositions.append(activeIndex)
-                missingNames.append(relationName)
-
-        if len(missingNames) > 0:
-            with torch.no_grad():
-                missingText = self.encodePredicateTexts(missingNames).to(device)
-                sourceText = self.encodePredicateTexts(sourceNames).to(device)
-                similarity = torch.matmul(missingText, sourceText.t())
-                temperature = max(float(self.mtmPrototypeTransferTemperature), 1e-6)
-                weights = F.softmax(similarity / temperature, dim=1)
-                transferred = F.normalize(torch.matmul(weights, sourcePrototypes), dim=-1)
-                for row, activeIndex in enumerate(missingPositions):
-                    activePrototypes[activeIndex] = transferred[row]
-
-        return F.normalize(activePrototypes, dim=-1)
 
     def computeMtmStructureLosses(self, predicted_norm, adapted_visual_norm, target_norm, alignLoss):
         if predicted_norm.size(0) < 2:
@@ -1215,93 +1136,6 @@ class ClipPredictor(nn.Module):
             "loss_mtm_prompt_anchor": self.mtmLossWeight * self.mtmPromptAnchorWeight * promptAnchor,
         }
 
-    def computeMtmLosses(self, relationFeatures, relationLabels, subjLabels, objLabels):
-        if not self.mtmLossEnabled or len(relationFeatures) == 0 or relationLabels is None:
-            zero = self.relationMtm.norm.weight.sum() * 0.0
-            return {
-                "loss_mtm_align": zero,
-                "loss_mtm_visual_structure": zero,
-                "loss_mtm_text_structure": zero,
-            }
-        relationFeatures = torch.cat(relationFeatures, dim=0).float()
-        relationLabels = torch.cat(relationLabels, dim=0).view(-1).long().to(relationFeatures.device)
-        subjLabels = torch.cat(subjLabels, dim=0).view(-1).long().to(relationFeatures.device)
-        objLabels = torch.cat(objLabels, dim=0).view(-1).long().to(relationFeatures.device)
-        positive = relationLabels > 0
-        if positive.any() and relationLabels[positive].max().item() >= len(self.activeRelNames):
-            raise ValueError(
-                "MTM received relation label {} but active relation names only has {} entries. "
-                "Use dataset rel_classes for MTM targets or regenerate stale dataset-statistics cache.".format(
-                    relationLabels[positive].max().item(), len(self.activeRelNames)
-                )
-            )
-        valid = positive
-        if valid.sum() == 0:
-            zero = relationFeatures.sum() * 0.0
-            return {
-                "loss_mtm_align": zero,
-                "loss_mtm_visual_structure": zero,
-                "loss_mtm_text_structure": zero,
-            }
-        relationFeatures = relationFeatures[valid]
-        relationLabels = relationLabels[valid]
-        subjLabels = subjLabels[valid]
-        objLabels = objLabels[valid]
-        if self.mtmMaxPairs > 0 and relationFeatures.size(0) > self.mtmMaxPairs:
-            sample_index = torch.linspace(
-                0,
-                relationFeatures.size(0) - 1,
-                steps=self.mtmMaxPairs,
-                device=relationFeatures.device,
-            ).long()
-            relationFeatures = relationFeatures.index_select(0, sample_index)
-            relationLabels = relationLabels.index_select(0, sample_index)
-            subjLabels = subjLabels.index_select(0, sample_index)
-            objLabels = objLabels.index_select(0, sample_index)
-
-        adapted_visual_features = self.relationMtm.encode_visual(relationFeatures)
-        predicted_text_embeddings = self.relationMtm.encode_text_space(adapted_visual_features)
-        target_texts = self.buildTargetTripletTexts(subjLabels, relationLabels, objLabels)
-        target_embeddings = self.encodeTripletTexts(target_texts).to(predicted_text_embeddings.device)
-        predicted_norm = F.normalize(predicted_text_embeddings.float(), dim=-1)
-        adapted_visual_norm = F.normalize(adapted_visual_features.float(), dim=-1)
-        target_norm = F.normalize(target_embeddings.float(), dim=-1)
-
-        alignLoss = (1.0 - (predicted_norm * target_norm).sum(dim=-1)).mean()
-        self.updateMtmPrototypeBank(adapted_visual_norm.detach(), relationLabels)
-        visualStructureLoss, textStructureLoss = self.computeMtmStructureLosses(
-            predicted_norm,
-            adapted_visual_norm,
-            target_norm,
-            alignLoss,
-        )
-        if self.mtmDebugger is not None:
-            self.maybeRecordTripletPromptSimilarity(target_norm, subjLabels, relationLabels, objLabels)
-        return {
-            "loss_mtm_align": self.mtmLossWeight * self.mtmAlignWeight * alignLoss,
-            "loss_mtm_visual_structure": (
-                self.mtmLossWeight
-                * self.mtmStructureWeight
-                * self.mtmVisualStructureWeight
-                * visualStructureLoss
-            ),
-            "loss_mtm_text_structure": (
-                self.mtmLossWeight
-                * self.mtmStructureWeight
-                * self.mtmTextStructureWeight
-                * textStructureLoss
-            ),
-        }
-
-    def computeMtmPrototypeScores(self, relationFeatures, outShape, outDtype):
-        prototypeBank = self.buildActiveMtmPrototypeBank(relationFeatures.device)
-        if prototypeBank is None:
-            return relationFeatures.new_zeros(outShape, dtype=outDtype)
-        adaptedVisual = self.relationMtm.encode_visual(relationFeatures)
-        adaptedVisual = F.normalize(adaptedVisual.float(), dim=-1)
-        scores = torch.matmul(adaptedVisual, prototypeBank.t())
-        return scores[:, :outShape[1]].to(dtype=outDtype)
-
     def computeFactorizedMtmInferenceScores(self, relationFeatures, subjLabels, objLabels, outShape, outDtype):
         relationFeatures = self.clipFeatureToVector(relationFeatures).float()
         predicted = F.normalize(self.relationMtm(relationFeatures).float(), dim=-1)
@@ -1318,27 +1152,6 @@ class ClipPredictor(nn.Module):
         tripletMu = F.normalize(tripletMu, dim=-1)
         scores = (predicted.unsqueeze(1) * tripletMu).sum(dim=-1)
         return scores[:, :outShape[1]].to(dtype=outDtype)
-
-    def computeMtmInferenceScores(self, relationFeatures, subjLabels, objLabels, outShape, outDtype):
-        predicted_embeddings = F.normalize(self.relationMtm(relationFeatures).float(), dim=-1)
-        scores = relationFeatures.new_zeros(outShape, dtype=torch.float32)
-        for label in subjLabels.unique():
-            mask = subjLabels == label
-            rel_pos = torch.nonzero(mask, as_tuple=False).view(-1)
-            label_predicted_embeddings = predicted_embeddings.index_select(0, rel_pos)
-            label_obj_labels = objLabels.index_select(0, rel_pos)
-            cached_embeddings = []
-            num_candidate_relations = None
-            for objLabel in label_obj_labels:
-                embeddings, candidate_count = self.getFilteredTripletEmbeddings(label.item(), objLabel.item())
-                cached_embeddings.append(embeddings)
-                num_candidate_relations = candidate_count
-            candidate_embeddings = torch.stack(cached_embeddings, dim=0)
-            candidate_embeddings = candidate_embeddings.to(predicted_embeddings.device).float()
-            candidate_embeddings = candidate_embeddings.view(rel_pos.size(0), num_candidate_relations, -1)
-            label_scores = (label_predicted_embeddings.unsqueeze(1) * candidate_embeddings).sum(-1)
-            scores.index_copy_(0, rel_pos, label_scores[:, :outShape[1]])
-        return scores.to(dtype=outDtype)
 
     def updata(self,mode):
         self.description_relation = pd.read_csv(
@@ -1412,7 +1225,6 @@ class ClipPredictor(nn.Module):
 
 
         rel_dists=[]
-        relationFeaturesForMtm = []
         subFeaturesForMtm = []
         objFeaturesForMtm = []
         relFeaturesForMtm = []
@@ -1454,19 +1266,17 @@ class ClipPredictor(nn.Module):
 
             sub_features = image_features.index_select(0, sub_idx)
             obj_features = image_features.index_select(0, obj_idx)
-            if self.mtmFactorizedEnabled:
-                text_sub, _ = self.getEntityTextMuSigma(obj_n1)
-                text_obj, _ = self.getEntityTextMuSigma(obj_n2)
-                if self.mtmDetachMvaText:
-                    text_sub = text_sub.detach()
-                    text_obj = text_obj.detach()
-            else:
-                text_sub = self.text_features3.index_select(0, obj_n1)
-                text_obj = self.text_features4.index_select(0, obj_n2)
-
+            text_sub = self.text_features3.index_select(0, obj_n1)
+            text_obj = self.text_features4.index_select(0, obj_n2)
             cross_output1 = self.adaper_clip1(sub_features, obj_features, text_sub)
             cross_output2 = self.adaper_clip2(obj_features, sub_features, text_obj)
             cross_output = (cross_output1 + cross_output2) / 2
+
+            mtm_text_sub = text_sub.detach()
+            mtm_text_obj = text_obj.detach()
+            mtm_cross_output1 = self.mtm_adaper_clip1(sub_features, obj_features, mtm_text_sub)
+            mtm_cross_output2 = self.mtm_adaper_clip2(obj_features, sub_features, mtm_text_obj)
+            mtm_cross_output = (mtm_cross_output1 + mtm_cross_output2) / 2
             pair_spatial_features = self.buildPairSpatialFeatures(proposals[i], pair_idx).to(
                 device=cross_output.device,
                 dtype=cross_output.dtype,
@@ -1481,7 +1291,7 @@ class ClipPredictor(nn.Module):
                 relationnessLogitsForLoss.append(relationness_logits)
                 relationnessLabelsForLoss.append(rel_labels[i].to(relationness_logits.device))
 
-            if self.training and self.mtmLossEnabled and self.mtmFactorizedEnabled and rel_labels is not None:
+            if self.training and self.mtmLossEnabled and rel_labels is not None:
                 mtm_feature_pos = torch.nonzero(
                     rel_labels[i].to(pair_idx.device).view(-1) > 0,
                     as_tuple=False,
@@ -1489,9 +1299,7 @@ class ClipPredictor(nn.Module):
                 if mtm_feature_pos.numel() > 0:
                     subFeaturesForMtm.append(sub_features.index_select(0, mtm_feature_pos))
                     objFeaturesForMtm.append(obj_features.index_select(0, mtm_feature_pos))
-                    relFeatureForMtm = cross_output.index_select(0, mtm_feature_pos)
-                    if self.mtmDetachMvaFeatureForMtm:
-                        relFeatureForMtm = relFeatureForMtm.detach()
+                    relFeatureForMtm = mtm_cross_output.index_select(0, mtm_feature_pos)
                     relFeaturesForMtm.append(relFeatureForMtm)
                     relationLabelsForMtm.append(rel_labels[i].to(mtm_feature_pos.device).index_select(0, mtm_feature_pos))
                     if proposals[i].has_field("labels"):
@@ -1501,58 +1309,6 @@ class ClipPredictor(nn.Module):
                     else:
                         subjLabelsForMtm.append(obj_n1.index_select(0, mtm_feature_pos))
                         objLabelsForMtm.append(obj_n2.index_select(0, mtm_feature_pos))
-
-            mtm_relation_features = None
-            need_mtm_features = (
-                (not self.mtmFactorizedEnabled)
-                and (
-                    (self.training and self.mtmLossEnabled)
-                    or ((not self.training) and self.mtmUseInference and self.mtmInferenceWeight != 0)
-                    or ((not self.training) and self.mtmPrototypeEnabled and self.mtmPrototypeWeight != 0)
-                )
-            )
-            if need_mtm_features:
-                mtm_pair_idx = pair_idx
-                mtm_feature_pos = None
-                if self.training and rel_labels is not None:
-                    mtm_feature_pos = torch.nonzero(
-                        rel_labels[i].to(pair_idx.device).view(-1) > 0,
-                        as_tuple=False,
-                    ).view(-1)
-                    mtm_pair_idx = pair_idx.index_select(0, mtm_feature_pos)
-                union_pair_tensors = []
-                if mtm_pair_idx.numel() > 0:
-                    with torch.no_grad():
-                        for rel_index in mtm_pair_idx:
-                            union_img = crop_and_resize(
-                                img[i].unsqueeze(0),
-                                proposals[i].bbox[rel_index[0]],
-                                proposals[i].bbox[rel_index[1]],
-                            )
-                            iimg = union_img[0].permute(1, 2, 0).detach().cpu().numpy() * 255
-                            iimg = Image.fromarray(np.uint8(iimg))
-                            union_img = self.clip_preprocess(iimg).unsqueeze(0).to(self.device)
-                            union_pair_tensors.append(union_img)
-                        union_pair_tensors = torch.cat(union_pair_tensors)
-                        mtm_relation_features = self.clip_model.encode_image(union_pair_tensors)
-                        if mtm_relation_features.dim() == 3:
-                            mtm_relation_features = mtm_relation_features[:, 0, :]
-
-            if (
-                self.training
-                and self.mtmLossEnabled
-                and (not self.mtmFactorizedEnabled)
-                and mtm_relation_features is not None
-            ):
-                relationFeaturesForMtm.append(mtm_relation_features)
-                relationLabelsForMtm.append(rel_labels[i].to(mtm_feature_pos.device).index_select(0, mtm_feature_pos))
-                if proposals[i].has_field("labels"):
-                    gtObjLabels = proposals[i].get_field("labels").long()
-                    subjLabelsForMtm.append(gtObjLabels.index_select(0, sub_idx).index_select(0, mtm_feature_pos))
-                    objLabelsForMtm.append(gtObjLabels.index_select(0, obj_idx).index_select(0, mtm_feature_pos))
-                else:
-                    subjLabelsForMtm.append(obj_n1.index_select(0, mtm_feature_pos))
-                    objLabelsForMtm.append(obj_n2.index_select(0, mtm_feature_pos))
 
             cross_norm = cross_output / cross_output.norm(dim=-1, keepdim=True).clamp(min=1e-6)
             similarity1 = cross_norm @ text1_norm.t()
@@ -1590,35 +1346,14 @@ class ClipPredictor(nn.Module):
                     filter_scores.index_copy_(0, rel_pos, scores.to(dtype=filter_scores.dtype))
                 rel_dist_per_batch = description_scores * 0.2 + filter_scores * 0.8
                 if self.mtmUseInference and self.mtmInferenceWeight != 0:
-                    if self.mtmFactorizedEnabled:
-                        rawMtmScores = self.computeFactorizedMtmInferenceScores(
-                            cross_output,
-                            obj_n1,
-                            obj_n2,
-                            rel_dist_per_batch.shape,
-                            rel_dist_per_batch.dtype,
-                        )
-                    else:
-                        rawMtmScores = self.computeMtmInferenceScores(
-                            mtm_relation_features,
-                            obj_n1,
-                            obj_n2,
-                            rel_dist_per_batch.shape,
-                            rel_dist_per_batch.dtype,
-                        )
-                    rel_dist_per_batch = rel_dist_per_batch + self.mtmInferenceWeight * rawMtmScores
-                if (
-                    (not self.mtmFactorizedEnabled)
-                    and self.mtmPrototypeEnabled
-                    and self.mtmPrototypeWeight != 0
-                    and mtm_relation_features is not None
-                ):
-                    prototypeScores = self.computeMtmPrototypeScores(
-                        mtm_relation_features,
+                    rawMtmScores = self.computeFactorizedMtmInferenceScores(
+                        mtm_cross_output,
+                        obj_n1,
+                        obj_n2,
                         rel_dist_per_batch.shape,
                         rel_dist_per_batch.dtype,
                     )
-                    rel_dist_per_batch = rel_dist_per_batch + self.mtmPrototypeWeight * prototypeScores
+                    rel_dist_per_batch = rel_dist_per_batch + self.mtmInferenceWeight * rawMtmScores
                 if self.useRelationnessInference:
                     proposals[i].add_field("relationness_scores", relationness_scores.squeeze(-1).detach())
 
@@ -1631,26 +1366,16 @@ class ClipPredictor(nn.Module):
 
         add_losses = {}
         if self.training and self.mtmLossEnabled:
-            if self.mtmFactorizedEnabled:
-                add_losses.update(
-                    self.computeFactorizedMtmLosses(
-                        subFeaturesForMtm,
-                        objFeaturesForMtm,
-                        relFeaturesForMtm,
-                        relationLabelsForMtm,
-                        subjLabelsForMtm,
-                        objLabelsForMtm,
-                    )
+            add_losses.update(
+                self.computeFactorizedMtmLosses(
+                    subFeaturesForMtm,
+                    objFeaturesForMtm,
+                    relFeaturesForMtm,
+                    relationLabelsForMtm,
+                    subjLabelsForMtm,
+                    objLabelsForMtm,
                 )
-            else:
-                add_losses.update(
-                    self.computeMtmLosses(
-                        relationFeaturesForMtm,
-                        relationLabelsForMtm,
-                        subjLabelsForMtm,
-                        objLabelsForMtm,
-                    )
-                )
+            )
         if self.training and self.relationnessLossEnabled:
             add_losses.update(self.computeRelationnessLoss(relationnessLogitsForLoss, relationnessLabelsForLoss))
         return obj_dists, rel_dists, add_losses
