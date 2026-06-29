@@ -618,6 +618,8 @@ class ClipPredictor(nn.Module):
         self.mtmLossWeight = mtmConfig.LOSS_WEIGHT
         self.mtmAlignWeight = mtmConfig.ALIGN_WEIGHT
         self.mtmStructureWeight = mtmConfig.STRUCTURE_WEIGHT
+        self.mtmVisualStructureWeight = mtmConfig.VISUAL_STRUCTURE_WEIGHT
+        self.mtmTextStructureWeight = mtmConfig.TEXT_STRUCTURE_WEIGHT
         self.mtmMaxPairs = mtmConfig.MAX_PAIRS
         self.mtmUseInference = mtmConfig.ENABLED and mtmConfig.USE_INFERENCE
         self.mtmInferenceWeight = mtmConfig.INFERENCE_WEIGHT
@@ -856,8 +858,8 @@ class ClipPredictor(nn.Module):
             textStructureLoss = (predictedSimilarity - targetSimilarity).abs()[offDiagonal].mean()
         return {
             "loss_mtm_align": self.mtmLossWeight * self.mtmAlignWeight * alignLoss,
-            "loss_mtm_visual_structure": self.mtmLossWeight * self.mtmStructureWeight * visualStructureLoss,
-            "loss_mtm_text_structure": self.mtmLossWeight * self.mtmStructureWeight * textStructureLoss,
+            "loss_mtm_visual_structure": self.mtmLossWeight * self.mtmStructureWeight * self.mtmVisualStructureWeight * visualStructureLoss,
+            "loss_mtm_text_structure": self.mtmLossWeight * self.mtmStructureWeight * self.mtmTextStructureWeight * textStructureLoss,
         }
 
     def computeMtmInferenceScores(self, relationFeatures, subjLabels, objLabels, outShape, outDtype):
