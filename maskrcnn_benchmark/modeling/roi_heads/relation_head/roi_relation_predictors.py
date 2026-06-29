@@ -234,8 +234,6 @@ class GQAClipPredictor(nn.Module):
         obj_classes, rel_classes, att_classes = statistics['obj_classes'], statistics['rel_classes'], statistics[
             'att_classes']
         self.device=config.MODEL.DEVICE
-        self.trainRelNames = list(rel_classes)
-        self.trainPart = config.OV_SETTING.TRAIN_PART
         self.clip_model, self.clip_preprocess = clip.load("ViT-B/32", device=self.device)
 
         self.adaper_clip1 = MVA()
@@ -483,8 +481,6 @@ class ClipPredictor(nn.Module):
         obj_classes, rel_classes, att_classes = statistics['obj_classes'], statistics['rel_classes'], statistics[
             'att_classes']
         self.device=config.MODEL.DEVICE
-        self.trainRelNames = list(rel_classes)
-        self.trainPart = config.OV_SETTING.TRAIN_PART
         self.clip_model, self.clip_preprocess = clip.load("ViT-B/32", device=self.device)
 
         self.adaper_clip1 = MVA()
@@ -550,6 +546,7 @@ class ClipPredictor(nn.Module):
         self.novel=[0]+[self.id_dict[x] for x in sorted(config.OV_SETTING.PRDCS_NOVEL)]
 
         self.semantic = [0]+[self.id_dict[x] for x in sorted(config.OV_SETTING.SEMAN)]
+        self.mtmTextSvdFilter = pd.read_csv(curpath+"/filter_total.csv").iloc[:, 1:]
         mode="base"
 
         if mode=="base":
@@ -624,6 +621,9 @@ class ClipPredictor(nn.Module):
         self.mtmMaxPairs = mtmConfig.MAX_PAIRS
         self.mtmUseInference = mtmConfig.ENABLED and mtmConfig.USE_INFERENCE
         self.mtmInferenceWeight = mtmConfig.INFERENCE_WEIGHT
+        self.mtmTextSvdEnabled = mtmConfig.TEXT_SVD_ENABLED
+        self.mtmTextSvdComponents = mtmConfig.TEXT_SVD_COMPONENTS
+        self.mtmTextSvdChunkSize = mtmConfig.TEXT_SVD_CHUNK_SIZE
         self.relationnessEnabled = relationnessConfig.ENABLED
         self.relationnessLossEnabled = relationnessConfig.ENABLED and relationnessConfig.LOSS_ENABLED
         self.relationnessLossWeight = relationnessConfig.LOSS_WEIGHT
@@ -641,14 +641,89 @@ class ClipPredictor(nn.Module):
             hiddenDim=mtmConfig.EMBED_DIM // 2,
             dropout=mtmConfig.DROPOUT,
         ).to(self.device)
-        self.activeRelNames = self.trainRelNames
+        self.activeRelNames = activeRelNames
         self.filteredTripletEmbeddingCache = {}
+        self.tripletTextSvdCache = {}
+        self.tripletTextPrincipalComponents = None
+        self.updateMtmTextSvdBasis()
 
-    def encodeTripletTexts(self, tripletTexts):
+    def encodeRawTripletTexts(self, tripletTexts):
         with torch.no_grad():
             tripletTokens = clip.tokenize(tripletTexts).to(self.device)
             tripletTextFeatures = self.clip_model.encode_text(tripletTokens).float()
             return F.normalize(tripletTextFeatures, dim=-1)
+
+    def iterFilteredTripletTextChunks(self):
+        chunk = []
+        chunkSize = max(int(self.mtmTextSvdChunkSize), 1)
+        objectNames = self.obj_names[1:] if len(self.obj_names) > 1 else self.obj_names
+        for subjName in objectNames:
+            candidateRelations = list(self.mtmTextSvdFilter[subjName])
+            for relationName in candidateRelations:
+                if relationName == "__background__":
+                    continue
+                for objName in objectNames:
+                    chunk.append("a photo of a " + subjName + " " + relationName + " a " + objName)
+                    if len(chunk) >= chunkSize:
+                        yield chunk
+                        chunk = []
+        if len(chunk) > 0:
+            yield chunk
+
+    def updateMtmTextSvdBasis(self):
+        if not self.mtmEnabled or not self.mtmTextSvdEnabled or self.mtmTextSvdComponents <= 0:
+            self.tripletTextPrincipalComponents = None
+            return
+        cacheKey = "filter_total"
+        if cacheKey in self.tripletTextSvdCache:
+            cachedComponents = self.tripletTextSvdCache[cacheKey]
+            if cachedComponents is None:
+                self.tripletTextPrincipalComponents = None
+            else:
+                self.tripletTextPrincipalComponents = cachedComponents.to(self.device)
+            return
+
+        covariance = None
+        numTriplets = 0
+        with torch.no_grad():
+            for tripletTexts in self.iterFilteredTripletTextChunks():
+                tripletFeatures = self.encodeRawTripletTexts(tripletTexts).float()
+                if covariance is None:
+                    featureDim = tripletFeatures.size(-1)
+                    covariance = tripletFeatures.new_zeros((featureDim, featureDim))
+                covariance = covariance + torch.matmul(tripletFeatures.t(), tripletFeatures)
+                numTriplets += tripletFeatures.size(0)
+
+        if covariance is None or numTriplets < 2:
+            self.tripletTextPrincipalComponents = None
+            self.tripletTextSvdCache[cacheKey] = None
+            return
+
+        covariance = covariance / float(numTriplets)
+        try:
+            _, eigvecs = torch.linalg.eigh(covariance.float())
+        except AttributeError:
+            _, eigvecs = torch.symeig(covariance.float(), eigenvectors=True)
+        numComponents = min(int(self.mtmTextSvdComponents), eigvecs.size(1))
+        principalComponents = eigvecs[:, -numComponents:].contiguous()
+        principalComponents = F.normalize(principalComponents, dim=0).detach().cpu()
+        self.tripletTextSvdCache[cacheKey] = principalComponents
+        self.tripletTextPrincipalComponents = principalComponents.to(self.device)
+
+    def refineTripletTextFeatures(self, tripletTextFeatures):
+        tripletTextFeatures = F.normalize(tripletTextFeatures.float(), dim=-1)
+        if self.tripletTextPrincipalComponents is None:
+            return tripletTextFeatures
+        components = self.tripletTextPrincipalComponents.to(
+            device=tripletTextFeatures.device,
+            dtype=tripletTextFeatures.dtype,
+        )
+        projection = torch.matmul(torch.matmul(tripletTextFeatures, components), components.t())
+        return F.normalize(tripletTextFeatures - projection, dim=-1)
+
+    def encodeTripletTexts(self, tripletTexts):
+        tripletTextFeatures = self.encodeRawTripletTexts(tripletTexts)
+        return self.refineTripletTextFeatures(tripletTextFeatures)
 
     def buildTargetTripletTexts(self, subjLabels, relationLabels, objLabels):
         texts = []
@@ -840,8 +915,9 @@ class ClipPredictor(nn.Module):
         self.description_relation=np.array(self.description_relation)
         self.description_relation = np.array([[np.array(item) for item in inner_list] for inner_list in self.description_relation])
         self.description_relation=torch.Tensor(self.description_relation).to(self.device)
-        self.activeRelNames = self.trainRelNames if mode == self.trainPart else activeRelNames
+        self.activeRelNames = activeRelNames
         self.filteredTripletEmbeddingCache = {}
+        self.updateMtmTextSvdBasis()
 
         with torch.no_grad():
             self.texts5=[]
