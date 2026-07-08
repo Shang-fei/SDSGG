@@ -7,6 +7,7 @@ from torch import nn
 from torch.nn import functional as F
 from torchvision.transforms import Normalize, ToPILImage
 from torchvision.transforms import functional as FF
+from torchvision.ops import roi_align
 from maskrcnn_benchmark.layers import smooth_l1_loss, kl_div_loss, entropy_loss, Label_Smoothing_Regression
 from maskrcnn_benchmark.modeling.utils import cat
 from .model_msg_passing import IMPContext
@@ -134,33 +135,116 @@ class MVA(nn.Module):
         return sub_features
 
 
-class MTMRelationAdapter(nn.Module):
-    def __init__(self, inputDim=512, embedDim=512, dropout=0.1, reduction=4):
-        super(MTMRelationAdapter, self).__init__()
-        bottleneckDim = max(embedDim // reduction, 1)
-        self.inputProj = nn.Linear(inputDim, embedDim)
-        self.inputNorm = nn.LayerNorm(embedDim)
-        self.downProj = nn.Linear(embedDim, bottleneckDim)
-        self.upProj = nn.Linear(bottleneckDim, embedDim)
-        self.gate = nn.Linear(embedDim, embedDim)
-        self.dropout = nn.Dropout(dropout)
+class MTMUnionGateFusion(nn.Module):
+    def __init__(self, featureDim=512, spatialDim=32, dropout=0.1):
+        super(MTMUnionGateFusion, self).__init__()
+        priorDim = featureDim * 2 + spatialDim
+        deltaDim = featureDim * 3 + spatialDim
+        self.priorNet = nn.Sequential(
+            nn.Linear(priorDim, featureDim),
+            nn.LayerNorm(featureDim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.deltaNet = nn.Sequential(
+            nn.Linear(deltaDim, featureDim),
+            nn.LayerNorm(featureDim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(featureDim, featureDim),
+        )
+        self.gate = nn.Linear(featureDim, featureDim)
+        self.outputNorm = nn.LayerNorm(featureDim)
 
-    def forward(self, relationFeatures):
-        x = self.inputProj(relationFeatures.float())
-        residual = x
-        x = self.inputNorm(x)
-        delta = self.downProj(x)
-        delta = F.gelu(delta)
-        delta = self.dropout(delta)
-        delta = self.upProj(delta)
-        gate = torch.sigmoid(self.gate(x))
-        return residual + gate * delta
+    def forward(self, unionFeatures, subFeatures, objFeatures, spatialFeatures):
+        unionFeatures = unionFeatures.float()
+        subFeatures = subFeatures.float()
+        objFeatures = objFeatures.float()
+        spatialFeatures = spatialFeatures.float()
+        prior = self.priorNet(torch.cat([subFeatures, objFeatures, spatialFeatures], dim=-1))
+        delta = self.deltaNet(torch.cat([unionFeatures, subFeatures, objFeatures, spatialFeatures], dim=-1))
+        gate = torch.sigmoid(self.gate(prior))
+        return self.outputNorm(unionFeatures + gate * delta)
+
+
+class BPLPosteriorNet(nn.Module):
+    def __init__(self, inputDim=512, hiddenDim=256, outputDim=512):
+        super(BPLPosteriorNet, self).__init__()
+        self.shared = nn.Sequential(
+            nn.Linear(inputDim, hiddenDim),
+            nn.ELU(inplace=True),
+            nn.Linear(hiddenDim, hiddenDim),
+            nn.ELU(inplace=True),
+        )
+        self.mean = nn.Linear(hiddenDim, outputDim)
+        self.logvar = nn.Linear(hiddenDim, outputDim)
+
+    def forward(self, imageFeatures):
+        hidden = self.shared(imageFeatures.float())
+        return self.mean(hidden), self.logvar(hidden).clamp(min=-10.0, max=10.0)
+
+
+class BayesianTripletPromptLearner(nn.Module):
+    def __init__(self, clipModel, ctxLen=4, embedDim=512, initStd=0.02):
+        super(BayesianTripletPromptLearner, self).__init__()
+        self.clipModel = clipModel
+        self.ctxLen = ctxLen
+        self.ctx = nn.Parameter(torch.empty(ctxLen, embedDim))
+        nn.init.normal_(self.ctx, std=initStd)
+        self.posterior = BPLPosteriorNet(embedDim, embedDim // 2, embedDim)
+
+    def sampleResiduals(self, mu, logvar, sampleNum):
+        eps = torch.randn(
+            sampleNum,
+            mu.size(0),
+            mu.size(1),
+            device=mu.device,
+            dtype=mu.dtype,
+        )
+        return mu.unsqueeze(0) + eps * torch.exp(0.5 * logvar).unsqueeze(0)
+
+    def encodePromptEmbeddings(self, prompts, tokenizedPrompts):
+        dtype = self.clipModel.dtype
+        x = prompts.to(dtype=dtype) + self.clipModel.positional_embedding.type(dtype)
+        x = x.permute(1, 0, 2)
+        x = self.clipModel.transformer(x)
+        x = x.permute(1, 0, 2)
+        x = self.clipModel.ln_final(x).type(dtype)
+        x = x[torch.arange(x.shape[0], device=x.device), tokenizedPrompts.argmax(dim=-1)] @ self.clipModel.text_projection
+        return x.float()
+
+    def buildPromptSamples(self, tripletTexts, imageFeatures, sampleNum):
+        promptPrefix = " ".join(["X"] * self.ctxLen)
+        promptedTexts = [promptPrefix + " " + text for text in tripletTexts]
+        tokenizedPrompts = clip.tokenize(promptedTexts).to(imageFeatures.device)
+        with torch.no_grad():
+            tokenEmbeddings = self.clipModel.token_embedding(tokenizedPrompts).float()
+        mu, logvar = self.posterior(imageFeatures.detach().float())
+        residuals = self.sampleResiduals(mu, logvar, sampleNum)
+        prompts = []
+        prefix = tokenEmbeddings[:, :1, :]
+        suffix = tokenEmbeddings[:, 1 + self.ctxLen :, :]
+        ctx = self.ctx.unsqueeze(0).expand(imageFeatures.size(0), -1, -1)
+        for residual in residuals:
+            shiftedCtx = ctx + residual.unsqueeze(1)
+            prompts.append(torch.cat([prefix, shiftedCtx, suffix], dim=1))
+        prompts = torch.cat(prompts, dim=0)
+        repeatedTokens = tokenizedPrompts.repeat(sampleNum, 1)
+        features = self.encodePromptEmbeddings(prompts, repeatedTokens)
+        features = F.normalize(features, dim=-1)
+        return features.view(sampleNum, imageFeatures.size(0), -1), mu, logvar
+
+    def klLoss(self, mu, logvar):
+        return (-0.5 * (1.0 + logvar - mu.pow(2) - logvar.exp()).sum(dim=-1)).mean()
 
 
 class RelationModalityTransfer(nn.Module):
     def __init__(self, inputDim=512, embedDim=512, fcLayers=3, attentionLayers=3, numHeads=8, dropout=0.1):
         super(RelationModalityTransfer, self).__init__()
-        self.adapter = MTMRelationAdapter(inputDim, embedDim, dropout)
+        self.inputProj = nn.Sequential(
+            nn.Linear(inputDim, embedDim),
+            nn.LayerNorm(embedDim),
+        )
         layers = []
         currentDim = embedDim
         for _ in range(max(fcLayers - 1, 0)):
@@ -180,17 +264,11 @@ class RelationModalityTransfer(nn.Module):
         self.selfAttention = nn.TransformerEncoder(encoderLayer, num_layers=attentionLayers)
         self.norm = nn.LayerNorm(embedDim)
 
-    def encode_visual(self, relationFeatures):
-        return self.adapter(relationFeatures)
-
-    def encode_text_space(self, visualFeatures):
-        x = self.fc(visualFeatures).unsqueeze(0)
+    def forward(self, relationFeatures):
+        x = self.inputProj(relationFeatures.float())
+        x = self.fc(x).unsqueeze(0)
         x = self.selfAttention(x).squeeze(0)
         return self.norm(x)
-
-    def forward(self, relationFeatures):
-        visualFeatures = self.encode_visual(relationFeatures)
-        return self.encode_text_space(visualFeatures)
 
 
 class RelationnessHead(nn.Module):
@@ -619,17 +697,40 @@ class ClipPredictor(nn.Module):
         self.mtmAlignWeight = mtmConfig.ALIGN_WEIGHT
         self.mtmStructureWeight = mtmConfig.STRUCTURE_WEIGHT
         self.mtmVisualStructureWeight = mtmConfig.VISUAL_STRUCTURE_WEIGHT
-        self.mtmTextStructureWeight = mtmConfig.TEXT_STRUCTURE_WEIGHT
         self.mtmMaxPairs = mtmConfig.MAX_PAIRS
         self.mtmUseInference = mtmConfig.ENABLED and mtmConfig.USE_INFERENCE
         self.mtmInferenceWeight = mtmConfig.INFERENCE_WEIGHT
         self.mtmTextSvdEnabled = mtmConfig.TEXT_SVD_ENABLED
         self.mtmTextSvdComponents = mtmConfig.TEXT_SVD_COMPONENTS
         self.mtmTextSvdChunkSize = mtmConfig.TEXT_SVD_CHUNK_SIZE
+        self.mtmUnionGateFusionEnabled = mtmConfig.UNION_GATE_FUSION
+        self.mtmBplEnabled = mtmConfig.BPL_ENABLED
+        self.mtmBplSampleNum = mtmConfig.BPL_SAMPLE_NUM
+        self.mtmBplTestSampleNum = mtmConfig.BPL_TEST_SAMPLE_NUM
+        self.mtmBplKlWeight = mtmConfig.BPL_KL_WEIGHT
+        self.mtmBplSvdAnchorWeight = mtmConfig.BPL_SVD_ANCHOR_WEIGHT
+        self.clipInputSize = self.clip_model.visual.input_resolution
+        self.clipImageNormalize = Normalize(
+            (0.48145466, 0.4578275, 0.40821073),
+            (0.26862954, 0.26130258, 0.27577711),
+        )
+        for param in self.clip_model.parameters():
+            param.requires_grad_(False)
         self.relationnessEnabled = relationnessConfig.ENABLED
         self.relationnessLossEnabled = relationnessConfig.ENABLED and relationnessConfig.LOSS_ENABLED
         self.relationnessLossWeight = relationnessConfig.LOSS_WEIGHT
         self.useRelationnessInference = relationnessConfig.ENABLED and relationnessConfig.USE_INFERENCE
+        self.mtmUnionGateFusion = MTMUnionGateFusion(
+            featureDim=mtmConfig.INPUT_DIM,
+            spatialDim=32,
+            dropout=mtmConfig.DROPOUT,
+        ).to(self.device)
+        self.bplPromptLearner = BayesianTripletPromptLearner(
+            self.clip_model,
+            ctxLen=mtmConfig.BPL_CTX_LEN,
+            embedDim=mtmConfig.EMBED_DIM,
+            initStd=mtmConfig.BPL_INIT_STD,
+        ).to(self.device)
         self.relationMtm = RelationModalityTransfer(
             mtmConfig.INPUT_DIM,
             mtmConfig.EMBED_DIM,
@@ -768,6 +869,71 @@ class ClipPredictor(nn.Module):
         embeddings, numCandidateRelations = self.filteredTripletEmbeddingCache[cacheKey]
         return embeddings.to(self.device), numCandidateRelations
 
+    def encodeClipImageFeatureMap(self, image):
+        imageInput = FF.resize(image, (self.clipInputSize, self.clipInputSize))
+        imageInput = self.clipImageNormalize(imageInput).unsqueeze(0).to(self.device)
+        tokens = self.clip_model.encode_image(imageInput)
+        if tokens.dim() != 3:
+            raise ValueError("MTM RoIAlign requires CLIP ViT token features, got shape {}".format(tuple(tokens.shape)))
+        globalFeature = tokens[:, 0, :].float()
+        patchTokens = tokens[:, 1:, :]
+        gridSize = int(patchTokens.size(1) ** 0.5)
+        if gridSize * gridSize != patchTokens.size(1):
+            raise ValueError("CLIP patch token count {} is not a square grid".format(patchTokens.size(1)))
+        featureMap = patchTokens.permute(0, 2, 1).contiguous().view(1, patchTokens.size(-1), gridSize, gridSize)
+        return globalFeature, featureMap
+
+    def scaleBoxesToClipInput(self, boxes, image):
+        _, imageHeight, imageWidth = image.shape
+        scaledBoxes = boxes.float().clone()
+        scaledBoxes[:, 0::2] = scaledBoxes[:, 0::2] * (float(self.clipInputSize) / float(imageWidth))
+        scaledBoxes[:, 1::2] = scaledBoxes[:, 1::2] * (float(self.clipInputSize) / float(imageHeight))
+        return scaledBoxes
+
+    def poolClipRoiFeatures(self, clipFeatureMap, boxes):
+        if boxes.numel() == 0:
+            return clipFeatureMap.new_zeros((0, clipFeatureMap.size(1)))
+        rois = torch.cat(
+            [
+                boxes.new_zeros((boxes.size(0), 1)),
+                boxes.to(device=clipFeatureMap.device, dtype=clipFeatureMap.dtype),
+            ],
+            dim=1,
+        )
+        spatialScale = float(clipFeatureMap.size(-1)) / float(self.clipInputSize)
+        pooled = roi_align(
+            clipFeatureMap,
+            rois,
+            output_size=(1, 1),
+            spatial_scale=spatialScale,
+            aligned=True,
+        )
+        return pooled.flatten(1)
+
+    def buildUnionBoxes(self, boxes, pairIdx):
+        subBoxes = boxes.index_select(0, pairIdx[:, 0].to(boxes.device))
+        objBoxes = boxes.index_select(0, pairIdx[:, 1].to(boxes.device))
+        topLeft = torch.min(subBoxes[:, :2], objBoxes[:, :2])
+        bottomRight = torch.max(subBoxes[:, 2:], objBoxes[:, 2:])
+        return torch.cat([topLeft, bottomRight], dim=-1)
+
+    def buildMtmRoiRelationFeatures(self, clipFeatureMap, proposal, pairIdx, image):
+        pairIdx = pairIdx.to(proposal.bbox.device)
+        clipBoxes = self.scaleBoxesToClipInput(proposal.bbox, image)
+        subBoxes = clipBoxes.index_select(0, pairIdx[:, 0])
+        objBoxes = clipBoxes.index_select(0, pairIdx[:, 1])
+        unionBoxes = self.buildUnionBoxes(clipBoxes, pairIdx)
+        subFeatures = self.poolClipRoiFeatures(clipFeatureMap, subBoxes)
+        objFeatures = self.poolClipRoiFeatures(clipFeatureMap, objBoxes)
+        unionFeatures = self.poolClipRoiFeatures(clipFeatureMap, unionBoxes)
+        spatialFeatures = self.buildPairSpatialFeatures(proposal, pairIdx).to(
+            device=unionFeatures.device,
+            dtype=unionFeatures.dtype,
+        )
+        if not self.mtmUnionGateFusionEnabled:
+            return unionFeatures
+        return self.mtmUnionGateFusion(unionFeatures, subFeatures, objFeatures, spatialFeatures)
+
     def buildPairSpatialFeatures(self, proposal, pairIdx):
         boxInfo = get_box_info(proposal.bbox, need_norm=True, proposal=proposal)
         subjBoxInfo = boxInfo.index_select(0, pairIdx[:, 0])
@@ -789,18 +955,22 @@ class ClipPredictor(nn.Module):
         loss = (positiveLoss + negativeLoss).sum() / normalizer
         return {"loss_mtm_relationness": self.relationnessLossWeight * loss}
 
-    def computeMtmLosses(self, relationFeatures, relationLabels, subjLabels, objLabels):
+    def computeMtmLosses(self, relationFeatures, relationLabels, subjLabels, objLabels, bplConditionFeatures=None):
         if not self.mtmLossEnabled or len(relationFeatures) == 0 or relationLabels is None:
             zero = self.relationMtm.norm.weight.sum() * 0.0
             return {
                 "loss_mtm_align": zero,
                 "loss_mtm_visual_structure": zero,
                 "loss_mtm_text_structure": zero,
+                "loss_mtm_bpl_kl": zero,
+                "loss_mtm_bpl_svd_anchor": zero,
             }
         relationFeatures = torch.cat(relationFeatures, dim=0).float()
         relationLabels = torch.cat(relationLabels, dim=0).view(-1).long().to(relationFeatures.device)
         subjLabels = torch.cat(subjLabels, dim=0).view(-1).long().to(relationFeatures.device)
         objLabels = torch.cat(objLabels, dim=0).view(-1).long().to(relationFeatures.device)
+        if bplConditionFeatures is not None and len(bplConditionFeatures) > 0:
+            bplConditionFeatures = torch.cat(bplConditionFeatures, dim=0).float().to(relationFeatures.device)
         positive = relationLabels > 0
         if positive.any() and relationLabels[positive].max().item() >= len(self.activeRelNames):
             raise ValueError(
@@ -816,11 +986,15 @@ class ClipPredictor(nn.Module):
                 "loss_mtm_align": zero,
                 "loss_mtm_visual_structure": zero,
                 "loss_mtm_text_structure": zero,
+                "loss_mtm_bpl_kl": zero,
+                "loss_mtm_bpl_svd_anchor": zero,
             }
         relationFeatures = relationFeatures[valid]
         relationLabels = relationLabels[valid]
         subjLabels = subjLabels[valid]
         objLabels = objLabels[valid]
+        if bplConditionFeatures is not None:
+            bplConditionFeatures = bplConditionFeatures[valid]
         if self.mtmMaxPairs > 0 and relationFeatures.size(0) > self.mtmMaxPairs:
             sample_index = torch.linspace(
                 0,
@@ -832,34 +1006,53 @@ class ClipPredictor(nn.Module):
             relationLabels = relationLabels.index_select(0, sample_index)
             subjLabels = subjLabels.index_select(0, sample_index)
             objLabels = objLabels.index_select(0, sample_index)
+            if bplConditionFeatures is not None:
+                bplConditionFeatures = bplConditionFeatures.index_select(0, sample_index)
 
-        adapted_visual_features = self.relationMtm.encode_visual(relationFeatures)
-        predicted_text_embeddings = self.relationMtm.encode_text_space(adapted_visual_features)
+        predicted_text_embeddings = self.relationMtm(relationFeatures)
         target_texts = self.buildTargetTripletTexts(subjLabels, relationLabels, objLabels)
-        target_embeddings = self.encodeTripletTexts(target_texts).to(predicted_text_embeddings.device)
         predicted_norm = F.normalize(predicted_text_embeddings.float(), dim=-1)
-        adapted_visual_norm = F.normalize(adapted_visual_features.float(), dim=-1)
-        target_norm = F.normalize(target_embeddings.float(), dim=-1)
+        input_visual_norm = F.normalize(relationFeatures.float(), dim=-1)
+        bplKlLoss = predicted_norm.sum() * 0.0
+        bplSvdAnchorLoss = predicted_norm.sum() * 0.0
+        textStructureLoss = predicted_norm.sum() * 0.0
 
-        alignLoss = (1.0 - (predicted_norm * target_norm).sum(dim=-1)).mean()
+        if self.mtmBplEnabled:
+            if bplConditionFeatures is None:
+                raise ValueError("BPL MTM loss requires pair-level condition features when MTM.BPL_ENABLED is True")
+            target_samples, bplMu, bplLogvar = self.bplPromptLearner.buildPromptSamples(
+                target_texts,
+                bplConditionFeatures.to(predicted_text_embeddings.device),
+                int(self.mtmBplSampleNum),
+            )
+            target_norm = F.normalize(target_samples.float(), dim=-1)
+            svd_anchor = self.encodeTripletTexts(target_texts).to(predicted_text_embeddings.device)
+            svd_anchor = F.normalize(svd_anchor.float(), dim=-1)
+            alignLoss = (1.0 - (predicted_norm.unsqueeze(0) * target_norm).sum(dim=-1)).mean()
+            bplSvdAnchorLoss = (1.0 - (target_norm * svd_anchor.unsqueeze(0)).sum(dim=-1)).mean()
+            bplKlLoss = self.bplPromptLearner.klLoss(bplMu, bplLogvar)
+        else:
+            target_embeddings = self.encodeTripletTexts(target_texts).to(predicted_text_embeddings.device)
+            target_norm = F.normalize(target_embeddings.float(), dim=-1)
+            alignLoss = (1.0 - (predicted_norm * target_norm).sum(dim=-1)).mean()
+
         if predicted_norm.size(0) < 2:
             visualStructureLoss = alignLoss * 0.0
-            textStructureLoss = alignLoss * 0.0
         else:
             predictedSimilarity = torch.matmul(predicted_norm, predicted_norm.t())
-            adaptedVisualSimilarity = torch.matmul(adapted_visual_norm, adapted_visual_norm.t())
-            targetSimilarity = torch.matmul(target_norm, target_norm.t())
+            inputVisualSimilarity = torch.matmul(input_visual_norm, input_visual_norm.t())
             offDiagonal = ~torch.eye(
                 predictedSimilarity.size(0),
                 dtype=torch.bool,
                 device=predictedSimilarity.device,
             )
-            visualStructureLoss = (adaptedVisualSimilarity - predictedSimilarity).abs()[offDiagonal].mean()
-            textStructureLoss = (predictedSimilarity - targetSimilarity).abs()[offDiagonal].mean()
+            visualStructureLoss = (inputVisualSimilarity - predictedSimilarity).abs()[offDiagonal].mean()
         return {
             "loss_mtm_align": self.mtmLossWeight * self.mtmAlignWeight * alignLoss,
             "loss_mtm_visual_structure": self.mtmLossWeight * self.mtmStructureWeight * self.mtmVisualStructureWeight * visualStructureLoss,
-            "loss_mtm_text_structure": self.mtmLossWeight * self.mtmStructureWeight * self.mtmTextStructureWeight * textStructureLoss,
+            "loss_mtm_text_structure": textStructureLoss,
+            "loss_mtm_bpl_kl": self.mtmBplKlWeight * bplKlLoss,
+            "loss_mtm_bpl_svd_anchor": self.mtmLossWeight * self.mtmBplSvdAnchorWeight * bplSvdAnchorLoss,
         }
 
     def computeMtmInferenceScores(self, relationFeatures, subjLabels, objLabels, outShape, outDtype):
@@ -870,16 +1063,41 @@ class ClipPredictor(nn.Module):
             rel_pos = torch.nonzero(mask, as_tuple=False).view(-1)
             label_predicted_embeddings = predicted_embeddings.index_select(0, rel_pos)
             label_obj_labels = objLabels.index_select(0, rel_pos)
-            cached_embeddings = []
+            label_condition_features = relationFeatures.index_select(0, rel_pos)
+            candidate_features = []
             num_candidate_relations = None
-            for objLabel in label_obj_labels:
-                embeddings, candidate_count = self.getFilteredTripletEmbeddings(label.item(), objLabel.item())
-                cached_embeddings.append(embeddings)
+            for pairOffset, objLabel in enumerate(label_obj_labels):
+                if self.mtmBplEnabled:
+                    candidateObjLabels = torch.tensor([int(objLabel.item())], device=self.device)
+                    tripletTexts, candidate_count = self.buildFilteredTripletTexts(int(label.item()), candidateObjLabels)
+                    conditionFeatures = label_condition_features[pairOffset : pairOffset + 1].to(
+                        predicted_embeddings.device
+                    ).expand(len(tripletTexts), -1)
+                    samples, _, _ = self.bplPromptLearner.buildPromptSamples(
+                        tripletTexts,
+                        conditionFeatures,
+                        int(self.mtmBplTestSampleNum),
+                    )
+                    samples = F.normalize(samples.float(), dim=-1)
+                    candidate_features.append(samples)
+                else:
+                    embeddings, candidate_count = self.getFilteredTripletEmbeddings(label.item(), objLabel.item())
+                    candidate_features.append(embeddings)
                 num_candidate_relations = candidate_count
-            candidate_embeddings = torch.stack(cached_embeddings, dim=0)
-            candidate_embeddings = candidate_embeddings.to(predicted_embeddings.device).float()
-            candidate_embeddings = candidate_embeddings.view(rel_pos.size(0), num_candidate_relations, -1)
-            label_scores = (label_predicted_embeddings.unsqueeze(1) * candidate_embeddings).sum(-1)
+            if self.mtmBplEnabled:
+                candidate_samples = torch.stack(candidate_features, dim=1).to(predicted_embeddings.device).float()
+                candidate_samples = candidate_samples.view(
+                    int(self.mtmBplTestSampleNum),
+                    rel_pos.size(0),
+                    num_candidate_relations,
+                    -1,
+                )
+                label_scores = (label_predicted_embeddings.unsqueeze(0).unsqueeze(2) * candidate_samples).sum(-1).mean(dim=0)
+            else:
+                candidate_embeddings = torch.stack(candidate_features, dim=0)
+                candidate_embeddings = candidate_embeddings.to(predicted_embeddings.device).float()
+                candidate_embeddings = candidate_embeddings.view(rel_pos.size(0), num_candidate_relations, -1)
+                label_scores = (label_predicted_embeddings.unsqueeze(1) * candidate_embeddings).sum(-1)
             scores.index_copy_(0, rel_pos, label_scores[:, :outShape[1]])
         return scores.to(dtype=outDtype)
 
@@ -960,6 +1178,7 @@ class ClipPredictor(nn.Module):
         relationLabelsForMtm = []
         subjLabelsForMtm = []
         objLabelsForMtm = []
+        bplConditionFeatures = []
         relationnessLogitsForLoss = []
         relationnessLabelsForLoss = []
         for i in range(len(num_rels)):
@@ -1029,26 +1248,19 @@ class ClipPredictor(nn.Module):
                         as_tuple=False,
                     ).view(-1)
                     mtm_pair_idx = pair_idx.index_select(0, mtm_feature_pos)
-                union_pair_tensors = []
                 if mtm_pair_idx.numel() > 0:
                     with torch.no_grad():
-                        for rel_index in mtm_pair_idx:
-                            union_img = crop_and_resize(
-                                img[i].unsqueeze(0),
-                                proposals[i].bbox[rel_index[0]],
-                                proposals[i].bbox[rel_index[1]],
-                            )
-                            iimg = union_img[0].permute(1, 2, 0).detach().cpu().numpy() * 255
-                            iimg = Image.fromarray(np.uint8(iimg))
-                            union_img = self.clip_preprocess(iimg).unsqueeze(0).to(self.device)
-                            union_pair_tensors.append(union_img)
-                        union_pair_tensors = torch.cat(union_pair_tensors)
-                        mtm_relation_features = self.clip_model.encode_image(union_pair_tensors)
-                        if mtm_relation_features.dim() == 3:
-                            mtm_relation_features = mtm_relation_features[:, 0, :]
+                        _, mtm_clip_feature_map = self.encodeClipImageFeatureMap(img[i])
+                    mtm_relation_features = self.buildMtmRoiRelationFeatures(
+                        mtm_clip_feature_map,
+                        proposals[i],
+                        mtm_pair_idx,
+                        img[i],
+                    )
 
             if self.training and self.mtmLossEnabled and mtm_relation_features is not None:
                 relationFeaturesForMtm.append(mtm_relation_features)
+                bplConditionFeatures.append(mtm_relation_features.detach())
                 relationLabelsForMtm.append(rel_labels[i].to(mtm_feature_pos.device).index_select(0, mtm_feature_pos))
                 if proposals[i].has_field("labels"):
                     gtObjLabels = proposals[i].get_field("labels").long()
@@ -1114,7 +1326,7 @@ class ClipPredictor(nn.Module):
 
         add_losses = {}
         if self.training and self.mtmLossEnabled:
-            add_losses.update(self.computeMtmLosses(relationFeaturesForMtm, relationLabelsForMtm, subjLabelsForMtm, objLabelsForMtm))
+            add_losses.update(self.computeMtmLosses(relationFeaturesForMtm, relationLabelsForMtm, subjLabelsForMtm, objLabelsForMtm, bplConditionFeatures))
         if self.training and self.relationnessLossEnabled:
             add_losses.update(self.computeRelationnessLoss(relationnessLogitsForLoss, relationnessLabelsForLoss))
         return obj_dists, rel_dists, add_losses
