@@ -876,7 +876,7 @@ class ClipPredictor(nn.Module):
         if tokens.dim() != 3:
             raise ValueError("MTM RoIAlign requires CLIP ViT token features, got shape {}".format(tuple(tokens.shape)))
         globalFeature = tokens[:, 0, :].float()
-        patchTokens = tokens[:, 1:, :]
+        patchTokens = tokens[:, 1:, :].float()
         gridSize = int(patchTokens.size(1) ** 0.5)
         if gridSize * gridSize != patchTokens.size(1):
             raise ValueError("CLIP patch token count {} is not a square grid".format(patchTokens.size(1)))
@@ -895,7 +895,7 @@ class ClipPredictor(nn.Module):
             return clipFeatureMap.new_zeros((0, clipFeatureMap.size(1)))
         rois = torch.cat(
             [
-                boxes.new_zeros((boxes.size(0), 1)),
+                torch.zeros((boxes.size(0), 1), device=clipFeatureMap.device, dtype=clipFeatureMap.dtype),
                 boxes.to(device=clipFeatureMap.device, dtype=clipFeatureMap.dtype),
             ],
             dim=1,
