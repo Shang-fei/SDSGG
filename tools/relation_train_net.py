@@ -286,9 +286,12 @@ def run_val(cfg, model, val_data_loaders, distributed, logger):
     model.updata(cfg.OV_SETTING.TRAIN_PART)
     return val_result
 
-def run_test_for_part(cfg, model, distributed, logger, test_part):
+def run_test(cfg, model, distributed, logger):
+    if distributed:
+        model = model.module
+
     torch.cuda.empty_cache()
-    model.updata(test_part)
+    model.updata(cfg.OV_SETTING.TEST_PART)
     iou_types = ("bbox",)
     if cfg.MODEL.MASK_ON:
         iou_types = iou_types + ("segm",)
@@ -303,12 +306,11 @@ def run_test_for_part(cfg, model, distributed, logger, test_part):
     dataset_names = cfg.DATASETS.TEST
     if cfg.OUTPUT_DIR:
         for idx, dataset_name in enumerate(dataset_names):
-            output_folder = os.path.join(cfg.OUTPUT_DIR, "inference", test_part, dataset_name)
+            output_folder = os.path.join(cfg.OUTPUT_DIR, "inference", dataset_name)
             mkdir(output_folder)
             output_folders[idx] = output_folder
     data_loaders_val = make_data_loader(cfg, mode='test', is_distributed=distributed)
     test_result = []
-    logger.info("Start testing on {} predicates".format(test_part))
     for output_folder, dataset_name, data_loader_val in zip(output_folders, dataset_names, data_loaders_val):
         dataset_result = inference(
             cfg,
@@ -332,18 +334,6 @@ def run_test_for_part(cfg, model, distributed, logger, test_part):
     test_result = float(valid_result.mean())
     del gathered_result, valid_result
     torch.cuda.empty_cache()
-    logger.info("{} Test Result: {:.4f}".format(test_part, test_result))
-    return test_result
-
-
-def run_test(cfg, model, distributed, logger):
-    if distributed:
-        model = model.module
-
-    primary_test_part = cfg.OV_SETTING.TEST_PART
-    test_result = run_test_for_part(cfg, model, distributed, logger, primary_test_part)
-    if primary_test_part != "base":
-        run_test_for_part(cfg, model, distributed, logger, "base")
     model.updata(cfg.OV_SETTING.TRAIN_PART)
     return test_result
 

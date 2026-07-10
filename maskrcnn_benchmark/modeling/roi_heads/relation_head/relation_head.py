@@ -37,7 +37,10 @@ class ROIRelationHead(torch.nn.Module):
         self.samp_processor = make_roi_relation_samp_processor(cfg)
 
         # parameters
-        self.use_union_box = self.cfg.MODEL.ROI_RELATION_HEAD.PREDICT_USE_VISION
+        self.use_union_box = (
+            self.cfg.MODEL.ROI_RELATION_HEAD.PREDICT_USE_VISION
+            and self.cfg.MODEL.ROI_RELATION_HEAD.PREDICTOR != "ClipPredictor"
+        )
 
     def updata(self,mode):
         self.predictor.updata(mode)

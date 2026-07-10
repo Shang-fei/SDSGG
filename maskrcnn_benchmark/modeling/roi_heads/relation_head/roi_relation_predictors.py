@@ -167,41 +167,56 @@ class MTMUnionGateFusion(nn.Module):
         return self.outputNorm(unionFeatures + gate * delta)
 
 
-class BPLPosteriorNet(nn.Module):
-    def __init__(self, inputDim=512, hiddenDim=256, outputDim=512):
-        super(BPLPosteriorNet, self).__init__()
-        self.shared = nn.Sequential(
+def initializeShipLayer(module):
+    if isinstance(module, nn.Linear):
+        nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
+
+
+class ShipVisualEncoder(nn.Module):
+    def __init__(self, inputDim=512, hiddenDim=2048, latentDim=512):
+        super(ShipVisualEncoder, self).__init__()
+        self.featureEncoder = nn.Sequential(
             nn.Linear(inputDim, hiddenDim),
-            nn.ELU(inplace=True),
-            nn.Linear(hiddenDim, hiddenDim),
-            nn.ELU(inplace=True),
+            nn.ReLU(inplace=True),
         )
-        self.mean = nn.Linear(hiddenDim, outputDim)
-        self.logvar = nn.Linear(hiddenDim, outputDim)
+        self.mean = nn.Linear(hiddenDim, latentDim)
+        self.logvar = nn.Linear(hiddenDim, latentDim)
+        self.apply(initializeShipLayer)
 
-    def forward(self, imageFeatures):
-        hidden = self.shared(imageFeatures.float())
-        return self.mean(hidden), self.logvar(hidden).clamp(min=-10.0, max=10.0)
+    def forward(self, visualFeatures):
+        hidden = self.featureEncoder(visualFeatures.float())
+        return self.mean(hidden), self.logvar(hidden)
 
 
-class BayesianTripletPromptLearner(nn.Module):
+class ShipLatentGenerator(nn.Module):
+    def __init__(self, latentDim=512, hiddenDim=4096, outputDim=512):
+        super(ShipLatentGenerator, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(latentDim, hiddenDim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hiddenDim, outputDim),
+        )
+        self.apply(initializeShipLayer)
+
+    def forward(self, latentFeatures):
+        return self.net(latentFeatures.float())
+
+
+class ShipTripletFeatureGenerator(nn.Module):
     def __init__(self, clipModel, ctxLen=4, embedDim=512, initStd=0.02):
-        super(BayesianTripletPromptLearner, self).__init__()
-        self.clipModel = clipModel
+        super(ShipTripletFeatureGenerator, self).__init__()
+        object.__setattr__(self, "clipModel", clipModel)
         self.ctxLen = ctxLen
         self.ctx = nn.Parameter(torch.empty(ctxLen, embedDim))
         nn.init.normal_(self.ctx, std=initStd)
-        self.posterior = BPLPosteriorNet(embedDim, embedDim // 2, embedDim)
+        self.visualEncoder = ShipVisualEncoder(embedDim, 2048, embedDim)
+        self.latentGenerator = ShipLatentGenerator(embedDim, 4096, embedDim)
 
-    def sampleResiduals(self, mu, logvar, sampleNum):
-        eps = torch.randn(
-            sampleNum,
-            mu.size(0),
-            mu.size(1),
-            device=mu.device,
-            dtype=mu.dtype,
-        )
-        return mu.unsqueeze(0) + eps * torch.exp(0.5 * logvar).unsqueeze(0)
+    def reparameterize(self, mean, logvar):
+        noise = torch.randn_like(mean)
+        return mean + noise * torch.exp(0.5 * logvar)
 
     def encodePromptEmbeddings(self, prompts, tokenizedPrompts):
         dtype = self.clipModel.dtype
@@ -213,29 +228,35 @@ class BayesianTripletPromptLearner(nn.Module):
         x = x[torch.arange(x.shape[0], device=x.device), tokenizedPrompts.argmax(dim=-1)] @ self.clipModel.text_projection
         return x.float()
 
-    def buildPromptSamples(self, tripletTexts, imageFeatures, sampleNum):
+    def encodeResidualPrompts(self, tripletTexts, residuals):
         promptPrefix = " ".join(["X"] * self.ctxLen)
         promptedTexts = [promptPrefix + " " + text for text in tripletTexts]
-        tokenizedPrompts = clip.tokenize(promptedTexts).to(imageFeatures.device)
+        tokenizedPrompts = clip.tokenize(promptedTexts).to(residuals.device)
         with torch.no_grad():
             tokenEmbeddings = self.clipModel.token_embedding(tokenizedPrompts).float()
-        mu, logvar = self.posterior(imageFeatures.detach().float())
-        residuals = self.sampleResiduals(mu, logvar, sampleNum)
-        prompts = []
         prefix = tokenEmbeddings[:, :1, :]
         suffix = tokenEmbeddings[:, 1 + self.ctxLen :, :]
-        ctx = self.ctx.unsqueeze(0).expand(imageFeatures.size(0), -1, -1)
-        for residual in residuals:
-            shiftedCtx = ctx + residual.unsqueeze(1)
-            prompts.append(torch.cat([prefix, shiftedCtx, suffix], dim=1))
-        prompts = torch.cat(prompts, dim=0)
-        repeatedTokens = tokenizedPrompts.repeat(sampleNum, 1)
-        features = self.encodePromptEmbeddings(prompts, repeatedTokens)
-        features = F.normalize(features, dim=-1)
-        return features.view(sampleNum, imageFeatures.size(0), -1), mu, logvar
+        ctx = self.ctx.unsqueeze(0).expand(residuals.size(0), -1, -1)
+        shiftedCtx = ctx + residuals.unsqueeze(1)
+        prompts = torch.cat([prefix, shiftedCtx, suffix], dim=1)
+        features = self.encodePromptEmbeddings(prompts, tokenizedPrompts)
+        return F.normalize(features.float(), dim=-1)
 
-    def klLoss(self, mu, logvar):
-        return (-0.5 * (1.0 + logvar - mu.pow(2) - logvar.exp()).sum(dim=-1)).mean()
+    def reconstruct(self, tripletTexts, visualFeatures):
+        reconstructionTargets = F.normalize(visualFeatures.detach().float(), dim=-1)
+        mean, logvar = self.visualEncoder(reconstructionTargets)
+        latentFeatures = self.reparameterize(mean, logvar)
+        residuals = self.latentGenerator(latentFeatures)
+        reconstructedFeatures = self.encodeResidualPrompts(tripletTexts, residuals)
+        return reconstructedFeatures, mean, logvar
+
+    def generate(self, tripletTexts, device):
+        latentFeatures = torch.randn(len(tripletTexts), self.ctx.size(1), device=device, dtype=torch.float32)
+        residuals = self.latentGenerator(latentFeatures)
+        return self.encodeResidualPrompts(tripletTexts, residuals)
+
+    def klLoss(self, mean, logvar):
+        return (-0.5 * (1.0 + logvar - mean.pow(2) - logvar.exp()).sum(dim=-1)).mean()
 
 
 class RelationModalityTransfer(nn.Module):
@@ -673,14 +694,8 @@ class ClipPredictor(nn.Module):
             text_features4 = self.clip_model.encode_text(text4)
             self.text_features4=text_features4
 
-            self.texts5=[]
-
-            for obj in self.obj_names:
-                text5 = clip.tokenize(["a photo of " + tex for tex in list(self.sub_filter_novel[obj])]).to(
-                    self.device)
-                text_features5 = self.clip_model.encode_text(text5)
-                text_features5 = text_features5
-                self.texts5.append(text_features5.detach().cpu().numpy())
+            self.texts5 = self.encodeSubjectFilterTextFeatures(self.sub_filter_novel)
+            self.texts5Tensor = F.normalize(torch.stack(self.texts5, dim=0), dim=-1)
 
         b=time.time()
         print('init complete : '+str(b-a))
@@ -704,11 +719,12 @@ class ClipPredictor(nn.Module):
         self.mtmTextSvdComponents = mtmConfig.TEXT_SVD_COMPONENTS
         self.mtmTextSvdChunkSize = mtmConfig.TEXT_SVD_CHUNK_SIZE
         self.mtmUnionGateFusionEnabled = mtmConfig.UNION_GATE_FUSION
-        self.mtmBplEnabled = mtmConfig.BPL_ENABLED
-        self.mtmBplSampleNum = mtmConfig.BPL_SAMPLE_NUM
-        self.mtmBplTestSampleNum = mtmConfig.BPL_TEST_SAMPLE_NUM
-        self.mtmBplKlWeight = mtmConfig.BPL_KL_WEIGHT
-        self.mtmBplSvdAnchorWeight = mtmConfig.BPL_SVD_ANCHOR_WEIGHT
+        self.mtmShipEnabled = mtmConfig.SHIP_ENABLED
+        self.mtmShipPseudoRatio = mtmConfig.SHIP_PSEUDO_RATIO
+        self.mtmShipReconWeight = mtmConfig.SHIP_RECON_WEIGHT
+        self.mtmShipKlWeight = mtmConfig.SHIP_KL_WEIGHT
+        self.mtmShipNovelAlignWeight = mtmConfig.SHIP_NOVEL_ALIGN_WEIGHT
+        self.mtmShipRampIters = max(int(mtmConfig.SHIP_RAMP_ITERS), 1)
         self.clipInputSize = self.clip_model.visual.input_resolution
         self.clipImageNormalize = Normalize(
             (0.48145466, 0.4578275, 0.40821073),
@@ -725,12 +741,14 @@ class ClipPredictor(nn.Module):
             spatialDim=32,
             dropout=mtmConfig.DROPOUT,
         ).to(self.device)
-        self.bplPromptLearner = BayesianTripletPromptLearner(
-            self.clip_model,
-            ctxLen=mtmConfig.BPL_CTX_LEN,
-            embedDim=mtmConfig.EMBED_DIM,
-            initStd=mtmConfig.BPL_INIT_STD,
-        ).to(self.device)
+        self.shipFeatureGenerator = None
+        if self.mtmShipEnabled:
+            self.shipFeatureGenerator = ShipTripletFeatureGenerator(
+                self.clip_model,
+                ctxLen=mtmConfig.SHIP_CTX_LEN,
+                embedDim=mtmConfig.EMBED_DIM,
+                initStd=mtmConfig.SHIP_INIT_STD,
+            ).to(self.device)
         self.relationMtm = RelationModalityTransfer(
             mtmConfig.INPUT_DIM,
             mtmConfig.EMBED_DIM,
@@ -748,13 +766,43 @@ class ClipPredictor(nn.Module):
         self.filteredTripletEmbeddingCache = {}
         self.tripletTextSvdCache = {}
         self.tripletTextPrincipalComponents = None
+        self.novelRelNames = [self.relNames[index] for index in self.novel if index != 0]
+        self.novelRelationCandidates = {}
+        self.register_buffer("shipTrainingStep", torch.zeros((), dtype=torch.long))
         self.updateMtmTextSvdBasis()
+        self.mtmModeStateCache = {
+            mode: {
+                "description_relation": self.description_relation,
+                "sub_filter_novel": self.sub_filter_novel,
+                "activeRelNames": self.activeRelNames,
+                "texts5": self.texts5,
+                "texts5Tensor": self.texts5Tensor,
+            }
+        }
+        self.filteredTripletEmbeddingCaches = {mode: self.filteredTripletEmbeddingCache}
 
     def encodeRawTripletTexts(self, tripletTexts):
         with torch.no_grad():
             tripletTokens = clip.tokenize(tripletTexts).to(self.device)
             tripletTextFeatures = self.clip_model.encode_text(tripletTokens).float()
             return F.normalize(tripletTextFeatures, dim=-1)
+
+    def encodeSubjectFilterTextFeatures(self, subjectFilter):
+        allTexts = []
+        featureCounts = []
+        for objName in self.obj_names:
+            objectTexts = ["a photo of " + text for text in list(subjectFilter[objName])]
+            allTexts.extend(objectTexts)
+            featureCounts.append(len(objectTexts))
+
+        encodedChunks = []
+        chunkSize = max(int(getattr(self, "mtmTextSvdChunkSize", 1024)), 1)
+        with torch.no_grad():
+            for offset in range(0, len(allTexts), chunkSize):
+                tokens = clip.tokenize(allTexts[offset : offset + chunkSize]).to(self.device)
+                encodedChunks.append(self.clip_model.encode_text(tokens).detach())
+        encodedFeatures = torch.cat(encodedChunks, dim=0)
+        return list(encodedFeatures.split(featureCounts, dim=0))
 
     def iterFilteredTripletTextChunks(self):
         chunk = []
@@ -849,6 +897,39 @@ class ClipPredictor(nn.Module):
             texts.append("a photo of a " + subjName + " " + relationName + " a " + objName)
         return texts
 
+    def buildNovelTripletTexts(self, subjLabels, objLabels, pseudoCount):
+        if pseudoCount <= 0 or len(self.novelRelNames) == 0:
+            return []
+        sampledPairIndices = torch.randint(
+            subjLabels.numel(),
+            (pseudoCount,),
+            device=subjLabels.device,
+        )
+        sampledSubjLabels = subjLabels.index_select(0, sampledPairIndices).detach().cpu().tolist()
+        sampledObjLabels = objLabels.index_select(0, sampledPairIndices).detach().cpu().tolist()
+        texts = []
+        for subjLabel, objLabel in zip(sampledSubjLabels, sampledObjLabels):
+            subjName = self.obj_names[int(subjLabel)]
+            objName = self.obj_names[int(objLabel)]
+            if subjName not in self.novelRelationCandidates:
+                compatibleRelations = []
+                if subjName in self.mtmTextSvdFilter.columns:
+                    for relationIndex in self.novel:
+                        if relationIndex == 0 or relationIndex >= len(self.mtmTextSvdFilter):
+                            continue
+                        relationName = self.relNames[relationIndex]
+                        if str(self.mtmTextSvdFilter.iloc[relationIndex][subjName]) == relationName:
+                            compatibleRelations.append(relationName)
+                if len(compatibleRelations) == 0:
+                    compatibleRelations = self.novelRelNames
+                self.novelRelationCandidates[subjName] = compatibleRelations
+            compatibleRelations = self.novelRelationCandidates[subjName]
+            sampledRelation = compatibleRelations[
+                int(torch.randint(len(compatibleRelations), (1,)).item())
+            ]
+            texts.append("a photo of a " + subjName + " " + sampledRelation + " a " + objName)
+        return texts
+
     def buildFilteredTripletTexts(self, subjLabel, objLabels):
         texts = []
         subjName = self.obj_names[int(subjLabel)]
@@ -868,6 +949,45 @@ class ClipPredictor(nn.Module):
             self.filteredTripletEmbeddingCache[cacheKey] = (embeddings, numCandidateRelations)
         embeddings, numCandidateRelations = self.filteredTripletEmbeddingCache[cacheKey]
         return embeddings.to(self.device), numCandidateRelations
+
+    def populateFilteredTripletEmbeddingCache(self, subjLabels, objLabels):
+        labelPairs = torch.stack([subjLabels, objLabels], dim=-1).detach().cpu().tolist()
+        missingKeys = []
+        seenKeys = set()
+        for subjLabel, objLabel in labelPairs:
+            cacheKey = (int(subjLabel), int(objLabel))
+            if cacheKey not in self.filteredTripletEmbeddingCache and cacheKey not in seenKeys:
+                missingKeys.append(cacheKey)
+                seenKeys.add(cacheKey)
+        if len(missingKeys) == 0:
+            return
+
+        pendingTexts = []
+        pendingEntries = []
+        chunkSize = max(int(self.mtmTextSvdChunkSize), 1)
+
+        def encodePendingTexts():
+            if len(pendingTexts) == 0:
+                return
+            encoded = self.encodeTripletTexts(pendingTexts).detach().cpu()
+            offset = 0
+            for cacheKey, candidateCount in pendingEntries:
+                self.filteredTripletEmbeddingCache[cacheKey] = (
+                    encoded[offset : offset + candidateCount],
+                    candidateCount,
+                )
+                offset += candidateCount
+            del pendingTexts[:]
+            del pendingEntries[:]
+
+        for cacheKey in missingKeys:
+            objLabelsForText = torch.tensor([cacheKey[1]], device=self.device)
+            texts, candidateCount = self.buildFilteredTripletTexts(cacheKey[0], objLabelsForText)
+            if len(pendingTexts) > 0 and len(pendingTexts) + len(texts) > chunkSize:
+                encodePendingTexts()
+            pendingTexts.extend(texts)
+            pendingEntries.append((cacheKey, candidateCount))
+        encodePendingTexts()
 
     def encodeClipImageFeatureMap(self, image):
         imageInput = FF.resize(image, (self.clipInputSize, self.clipInputSize))
@@ -955,22 +1075,23 @@ class ClipPredictor(nn.Module):
         loss = (positiveLoss + negativeLoss).sum() / normalizer
         return {"loss_mtm_relationness": self.relationnessLossWeight * loss}
 
-    def computeMtmLosses(self, relationFeatures, relationLabels, subjLabels, objLabels, bplConditionFeatures=None):
+    def emptyMtmLosses(self, zero):
+        return {
+            "loss_mtm_align": zero,
+            "loss_mtm_novel_align": zero,
+            "loss_mtm_visual_structure": zero,
+            "loss_mtm_ship_recon": zero,
+            "loss_mtm_ship_kl": zero,
+        }
+
+    def computeMtmLosses(self, relationFeatures, relationLabels, subjLabels, objLabels):
         if not self.mtmLossEnabled or len(relationFeatures) == 0 or relationLabels is None:
-            zero = self.relationMtm.norm.weight.sum() * 0.0
-            return {
-                "loss_mtm_align": zero,
-                "loss_mtm_visual_structure": zero,
-                "loss_mtm_text_structure": zero,
-                "loss_mtm_bpl_kl": zero,
-                "loss_mtm_bpl_svd_anchor": zero,
-            }
+            return self.emptyMtmLosses(self.relationMtm.norm.weight.sum() * 0.0)
+
         relationFeatures = torch.cat(relationFeatures, dim=0).float()
         relationLabels = torch.cat(relationLabels, dim=0).view(-1).long().to(relationFeatures.device)
         subjLabels = torch.cat(subjLabels, dim=0).view(-1).long().to(relationFeatures.device)
         objLabels = torch.cat(objLabels, dim=0).view(-1).long().to(relationFeatures.device)
-        if bplConditionFeatures is not None and len(bplConditionFeatures) > 0:
-            bplConditionFeatures = torch.cat(bplConditionFeatures, dim=0).float().to(relationFeatures.device)
         positive = relationLabels > 0
         if positive.any() and relationLabels[positive].max().item() >= len(self.activeRelNames):
             raise ValueError(
@@ -979,129 +1100,180 @@ class ClipPredictor(nn.Module):
                     relationLabels[positive].max().item(), len(self.activeRelNames)
                 )
             )
-        valid = positive
-        if valid.sum() == 0:
-            zero = relationFeatures.sum() * 0.0
-            return {
-                "loss_mtm_align": zero,
-                "loss_mtm_visual_structure": zero,
-                "loss_mtm_text_structure": zero,
-                "loss_mtm_bpl_kl": zero,
-                "loss_mtm_bpl_svd_anchor": zero,
-            }
-        relationFeatures = relationFeatures[valid]
-        relationLabels = relationLabels[valid]
-        subjLabels = subjLabels[valid]
-        objLabels = objLabels[valid]
-        if bplConditionFeatures is not None:
-            bplConditionFeatures = bplConditionFeatures[valid]
+        if not positive.any():
+            return self.emptyMtmLosses(relationFeatures.sum() * 0.0)
+
+        relationFeatures = relationFeatures[positive]
+        relationLabels = relationLabels[positive]
+        subjLabels = subjLabels[positive]
+        objLabels = objLabels[positive]
         if self.mtmMaxPairs > 0 and relationFeatures.size(0) > self.mtmMaxPairs:
-            sample_index = torch.linspace(
+            sampleIndex = torch.linspace(
                 0,
                 relationFeatures.size(0) - 1,
                 steps=self.mtmMaxPairs,
                 device=relationFeatures.device,
             ).long()
-            relationFeatures = relationFeatures.index_select(0, sample_index)
-            relationLabels = relationLabels.index_select(0, sample_index)
-            subjLabels = subjLabels.index_select(0, sample_index)
-            objLabels = objLabels.index_select(0, sample_index)
-            if bplConditionFeatures is not None:
-                bplConditionFeatures = bplConditionFeatures.index_select(0, sample_index)
+            relationFeatures = relationFeatures.index_select(0, sampleIndex)
+            relationLabels = relationLabels.index_select(0, sampleIndex)
+            subjLabels = subjLabels.index_select(0, sampleIndex)
+            objLabels = objLabels.index_select(0, sampleIndex)
 
-        predicted_text_embeddings = self.relationMtm(relationFeatures)
-        target_texts = self.buildTargetTripletTexts(subjLabels, relationLabels, objLabels)
-        predicted_norm = F.normalize(predicted_text_embeddings.float(), dim=-1)
-        input_visual_norm = F.normalize(relationFeatures.float(), dim=-1)
-        bplKlLoss = predicted_norm.sum() * 0.0
-        bplSvdAnchorLoss = predicted_norm.sum() * 0.0
-        textStructureLoss = predicted_norm.sum() * 0.0
+        baseVisualFeatures = F.normalize(relationFeatures.float(), dim=-1)
+        baseTexts = self.buildTargetTripletTexts(subjLabels, relationLabels, objLabels)
+        baseTextTargets = F.normalize(
+            self.encodeTripletTexts(baseTexts).to(baseVisualFeatures.device).float(),
+            dim=-1,
+        )
+        zero = baseVisualFeatures.sum() * 0.0
+        novelAlignLoss = zero
+        reconstructionLoss = zero
+        klLoss = zero
+        pseudoVisualFeatures = None
 
-        if self.mtmBplEnabled:
-            if bplConditionFeatures is None:
-                raise ValueError("BPL MTM loss requires pair-level condition features when MTM.BPL_ENABLED is True")
-            target_samples, bplMu, bplLogvar = self.bplPromptLearner.buildPromptSamples(
-                target_texts,
-                bplConditionFeatures.to(predicted_text_embeddings.device),
-                int(self.mtmBplSampleNum),
+        if self.mtmShipEnabled:
+            self.shipTrainingStep.add_(1)
+            reconstructedFeatures, shipMean, shipLogvar = self.shipFeatureGenerator.reconstruct(
+                baseTexts,
+                baseVisualFeatures,
             )
-            target_norm = F.normalize(target_samples.float(), dim=-1)
-            svd_anchor = self.encodeTripletTexts(target_texts).to(predicted_text_embeddings.device)
-            svd_anchor = F.normalize(svd_anchor.float(), dim=-1)
-            alignLoss = (1.0 - (predicted_norm.unsqueeze(0) * target_norm).sum(dim=-1)).mean()
-            bplSvdAnchorLoss = (1.0 - (target_norm * svd_anchor.unsqueeze(0)).sum(dim=-1)).mean()
-            bplKlLoss = self.bplPromptLearner.klLoss(bplMu, bplLogvar)
+            reconstructionLoss = (
+                reconstructedFeatures - baseVisualFeatures.detach()
+            ).pow(2).sum(dim=-1).mean()
+            klLoss = self.shipFeatureGenerator.klLoss(shipMean, shipLogvar)
+            pseudoCount = int(round(baseVisualFeatures.size(0) * float(self.mtmShipPseudoRatio)))
+            if self.mtmShipPseudoRatio > 0 and pseudoCount == 0:
+                pseudoCount = 1
+            novelTexts = self.buildNovelTripletTexts(subjLabels, objLabels, pseudoCount)
+            if len(novelTexts) > 0:
+                pseudoVisualFeatures = self.shipFeatureGenerator.generate(
+                    novelTexts,
+                    baseVisualFeatures.device,
+                )
+                allVisualFeatures = torch.cat([baseVisualFeatures, pseudoVisualFeatures], dim=0)
+            else:
+                novelTexts = []
+                allVisualFeatures = baseVisualFeatures
         else:
-            target_embeddings = self.encodeTripletTexts(target_texts).to(predicted_text_embeddings.device)
-            target_norm = F.normalize(target_embeddings.float(), dim=-1)
-            alignLoss = (1.0 - (predicted_norm * target_norm).sum(dim=-1)).mean()
+            novelTexts = []
+            allVisualFeatures = baseVisualFeatures
 
-        if predicted_norm.size(0) < 2:
-            visualStructureLoss = alignLoss * 0.0
+        predictedFeatures = F.normalize(self.relationMtm(allVisualFeatures).float(), dim=-1)
+        baseCount = baseVisualFeatures.size(0)
+        basePredictedFeatures = predictedFeatures[:baseCount]
+        baseAlignLoss = (1.0 - (basePredictedFeatures * baseTextTargets).sum(dim=-1)).mean()
+
+        if self.mtmShipEnabled:
+            rampProgress = min(float(self.shipTrainingStep.item()) / float(self.mtmShipRampIters), 1.0)
+            pseudoWeight = 0.1 + 0.9 * rampProgress
+            klWeight = rampProgress
         else:
-            predictedSimilarity = torch.matmul(predicted_norm, predicted_norm.t())
-            inputVisualSimilarity = torch.matmul(input_visual_norm, input_visual_norm.t())
+            pseudoWeight = 0.0
+            klWeight = 0.0
+
+        if pseudoVisualFeatures is not None:
+            novelTextTargets = F.normalize(
+                self.encodeTripletTexts(novelTexts).to(predictedFeatures.device).float(),
+                dim=-1,
+            )
+            novelPredictedFeatures = predictedFeatures[baseCount:]
+            novelAlignLoss = (
+                1.0 - (novelPredictedFeatures * novelTextTargets).sum(dim=-1)
+            ).mean()
+
+        if predictedFeatures.size(0) < 2:
+            visualStructureLoss = zero
+        else:
+            inputVisualSimilarity = torch.matmul(allVisualFeatures, allVisualFeatures.t())
+            predictedSimilarity = torch.matmul(predictedFeatures, predictedFeatures.t())
+            structureError = (inputVisualSimilarity - predictedSimilarity).abs()
             offDiagonal = ~torch.eye(
                 predictedSimilarity.size(0),
                 dtype=torch.bool,
                 device=predictedSimilarity.device,
             )
-            visualStructureLoss = (inputVisualSimilarity - predictedSimilarity).abs()[offDiagonal].mean()
+            structureWeights = torch.ones_like(structureError)
+            if pseudoVisualFeatures is not None:
+                novelPositions = torch.arange(
+                    predictedFeatures.size(0),
+                    device=predictedFeatures.device,
+                ) >= baseCount
+                involvesNovel = novelPositions.unsqueeze(0) | novelPositions.unsqueeze(1)
+                structureWeights = torch.where(
+                    involvesNovel,
+                    structureWeights.new_full((), pseudoWeight),
+                    structureWeights,
+                )
+            validWeights = structureWeights[offDiagonal]
+            visualStructureLoss = (
+                structureError[offDiagonal] * validWeights
+            ).sum() / validWeights.sum().clamp(min=1.0)
+
         return {
-            "loss_mtm_align": self.mtmLossWeight * self.mtmAlignWeight * alignLoss,
+            "loss_mtm_align": self.mtmLossWeight * self.mtmAlignWeight * baseAlignLoss,
+            "loss_mtm_novel_align": self.mtmLossWeight * self.mtmShipNovelAlignWeight * pseudoWeight * novelAlignLoss,
             "loss_mtm_visual_structure": self.mtmLossWeight * self.mtmStructureWeight * self.mtmVisualStructureWeight * visualStructureLoss,
-            "loss_mtm_text_structure": textStructureLoss,
-            "loss_mtm_bpl_kl": self.mtmBplKlWeight * bplKlLoss,
-            "loss_mtm_bpl_svd_anchor": self.mtmLossWeight * self.mtmBplSvdAnchorWeight * bplSvdAnchorLoss,
+            "loss_mtm_ship_recon": self.mtmLossWeight * self.mtmShipReconWeight * reconstructionLoss,
+            "loss_mtm_ship_kl": self.mtmLossWeight * self.mtmShipKlWeight * klWeight * klLoss,
         }
 
     def computeMtmInferenceScores(self, relationFeatures, subjLabels, objLabels, outShape, outDtype):
-        predicted_embeddings = F.normalize(self.relationMtm(relationFeatures).float(), dim=-1)
+        normalizedRelationFeatures = F.normalize(relationFeatures.float(), dim=-1)
+        predicted_embeddings = F.normalize(self.relationMtm(normalizedRelationFeatures).float(), dim=-1)
         scores = relationFeatures.new_zeros(outShape, dtype=torch.float32)
-        for label in subjLabels.unique():
-            mask = subjLabels == label
-            rel_pos = torch.nonzero(mask, as_tuple=False).view(-1)
-            label_predicted_embeddings = predicted_embeddings.index_select(0, rel_pos)
-            label_obj_labels = objLabels.index_select(0, rel_pos)
-            label_condition_features = relationFeatures.index_select(0, rel_pos)
-            candidate_features = []
-            num_candidate_relations = None
-            for pairOffset, objLabel in enumerate(label_obj_labels):
-                if self.mtmBplEnabled:
-                    candidateObjLabels = torch.tensor([int(objLabel.item())], device=self.device)
-                    tripletTexts, candidate_count = self.buildFilteredTripletTexts(int(label.item()), candidateObjLabels)
-                    conditionFeatures = label_condition_features[pairOffset : pairOffset + 1].to(
-                        predicted_embeddings.device
-                    ).expand(len(tripletTexts), -1)
-                    samples, _, _ = self.bplPromptLearner.buildPromptSamples(
-                        tripletTexts,
-                        conditionFeatures,
-                        int(self.mtmBplTestSampleNum),
-                    )
-                    samples = F.normalize(samples.float(), dim=-1)
-                    candidate_features.append(samples)
-                else:
-                    embeddings, candidate_count = self.getFilteredTripletEmbeddings(label.item(), objLabel.item())
-                    candidate_features.append(embeddings)
-                num_candidate_relations = candidate_count
-            if self.mtmBplEnabled:
-                candidate_samples = torch.stack(candidate_features, dim=1).to(predicted_embeddings.device).float()
-                candidate_samples = candidate_samples.view(
-                    int(self.mtmBplTestSampleNum),
-                    rel_pos.size(0),
-                    num_candidate_relations,
-                    -1,
-                )
-                label_scores = (label_predicted_embeddings.unsqueeze(0).unsqueeze(2) * candidate_samples).sum(-1).mean(dim=0)
-            else:
-                candidate_embeddings = torch.stack(candidate_features, dim=0)
-                candidate_embeddings = candidate_embeddings.to(predicted_embeddings.device).float()
-                candidate_embeddings = candidate_embeddings.view(rel_pos.size(0), num_candidate_relations, -1)
-                label_scores = (label_predicted_embeddings.unsqueeze(1) * candidate_embeddings).sum(-1)
-            scores.index_copy_(0, rel_pos, label_scores[:, :outShape[1]])
+        self.populateFilteredTripletEmbeddingCache(subjLabels, objLabels)
+        labelPairs = torch.stack([subjLabels, objLabels], dim=-1).detach().cpu().tolist()
+        chunkSize = max(int(self.mtmTextSvdChunkSize), 1)
+        for offset in range(0, len(labelPairs), chunkSize):
+            chunkPairs = labelPairs[offset : offset + chunkSize]
+            candidateFeatures = [
+                self.filteredTripletEmbeddingCache[(int(subjLabel), int(objLabel))][0]
+                for subjLabel, objLabel in chunkPairs
+            ]
+            candidateEmbeddings = torch.stack(candidateFeatures, dim=0).to(
+                device=predicted_embeddings.device,
+                dtype=torch.float32,
+            )
+            chunkPredicted = predicted_embeddings[offset : offset + len(chunkPairs)]
+            chunkScores = (chunkPredicted.unsqueeze(1) * candidateEmbeddings).sum(dim=-1)
+            scores[offset : offset + len(chunkPairs), :outShape[1]] = chunkScores[:, :outShape[1]]
         return scores.to(dtype=outDtype)
 
+    def computePairFilterScores(self, subFeatures, objFeatures, subjLabels, numRelations):
+        textFeatureBank = self.texts5Tensor.to(
+            device=subFeatures.device,
+            dtype=subFeatures.dtype,
+        )
+        scores = subFeatures.new_empty((subFeatures.size(0), numRelations))
+        chunkSize = max(int(self.mtmTextSvdChunkSize), 1)
+        for offset in range(0, subFeatures.size(0), chunkSize):
+            end = min(offset + chunkSize, subFeatures.size(0))
+            relationTextFeatures = textFeatureBank.index_select(
+                0,
+                subjLabels[offset:end],
+            )[:, :numRelations]
+            subScores = torch.bmm(
+                relationTextFeatures,
+                subFeatures[offset:end].unsqueeze(-1),
+            ).squeeze(-1) / 0.05
+            objScores = torch.bmm(
+                relationTextFeatures,
+                objFeatures[offset:end].unsqueeze(-1),
+            ).squeeze(-1) / 0.05
+            scores[offset:end] = (subScores + objScores) / 2
+        return scores
+
     def updata(self,mode):
+        if mode in self.mtmModeStateCache:
+            cachedState = self.mtmModeStateCache[mode]
+            self.description_relation = cachedState["description_relation"]
+            self.sub_filter_novel = cachedState["sub_filter_novel"]
+            self.activeRelNames = cachedState["activeRelNames"]
+            self.texts5 = cachedState["texts5"]
+            self.texts5Tensor = cachedState["texts5Tensor"]
+            self.filteredTripletEmbeddingCache = self.filteredTripletEmbeddingCaches[mode]
+            return
+
         self.description_relation = pd.read_csv(
             curpath+"/description_relation.csv")
         if mode == "base":
@@ -1130,29 +1302,27 @@ class ClipPredictor(nn.Module):
             self.sub_filter_novel = pd.read_csv(
                 curpath+"/filter_total.csv").iloc[
                                     self.semantic, 1:]
+        else:
+            raise ValueError("Unsupported predicate evaluation mode: {}".format(mode))
 
         self.description_relation=self.description_relation.applymap(lambda x: [int(s) for s in x.split(',')])
         self.description_relation=np.array(self.description_relation)
         self.description_relation = np.array([[np.array(item) for item in inner_list] for inner_list in self.description_relation])
         self.description_relation=torch.Tensor(self.description_relation).to(self.device)
         self.activeRelNames = activeRelNames
-        self.filteredTripletEmbeddingCache = {}
+        self.filteredTripletEmbeddingCache = self.filteredTripletEmbeddingCaches.setdefault(mode, {})
         self.updateMtmTextSvdBasis()
 
-        with torch.no_grad():
-            self.texts5=[]
+        self.texts5 = self.encodeSubjectFilterTextFeatures(self.sub_filter_novel)
+        self.texts5Tensor = F.normalize(torch.stack(self.texts5, dim=0), dim=-1)
 
-            for obj in self.obj_names:
-                text5 = clip.tokenize(["a photo of " + tex for tex in list(self.sub_filter_novel[obj])]).to(
-                    self.device)
-
-                timing = []
-
-                a = time.time()
-
-                text_features5 = self.clip_model.encode_text(text5)
-                text_features5 = text_features5
-                self.texts5.append(text_features5.detach().cpu().numpy())
+        self.mtmModeStateCache[mode] = {
+            "description_relation": self.description_relation,
+            "sub_filter_novel": self.sub_filter_novel,
+            "activeRelNames": self.activeRelNames,
+            "texts5": self.texts5,
+            "texts5Tensor": self.texts5Tensor,
+        }
 
     def forward(self, proposals, rel_pair_idxs, rel_labels, rel_binarys, roi_features, union_features, logger=None,img=None):
         # Returns:
@@ -1178,7 +1348,6 @@ class ClipPredictor(nn.Module):
         relationLabelsForMtm = []
         subjLabelsForMtm = []
         objLabelsForMtm = []
-        bplConditionFeatures = []
         relationnessLogitsForLoss = []
         relationnessLabelsForLoss = []
         for i in range(len(num_rels)):
@@ -1260,7 +1429,6 @@ class ClipPredictor(nn.Module):
 
             if self.training and self.mtmLossEnabled and mtm_relation_features is not None:
                 relationFeaturesForMtm.append(mtm_relation_features)
-                bplConditionFeatures.append(mtm_relation_features.detach())
                 relationLabelsForMtm.append(rel_labels[i].to(mtm_feature_pos.device).index_select(0, mtm_feature_pos))
                 if proposals[i].has_field("labels"):
                     gtObjLabels = proposals[i].get_field("labels").long()
@@ -1287,23 +1455,16 @@ class ClipPredictor(nn.Module):
                 description_relation = self.description_relation.index_select(1, obj_n1)
                 description_scores = (description_relation.permute(1, 0, 2) * similarity_delta.unsqueeze(1)).sum(-1)
 
-                grouped_filter_scores = []
                 cls_features = image_features[:, 0, :]
                 cls_norm = cls_features / cls_features.norm(dim=-1, keepdim=True).clamp(min=1e-6)
                 sub_norm = cls_norm.index_select(0, sub_idx)
                 obj_norm = cls_norm.index_select(0, obj_idx)
-                for label in obj_n1.unique():
-                    mask = obj_n1 == label
-                    rel_pos = torch.nonzero(mask, as_tuple=False).view(-1)
-                    text_features5 = torch.Tensor(self.texts5[int(label.item())]).to(self.device).to(dtype=cls_norm.dtype)
-                    text_features5 = text_features5 / text_features5.norm(dim=-1, keepdim=True).clamp(min=1e-6)
-                    similarity31 = sub_norm.index_select(0, rel_pos) @ text_features5.t() / 0.05
-                    similarity32 = obj_norm.index_select(0, rel_pos) @ text_features5.t() / 0.05
-                    label_filter_scores = (similarity31 + similarity32) / 2
-                    grouped_filter_scores.append((rel_pos, label_filter_scores[:, :description_scores.size(1)]))
-                filter_scores = description_scores.new_zeros(description_scores.shape)
-                for rel_pos, scores in grouped_filter_scores:
-                    filter_scores.index_copy_(0, rel_pos, scores.to(dtype=filter_scores.dtype))
+                filter_scores = self.computePairFilterScores(
+                    sub_norm,
+                    obj_norm,
+                    obj_n1,
+                    description_scores.size(1),
+                ).to(dtype=description_scores.dtype)
                 rel_dist_per_batch = description_scores * 0.2 + filter_scores * 0.8
                 if self.mtmUseInference and self.mtmInferenceWeight != 0:
                     mtmScores = self.computeMtmInferenceScores(
@@ -1326,7 +1487,7 @@ class ClipPredictor(nn.Module):
 
         add_losses = {}
         if self.training and self.mtmLossEnabled:
-            add_losses.update(self.computeMtmLosses(relationFeaturesForMtm, relationLabelsForMtm, subjLabelsForMtm, objLabelsForMtm, bplConditionFeatures))
+            add_losses.update(self.computeMtmLosses(relationFeaturesForMtm, relationLabelsForMtm, subjLabelsForMtm, objLabelsForMtm))
         if self.training and self.relationnessLossEnabled:
             add_losses.update(self.computeRelationnessLoss(relationnessLogitsForLoss, relationnessLabelsForLoss))
         return obj_dists, rel_dists, add_losses
