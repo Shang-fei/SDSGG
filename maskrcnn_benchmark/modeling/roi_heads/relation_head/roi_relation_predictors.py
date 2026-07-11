@@ -1007,7 +1007,7 @@ class ClipPredictor(nn.Module):
         bottomRight = torch.max(subBoxes[:, 2:], objBoxes[:, 2:])
         return torch.cat([topLeft, bottomRight], dim=-1)
 
-    def buildMtmRoiRelationFeatures(self, clipFeatureMap, proposal, pairIdx, image):
+    def buildMtmRoiRelationFeatures(self, clipFeatureMap, proposal, pairIdx, image, returnDebugFeatures=False):
         pairIdx = pairIdx.to(proposal.bbox.device)
         clipBoxes = self.scaleBoxesToClipInput(proposal.bbox, image)
         subBoxes = clipBoxes.index_select(0, pairIdx[:, 0])
@@ -1020,9 +1020,23 @@ class ClipPredictor(nn.Module):
             device=unionFeatures.device,
             dtype=unionFeatures.dtype,
         )
-        if not self.mtmUnionGateFusionEnabled:
-            return unionFeatures
-        return self.mtmUnionGateFusion(unionFeatures, subFeatures, objFeatures, spatialFeatures)
+        if self.mtmUnionGateFusionEnabled:
+            relationFeatures = self.mtmUnionGateFusion(
+                unionFeatures,
+                subFeatures,
+                objFeatures,
+                spatialFeatures,
+            )
+        else:
+            relationFeatures = unionFeatures
+        if not returnDebugFeatures:
+            return relationFeatures
+        return relationFeatures, {
+            "sub_raw": subFeatures.detach(),
+            "obj_raw": objFeatures.detach(),
+            "union_raw": unionFeatures.detach(),
+            "fused_x_rel": relationFeatures.detach(),
+        }
 
     def buildPairSpatialFeatures(self, proposal, pairIdx):
         boxInfo = get_box_info(proposal.bbox, need_norm=True, proposal=proposal)
@@ -1039,7 +1053,15 @@ class ClipPredictor(nn.Module):
             "loss_mtm_ship_kl": zero,
         }
 
-    def computeMtmLosses(self, relationFeatures, relationLabels, subjLabels, objLabels, logger=None):
+    def computeMtmLosses(
+        self,
+        relationFeatures,
+        relationLabels,
+        subjLabels,
+        objLabels,
+        logger=None,
+        roiDebugFeatures=None,
+    ):
         if not self.mtmLossEnabled or len(relationFeatures) == 0 or relationLabels is None:
             return self.emptyMtmLosses(self.relationMtm.norm.weight.sum() * 0.0)
 
@@ -1047,6 +1069,12 @@ class ClipPredictor(nn.Module):
         relationLabels = torch.cat(relationLabels, dim=0).view(-1).long().to(relationFeatures.device)
         subjLabels = torch.cat(subjLabels, dim=0).view(-1).long().to(relationFeatures.device)
         objLabels = torch.cat(objLabels, dim=0).view(-1).long().to(relationFeatures.device)
+        if roiDebugFeatures is not None:
+            roiDebugFeatures = {
+                name: torch.cat(features, dim=0).float().to(relationFeatures.device)
+                for name, features in roiDebugFeatures.items()
+                if len(features) > 0
+            }
         positive = relationLabels > 0
         if positive.any() and relationLabels[positive].max().item() >= len(self.activeRelNames):
             raise ValueError(
@@ -1062,6 +1090,11 @@ class ClipPredictor(nn.Module):
         relationLabels = relationLabels[positive]
         subjLabels = subjLabels[positive]
         objLabels = objLabels[positive]
+        if roiDebugFeatures is not None:
+            roiDebugFeatures = {
+                name: features[positive]
+                for name, features in roiDebugFeatures.items()
+            }
         self.mtmDebugIteration.add_(1)
         if self.mtmMaxPairs > 0 and relationFeatures.size(0) > self.mtmMaxPairs:
             sampleIndex = torch.linspace(
@@ -1074,6 +1107,11 @@ class ClipPredictor(nn.Module):
             relationLabels = relationLabels.index_select(0, sampleIndex)
             subjLabels = subjLabels.index_select(0, sampleIndex)
             objLabels = objLabels.index_select(0, sampleIndex)
+            if roiDebugFeatures is not None:
+                roiDebugFeatures = {
+                    name: features.index_select(0, sampleIndex)
+                    for name, features in roiDebugFeatures.items()
+                }
 
         baseVisualFeatures = F.normalize(relationFeatures.float(), dim=-1)
         baseTexts = self.buildTargetTripletTexts(subjLabels, relationLabels, objLabels)
@@ -1193,6 +1231,28 @@ class ClipPredictor(nn.Module):
                         mtmValues.max().item(),
                         errorValues.mean().item(),
                     )
+                    if roiDebugFeatures is not None and baseCount >= 2:
+                        baseOffDiagonal = ~torch.eye(
+                            baseCount,
+                            dtype=torch.bool,
+                            device=predictedSimilarity.device,
+                        )
+                        for stageName in ("sub_raw", "obj_raw", "union_raw", "fused_x_rel"):
+                            if stageName not in roiDebugFeatures:
+                                continue
+                            stageFeatures = F.normalize(roiDebugFeatures[stageName], dim=-1)
+                            stageSimilarity = torch.matmul(stageFeatures, stageFeatures.t())
+                            stageValues = stageSimilarity[baseOffDiagonal].float()
+                            logger.info(
+                                "MTM RoI debug iter=%d stage=%s: "
+                                "cos_mean=%.6f cos_std=%.6f cos_min=%.6f cos_max=%.6f",
+                                int(self.mtmDebugIteration.item()),
+                                stageName,
+                                stageValues.mean().item(),
+                                stageValues.std(unbiased=False).item(),
+                                stageValues.min().item(),
+                                stageValues.max().item(),
+                            )
 
         return {
             "loss_mtm_align": self.mtmLossWeight * self.mtmAlignWeight * baseAlignLoss,
@@ -1333,6 +1393,12 @@ class ClipPredictor(nn.Module):
         relationLabelsForMtm = []
         subjLabelsForMtm = []
         objLabelsForMtm = []
+        roiDebugFeaturesForMtm = {
+            "sub_raw": [],
+            "obj_raw": [],
+            "union_raw": [],
+            "fused_x_rel": [],
+        }
         for i in range(len(num_rels)):
             image_tensor=[]
             with torch.no_grad():
@@ -1390,12 +1456,19 @@ class ClipPredictor(nn.Module):
                     mtm_image = self.cropImagePadding(img[i], proposals[i])
                     with torch.no_grad():
                         _, mtm_clip_feature_map = self.encodeClipImageFeatureMap(mtm_image)
-                    mtm_relation_features = self.buildMtmRoiRelationFeatures(
+                    mtmFeatureOutput = self.buildMtmRoiRelationFeatures(
                         mtm_clip_feature_map,
                         proposals[i],
                         mtm_pair_idx,
                         mtm_image,
+                        returnDebugFeatures=(self.training and self.mtmStructureDebugEnabled),
                     )
+                    if self.training and self.mtmStructureDebugEnabled:
+                        mtm_relation_features, imageRoiDebugFeatures = mtmFeatureOutput
+                        for stageName, stageFeatures in imageRoiDebugFeatures.items():
+                            roiDebugFeaturesForMtm[stageName].append(stageFeatures)
+                    else:
+                        mtm_relation_features = mtmFeatureOutput
 
             if self.training and self.mtmLossEnabled and mtm_relation_features is not None:
                 relationFeaturesForMtm.append(mtm_relation_features)
@@ -1461,6 +1534,7 @@ class ClipPredictor(nn.Module):
                     subjLabelsForMtm,
                     objLabelsForMtm,
                     logger,
+                    roiDebugFeaturesForMtm if self.mtmStructureDebugEnabled else None,
                 )
             )
         return obj_dists, rel_dists, add_losses
