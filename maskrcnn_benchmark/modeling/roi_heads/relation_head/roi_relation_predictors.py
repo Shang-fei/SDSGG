@@ -1204,6 +1204,10 @@ class ClipPredictor(nn.Module):
                     novelTexts,
                     baseVisualFeatures.device,
                 )
+                baseInputNorm = relationFeatures.detach().float().norm(
+                    dim=-1,
+                ).mean().clamp(min=1e-6)
+                pseudoRawUnionFeatures = pseudoRawUnionFeatures * baseInputNorm
                 if self.mtmVisualAdapterEnabled:
                     pseudoAdaptedFeatures = self.relationMtm.encode_visual(pseudoRawUnionFeatures)
                 else:
@@ -1366,8 +1370,8 @@ class ClipPredictor(nn.Module):
                         novelMtmSimilarity = predictedSimilarity[baseCount:, baseCount:]
                         novelTextSimilarity = torch.matmul(novelTextTargets, novelTextTargets.t())
                         novelRawSimilarity = torch.matmul(
-                            pseudoRawUnionFeatures,
-                            pseudoRawUnionFeatures.t(),
+                            F.normalize(pseudoRawUnionFeatures, dim=-1),
+                            F.normalize(pseudoRawUnionFeatures, dim=-1).t(),
                         )
                         novelRawStats = similarityStats(novelRawSimilarity, novelMask)
                         novelTextStats = similarityStats(novelTextSimilarity, novelMask)
@@ -1383,7 +1387,7 @@ class ClipPredictor(nn.Module):
                             novelPredictedFeatures * novelTextTargets
                         ).sum(dim=-1).mean().item()
                         novelRawBaseNearest = torch.matmul(
-                            pseudoRawUnionFeatures,
+                            F.normalize(pseudoRawUnionFeatures, dim=-1),
                             baseRawUnionFeatures.t(),
                         ).max(dim=1)[0].mean().item()
                         novelVisualBaseNearest = torch.matmul(
