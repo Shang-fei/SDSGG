@@ -7,7 +7,6 @@ from torch import nn
 from torch.nn import functional as F
 from torchvision.transforms import Normalize, ToPILImage
 from torchvision.transforms import functional as FF
-from torchvision.ops import roi_align
 from maskrcnn_benchmark.layers import smooth_l1_loss, kl_div_loss, entropy_loss, Label_Smoothing_Regression
 from maskrcnn_benchmark.modeling.utils import cat
 from .model_msg_passing import IMPContext
@@ -135,44 +134,26 @@ class MVA(nn.Module):
         return sub_features
 
 
-class MTMVisualResidualAdapter(nn.Module):
-    def __init__(self, featureDim=512, spatialDim=32, dropout=0.1, mode="union", maxScale=0.1):
-        super(MTMVisualResidualAdapter, self).__init__()
-        mode = str(mode).lower()
-        if mode not in {"union", "context"}:
-            raise ValueError("MTM.VISUAL_ADAPTER_MODE must be 'union' or 'context', got {}".format(mode))
-        self.mode = mode
-        inputDim = featureDim if mode == "union" else featureDim * 3 + spatialDim
-        hiddenDim = max(featureDim // 4, 1)
-        self.deltaNet = nn.Sequential(
-            nn.Linear(inputDim, hiddenDim),
-            nn.LayerNorm(hiddenDim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hiddenDim, featureDim),
-        )
-        self.alpha = nn.Parameter(torch.zeros(()))
-        self.maxScale = float(maxScale)
+class MTMRelationAdapter(nn.Module):
+    def __init__(self, inputDim=512, embedDim=512, dropout=0.1, reduction=4):
+        super(MTMRelationAdapter, self).__init__()
+        bottleneckDim = max(embedDim // reduction, 1)
+        self.inputProj = nn.Linear(inputDim, embedDim)
+        self.inputNorm = nn.LayerNorm(embedDim)
+        self.downProj = nn.Linear(embedDim, bottleneckDim)
+        self.upProj = nn.Linear(bottleneckDim, embedDim)
+        self.gate = nn.Linear(embedDim, embedDim)
+        self.dropout = nn.Dropout(dropout)
 
-    def residualScale(self):
-        return self.maxScale * torch.tanh(self.alpha)
-
-    def forward(self, unionFeatures, subFeatures, objFeatures, spatialFeatures):
-        unionFeatures = unionFeatures.float()
-        if self.mode == "context":
-            adapterInputs = torch.cat(
-                [
-                    unionFeatures,
-                    subFeatures.float(),
-                    objFeatures.float(),
-                    spatialFeatures.float(),
-                ],
-                dim=-1,
-            )
-        else:
-            adapterInputs = unionFeatures
-        delta = self.deltaNet(adapterInputs)
-        return unionFeatures + self.residualScale() * delta
+    def forward(self, relationFeatures):
+        x = self.inputProj(relationFeatures.float())
+        residual = x
+        x = self.inputNorm(x)
+        delta = self.downProj(x)
+        delta = F.gelu(delta)
+        delta = self.dropout(delta)
+        delta = self.upProj(delta)
+        return residual + torch.sigmoid(self.gate(x)) * delta
 
 
 def initializeShipLayer(module, initStd=0.02):
@@ -287,10 +268,7 @@ class ShipTripletFeatureGenerator(nn.Module):
 class RelationModalityTransfer(nn.Module):
     def __init__(self, inputDim=512, embedDim=512, fcLayers=3, attentionLayers=3, numHeads=8, dropout=0.1):
         super(RelationModalityTransfer, self).__init__()
-        self.inputProj = nn.Sequential(
-            nn.Linear(inputDim, embedDim),
-            nn.LayerNorm(embedDim),
-        )
+        self.adapter = MTMRelationAdapter(inputDim, embedDim, dropout)
         layers = []
         currentDim = embedDim
         for _ in range(max(fcLayers - 1, 0)):
@@ -310,11 +288,16 @@ class RelationModalityTransfer(nn.Module):
         self.selfAttention = nn.TransformerEncoder(encoderLayer, num_layers=attentionLayers)
         self.norm = nn.LayerNorm(embedDim)
 
-    def forward(self, relationFeatures):
-        x = self.inputProj(relationFeatures.float())
-        x = self.fc(x).unsqueeze(0)
+    def encode_visual(self, relationFeatures):
+        return self.adapter(relationFeatures)
+
+    def encode_text_space(self, visualFeatures):
+        x = self.fc(visualFeatures).unsqueeze(0)
         x = self.selfAttention(x).squeeze(0)
         return self.norm(x)
+
+    def forward(self, relationFeatures):
+        return self.encode_text_space(self.encode_visual(relationFeatures))
 
 
 @registry.ROI_RELATION_PREDICTOR.register("GQAClipPredictor")
@@ -724,7 +707,7 @@ class ClipPredictor(nn.Module):
         self.mtmTextSvdComponents = mtmConfig.TEXT_SVD_COMPONENTS
         self.mtmTextSvdChunkSize = mtmConfig.TEXT_SVD_CHUNK_SIZE
         self.mtmVisualAdapterEnabled = mtmConfig.VISUAL_ADAPTER_ENABLED
-        self.mtmVisualAdapterMode = mtmConfig.VISUAL_ADAPTER_MODE
+        self.mtmUnionCropChunkSize = max(int(mtmConfig.UNION_CROP_CHUNK_SIZE), 1)
         self.mtmShipEnabled = mtmConfig.SHIP_ENABLED
         self.mtmShipPseudoRatio = mtmConfig.SHIP_PSEUDO_RATIO
         self.mtmShipReconWeight = mtmConfig.SHIP_RECON_WEIGHT
@@ -742,17 +725,8 @@ class ClipPredictor(nn.Module):
         )
         for param in self.clip_model.parameters():
             param.requires_grad_(False)
-        self.mtmVisualAdapter = MTMVisualResidualAdapter(
-            featureDim=mtmConfig.INPUT_DIM,
-            spatialDim=32,
-            dropout=mtmConfig.DROPOUT,
-            mode=self.mtmVisualAdapterMode,
-            maxScale=mtmConfig.VISUAL_ADAPTER_MAX_SCALE,
-        ).to(self.device)
         self.shipFeatureGenerator = None
         if self.mtmShipEnabled:
-            if self.mtmVisualAdapterEnabled and self.mtmVisualAdapterMode != "union":
-                raise ValueError("SHIP pseudo union features require MTM.VISUAL_ADAPTER_MODE='union'")
             self.shipFeatureGenerator = ShipTripletFeatureGenerator(
                 self.clip_model,
                 visualDim=mtmConfig.INPUT_DIM,
@@ -1001,50 +975,9 @@ class ClipPredictor(nn.Module):
             pendingEntries.append((cacheKey, candidateCount))
         encodePendingTexts()
 
-    def encodeClipImageFeatureMap(self, image):
-        imageInput = FF.resize(image, (self.clipInputSize, self.clipInputSize))
-        imageInput = self.clipImageNormalize(imageInput).unsqueeze(0).to(self.device)
-        tokens = self.clip_model.encode_image(imageInput)
-        if tokens.dim() != 3:
-            raise ValueError("MTM RoIAlign requires CLIP ViT token features, got shape {}".format(tuple(tokens.shape)))
-        globalFeature = tokens[:, 0, :].float()
-        patchTokens = tokens[:, 1:, :].float()
-        gridSize = int(patchTokens.size(1) ** 0.5)
-        if gridSize * gridSize != patchTokens.size(1):
-            raise ValueError("CLIP patch token count {} is not a square grid".format(patchTokens.size(1)))
-        featureMap = patchTokens.permute(0, 2, 1).contiguous().view(1, patchTokens.size(-1), gridSize, gridSize)
-        return globalFeature, featureMap
-
     def cropImagePadding(self, image, proposal):
         imageWidth, imageHeight = proposal.size
         return image[:, : int(imageHeight), : int(imageWidth)]
-
-    def scaleBoxesToClipInput(self, boxes, image):
-        _, imageHeight, imageWidth = image.shape
-        scaledBoxes = boxes.float().clone()
-        scaledBoxes[:, 0::2] = scaledBoxes[:, 0::2] * (float(self.clipInputSize) / float(imageWidth))
-        scaledBoxes[:, 1::2] = scaledBoxes[:, 1::2] * (float(self.clipInputSize) / float(imageHeight))
-        return scaledBoxes
-
-    def poolClipRoiFeatures(self, clipFeatureMap, boxes):
-        if boxes.numel() == 0:
-            return clipFeatureMap.new_zeros((0, clipFeatureMap.size(1)))
-        rois = torch.cat(
-            [
-                torch.zeros((boxes.size(0), 1), device=clipFeatureMap.device, dtype=clipFeatureMap.dtype),
-                boxes.to(device=clipFeatureMap.device, dtype=clipFeatureMap.dtype),
-            ],
-            dim=1,
-        )
-        spatialScale = float(clipFeatureMap.size(-1)) / float(self.clipInputSize)
-        pooled = roi_align(
-            clipFeatureMap,
-            rois,
-            output_size=(1, 1),
-            spatial_scale=spatialScale,
-            aligned=True,
-        )
-        return pooled.flatten(1)
 
     def buildUnionBoxes(self, boxes, pairIdx):
         subBoxes = boxes.index_select(0, pairIdx[:, 0].to(boxes.device))
@@ -1053,31 +986,36 @@ class ClipPredictor(nn.Module):
         bottomRight = torch.max(subBoxes[:, 2:], objBoxes[:, 2:])
         return torch.cat([topLeft, bottomRight], dim=-1)
 
-    def buildMtmRoiRelationFeatures(self, clipFeatureMap, proposal, pairIdx, image, returnRawUnion=False):
+    def buildMtmUnionCropFeatures(self, image, proposal, pairIdx):
         pairIdx = pairIdx.to(proposal.bbox.device)
-        clipBoxes = self.scaleBoxesToClipInput(proposal.bbox, image)
-        subBoxes = clipBoxes.index_select(0, pairIdx[:, 0])
-        objBoxes = clipBoxes.index_select(0, pairIdx[:, 1])
-        unionBoxes = self.buildUnionBoxes(clipBoxes, pairIdx)
-        subFeatures = self.poolClipRoiFeatures(clipFeatureMap, subBoxes)
-        objFeatures = self.poolClipRoiFeatures(clipFeatureMap, objBoxes)
-        unionFeatures = self.poolClipRoiFeatures(clipFeatureMap, unionBoxes)
-        spatialFeatures = self.buildPairSpatialFeatures(proposal, pairIdx).to(
-            device=unionFeatures.device,
-            dtype=unionFeatures.dtype,
-        )
-        if self.mtmVisualAdapterEnabled:
-            relationFeatures = self.mtmVisualAdapter(
-                unionFeatures,
-                subFeatures,
-                objFeatures,
-                spatialFeatures,
-            )
-        else:
-            relationFeatures = unionFeatures
-        if returnRawUnion:
-            return relationFeatures, unionFeatures.detach()
-        return relationFeatures
+        unionBoxes = self.buildUnionBoxes(proposal.bbox, pairIdx).round().long()
+        _, imageHeight, imageWidth = image.shape
+        if unionBoxes.size(0) == 0:
+            return image.new_zeros((0, self.relationMtm.adapter.inputProj.in_features)).float()
+
+        encodedChunks = []
+        for offset in range(0, unionBoxes.size(0), self.mtmUnionCropChunkSize):
+            cropChunk = []
+            for box in unionBoxes[offset : offset + self.mtmUnionCropChunkSize]:
+                left = int(box[0].clamp(min=0, max=max(imageWidth - 1, 0)).item())
+                top = int(box[1].clamp(min=0, max=max(imageHeight - 1, 0)).item())
+                right = int(box[2].clamp(min=left + 1, max=imageWidth).item())
+                bottom = int(box[3].clamp(min=top + 1, max=imageHeight).item())
+                crop = FF.resized_crop(
+                    image,
+                    top,
+                    left,
+                    bottom - top,
+                    right - left,
+                    (self.clipInputSize, self.clipInputSize),
+                )
+                cropChunk.append(self.clipImageNormalize(crop))
+            cropChunk = torch.stack(cropChunk, dim=0).to(self.device)
+            encoded = self.clip_model.encode_image(cropChunk)
+            if encoded.dim() == 3:
+                encoded = encoded[:, 0, :]
+            encodedChunks.append(encoded.float())
+        return torch.cat(encodedChunks, dim=0)
 
     def buildPairSpatialFeatures(self, proposal, pairIdx):
         boxInfo = get_box_info(proposal.bbox, need_norm=True, proposal=proposal)
@@ -1142,8 +1080,14 @@ class ClipPredictor(nn.Module):
             subjLabels = subjLabels.index_select(0, sampleIndex)
             objLabels = objLabels.index_select(0, sampleIndex)
 
-        baseVisualFeatures = F.normalize(relationFeatures.float(), dim=-1)
         baseRawUnionFeatures = F.normalize(rawUnionFeatures.detach().float(), dim=-1)
+        if self.mtmVisualAdapterEnabled:
+            baseVisualFeatures = F.normalize(
+                self.relationMtm.encode_visual(baseRawUnionFeatures),
+                dim=-1,
+            )
+        else:
+            baseVisualFeatures = baseRawUnionFeatures
         baseTexts = self.buildTargetTripletTexts(subjLabels, relationLabels, objLabels)
         baseTextTargets = F.normalize(
             self.encodeTripletTexts(baseTexts).to(baseVisualFeatures.device).float(),
@@ -1155,6 +1099,7 @@ class ClipPredictor(nn.Module):
         klLoss = zero
         visualTransferLoss = zero
         visualTransferCosine = None
+        reconstructedFeatures = None
         pseudoVisualFeatures = None
         pseudoRawUnionFeatures = None
         pseudoWeight = 0.0
@@ -1200,12 +1145,7 @@ class ClipPredictor(nn.Module):
                     baseVisualFeatures.device,
                 )
                 if self.mtmVisualAdapterEnabled:
-                    pseudoVisualFeatures = self.mtmVisualAdapter(
-                        pseudoRawUnionFeatures,
-                        None,
-                        None,
-                        None,
-                    )
+                    pseudoVisualFeatures = self.relationMtm.encode_visual(pseudoRawUnionFeatures)
                 else:
                     pseudoVisualFeatures = pseudoRawUnionFeatures
                 pseudoVisualFeatures = F.normalize(pseudoVisualFeatures.float(), dim=-1)
@@ -1218,7 +1158,10 @@ class ClipPredictor(nn.Module):
             novelTextTargets = None
             allVisualFeatures = baseVisualFeatures
 
-        predictedFeatures = F.normalize(self.relationMtm(allVisualFeatures).float(), dim=-1)
+        predictedFeatures = F.normalize(
+            self.relationMtm.encode_text_space(allVisualFeatures).float(),
+            dim=-1,
+        )
         baseCount = baseVisualFeatures.size(0)
         basePredictedFeatures = predictedFeatures[:baseCount]
         baseAlignLoss = (1.0 - (basePredictedFeatures * baseTextTargets).sum(dim=-1)).mean()
@@ -1327,22 +1270,25 @@ class ClipPredictor(nn.Module):
                     baseAlignCosine = (
                         basePredictedFeatures * baseTextTargets
                     ).sum(dim=-1).mean().item()
+                    baseReconstructionCosine = (
+                        reconstructedFeatures * baseRawUnionFeatures
+                    ).sum(dim=-1).mean().item() if reconstructedFeatures is not None else float("nan")
                     logger.info(
                         "MTM debug i=%d base "
                         "raw(mean/max/min/std)=%.4f/%.4f/%.4f/%.4f "
-                        "xrel(mean/max/min/std)=%.4f/%.4f/%.4f/%.4f "
-                        "qrel(mean/max/min/std)=%.4f/%.4f/%.4f/%.4f "
-                        "tsvd(mean/max/min/std)=%.4f/%.4f/%.4f/%.4f "
-                        "align=%.4f err=%.4f scale=%.4f",
+                        "h(mean/max/min/std)=%.4f/%.4f/%.4f/%.4f "
+                        "q(mean/max/min/std)=%.4f/%.4f/%.4f/%.4f "
+                        "t(mean/max/min/std)=%.4f/%.4f/%.4f/%.4f "
+                        "align=%.4f recon=%.4f struct=%.4f kl=%.4f",
                         int(self.mtmDebugIteration.item()),
                         *baseRawStats,
                         *baseVisualStats,
                         *baseMtmStats,
                         *baseTextStats,
                         baseAlignCosine,
+                        baseReconstructionCosine,
                         baseStructureError,
-                        self.mtmVisualAdapter.residualScale().item()
-                        if self.mtmVisualAdapterEnabled else 0.0,
+                        klLoss.item(),
                     )
                     novelCount = predictedFeatures.size(0) - baseCount
                     if pseudoVisualFeatures is not None and novelCount >= 2:
@@ -1368,6 +1314,14 @@ class ClipPredictor(nn.Module):
                         novelAlignCosine = (
                             novelPredictedFeatures * novelTextTargets
                         ).sum(dim=-1).mean().item()
+                        novelRawBaseNearest = torch.matmul(
+                            pseudoRawUnionFeatures,
+                            baseRawUnionFeatures.t(),
+                        ).max(dim=1)[0].mean().item()
+                        novelVisualBaseNearest = torch.matmul(
+                            pseudoVisualFeatures,
+                            baseVisualFeatures.t(),
+                        ).max(dim=1)[0].mean().item()
                         crossStructureError = (
                             inputVisualSimilarity[:baseCount, baseCount:]
                             - predictedSimilarity[:baseCount, baseCount:]
@@ -1375,10 +1329,11 @@ class ClipPredictor(nn.Module):
                         logger.info(
                             "MTM debug i=%d novel "
                             "raw(mean/max/min/std)=%.4f/%.4f/%.4f/%.4f "
-                            "xrel(mean/max/min/std)=%.4f/%.4f/%.4f/%.4f "
-                            "qrel(mean/max/min/std)=%.4f/%.4f/%.4f/%.4f "
-                            "tsvd(mean/max/min/std)=%.4f/%.4f/%.4f/%.4f "
-                            "align=%.4f transfer=%.4f err=%.4f cross_err=%.4f ramp=%.4f",
+                            "h(mean/max/min/std)=%.4f/%.4f/%.4f/%.4f "
+                            "q(mean/max/min/std)=%.4f/%.4f/%.4f/%.4f "
+                            "t(mean/max/min/std)=%.4f/%.4f/%.4f/%.4f "
+                            "align=%.4f transfer=%.4f nnbase(raw/h)=%.4f/%.4f "
+                            "struct=%.4f cross=%.4f ramp=%.4f",
                             int(self.mtmDebugIteration.item()),
                             *novelRawStats,
                             *novelVisualStats,
@@ -1387,6 +1342,8 @@ class ClipPredictor(nn.Module):
                             novelAlignCosine,
                             visualTransferCosine.item()
                             if visualTransferCosine is not None else float("nan"),
+                            novelRawBaseNearest,
+                            novelVisualBaseNearest,
                             novelStructureError,
                             crossStructureError,
                             pseudoWeight,
@@ -1403,7 +1360,17 @@ class ClipPredictor(nn.Module):
 
     def computeMtmInferenceScores(self, relationFeatures, subjLabels, objLabels, outShape, outDtype):
         normalizedRelationFeatures = F.normalize(relationFeatures.float(), dim=-1)
-        predicted_embeddings = F.normalize(self.relationMtm(normalizedRelationFeatures).float(), dim=-1)
+        if self.mtmVisualAdapterEnabled:
+            visualFeatures = F.normalize(
+                self.relationMtm.encode_visual(normalizedRelationFeatures),
+                dim=-1,
+            )
+        else:
+            visualFeatures = normalizedRelationFeatures
+        predicted_embeddings = F.normalize(
+            self.relationMtm.encode_text_space(visualFeatures).float(),
+            dim=-1,
+        )
         scores = relationFeatures.new_zeros(outShape, dtype=torch.float32)
         self.populateFilteredTripletEmbeddingCache(subjLabels, objLabels)
         labelPairs = torch.stack([subjLabels, objLabels], dim=-1).detach().cpu().tolist()
@@ -1589,18 +1556,13 @@ class ClipPredictor(nn.Module):
                 if mtm_pair_idx.numel() > 0:
                     mtm_image = self.cropImagePadding(img[i], proposals[i])
                     with torch.no_grad():
-                        _, mtm_clip_feature_map = self.encodeClipImageFeatureMap(mtm_image)
-                    mtmFeatureOutput = self.buildMtmRoiRelationFeatures(
-                        mtm_clip_feature_map,
-                        proposals[i],
-                        mtm_pair_idx,
-                        mtm_image,
-                        returnRawUnion=(self.training and self.mtmLossEnabled),
-                    )
+                        mtm_relation_features = self.buildMtmUnionCropFeatures(
+                            mtm_image,
+                            proposals[i],
+                            mtm_pair_idx,
+                        )
                     if self.training and self.mtmLossEnabled:
-                        mtm_relation_features, mtm_raw_union_features = mtmFeatureOutput
-                    else:
-                        mtm_relation_features = mtmFeatureOutput
+                        mtm_raw_union_features = mtm_relation_features.detach()
 
             if self.training and self.mtmLossEnabled and mtm_relation_features is not None:
                 relationFeaturesForMtm.append(mtm_relation_features)
