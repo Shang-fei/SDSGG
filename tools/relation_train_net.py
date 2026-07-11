@@ -150,7 +150,7 @@ def train(cfg, local_rank, distributed, logger):
         images = images.to(device)
         targets = [target.to(device) for target in targets]
         
-        loss_dict = model(images, targets)
+        loss_dict = model(images, targets, logger)
 
 
         losses = sum(loss for loss in loss_dict.values())
