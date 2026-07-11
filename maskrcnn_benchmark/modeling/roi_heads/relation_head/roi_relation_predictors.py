@@ -285,27 +285,6 @@ class RelationModalityTransfer(nn.Module):
         return self.norm(x)
 
 
-class RelationnessHead(nn.Module):
-    def __init__(self, relationDim=512, spatialDim=32, hiddenDim=256, dropout=0.1):
-        super(RelationnessHead, self).__init__()
-        self.spatialProj = nn.Sequential(
-            nn.Linear(spatialDim, hiddenDim),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-        )
-        self.classifier = nn.Sequential(
-            nn.Linear(relationDim + hiddenDim, hiddenDim),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Linear(hiddenDim, 1),
-        )
-
-    def forward(self, relationFeatures, spatialFeatures):
-        spatialFeatures = self.spatialProj(spatialFeatures.float())
-        features = torch.cat([relationFeatures.float(), spatialFeatures], dim=-1)
-        return self.classifier(features).squeeze(-1)
-
-
 @registry.ROI_RELATION_PREDICTOR.register("GQAClipPredictor")
 class GQAClipPredictor(nn.Module):
     def __init__(self, config, in_channels):
@@ -698,13 +677,14 @@ class ClipPredictor(nn.Module):
 
         self.linear1=nn.Linear(1024,512, bias=False).to(self.device).half()
         mtmConfig = config.MODEL.ROI_RELATION_HEAD.MTM
-        relationnessConfig = config.MODEL.ROI_RELATION_HEAD.RELATIONNESS
         self.mtmEnabled = mtmConfig.ENABLED
         self.mtmLossEnabled = mtmConfig.ENABLED and mtmConfig.LOSS_ENABLED
         self.mtmLossWeight = mtmConfig.LOSS_WEIGHT
         self.mtmAlignWeight = mtmConfig.ALIGN_WEIGHT
         self.mtmStructureWeight = mtmConfig.STRUCTURE_WEIGHT
         self.mtmVisualStructureWeight = mtmConfig.VISUAL_STRUCTURE_WEIGHT
+        self.mtmStructureDebugEnabled = mtmConfig.STRUCTURE_DEBUG_ENABLED
+        self.mtmStructureDebugStep = max(int(mtmConfig.STRUCTURE_DEBUG_STEP), 1)
         self.mtmMaxPairs = mtmConfig.MAX_PAIRS
         self.mtmUseInference = mtmConfig.ENABLED and mtmConfig.USE_INFERENCE
         self.mtmInferenceWeight = mtmConfig.INFERENCE_WEIGHT
@@ -726,10 +706,6 @@ class ClipPredictor(nn.Module):
         )
         for param in self.clip_model.parameters():
             param.requires_grad_(False)
-        self.relationnessEnabled = relationnessConfig.ENABLED
-        self.relationnessLossEnabled = relationnessConfig.ENABLED and relationnessConfig.LOSS_ENABLED
-        self.relationnessLossWeight = relationnessConfig.LOSS_WEIGHT
-        self.useRelationnessInference = relationnessConfig.ENABLED and relationnessConfig.USE_INFERENCE
         self.mtmUnionGateFusion = MTMUnionGateFusion(
             featureDim=mtmConfig.INPUT_DIM,
             spatialDim=32,
@@ -751,11 +727,6 @@ class ClipPredictor(nn.Module):
             mtmConfig.NUM_HEADS,
             mtmConfig.DROPOUT,
         ).to(self.device)
-        self.relationnessHead = RelationnessHead(
-            relationDim=mtmConfig.EMBED_DIM,
-            hiddenDim=mtmConfig.EMBED_DIM // 2,
-            dropout=mtmConfig.DROPOUT,
-        ).to(self.device)
         self.activeRelNames = activeRelNames
         self.filteredTripletEmbeddingCache = {}
         self.tripletTextSvdCache = {}
@@ -763,6 +734,7 @@ class ClipPredictor(nn.Module):
         self.novelRelNames = [self.relNames[index] for index in self.novel if index != 0]
         self.novelRelationCandidates = {}
         self.register_buffer("shipTrainingStep", torch.zeros((), dtype=torch.long))
+        self.register_buffer("mtmDebugIteration", torch.zeros((), dtype=torch.long))
         self.updateMtmTextSvdBasis()
         self.mtmModeStateCache = {
             mode: {
@@ -1054,21 +1026,6 @@ class ClipPredictor(nn.Module):
         objBoxInfo = boxInfo.index_select(0, pairIdx[:, 1])
         return get_box_pair_info(subjBoxInfo, objBoxInfo)
 
-    def computeRelationnessLoss(self, relationnessLogits, relationLabels):
-        if len(relationnessLogits) == 0 or relationLabels is None:
-            zero = self.relationnessHead.classifier[-1].weight.sum() * 0.0
-            return {"loss_mtm_relationness": zero}
-        relationnessLogits = torch.cat(relationnessLogits, dim=0).float()
-        relationLabels = torch.cat(relationLabels, dim=0).view(-1).to(relationnessLogits.device)
-        relationnessTargets = (relationLabels > 0).float()
-        relationnessProb = torch.sigmoid(relationnessLogits).clamp(min=1e-6, max=1.0 - 1e-6)
-        gamma = 2.0
-        positiveLoss = -relationnessTargets * torch.log(relationnessProb) * (1.0 - relationnessProb).pow(gamma)
-        negativeLoss = -(1.0 - relationnessTargets) * torch.log(1.0 - relationnessProb) * relationnessProb.pow(gamma)
-        normalizer = relationnessTargets.sum().clamp(min=1.0)
-        loss = (positiveLoss + negativeLoss).sum() / normalizer
-        return {"loss_mtm_relationness": self.relationnessLossWeight * loss}
-
     def emptyMtmLosses(self, zero):
         return {
             "loss_mtm_align": zero,
@@ -1078,7 +1035,7 @@ class ClipPredictor(nn.Module):
             "loss_mtm_ship_kl": zero,
         }
 
-    def computeMtmLosses(self, relationFeatures, relationLabels, subjLabels, objLabels):
+    def computeMtmLosses(self, relationFeatures, relationLabels, subjLabels, objLabels, logger=None):
         if not self.mtmLossEnabled or len(relationFeatures) == 0 or relationLabels is None:
             return self.emptyMtmLosses(self.relationMtm.norm.weight.sum() * 0.0)
 
@@ -1101,6 +1058,7 @@ class ClipPredictor(nn.Module):
         relationLabels = relationLabels[positive]
         subjLabels = subjLabels[positive]
         objLabels = objLabels[positive]
+        self.mtmDebugIteration.add_(1)
         if self.mtmMaxPairs > 0 and relationFeatures.size(0) > self.mtmMaxPairs:
             sampleIndex = torch.linspace(
                 0,
@@ -1206,6 +1164,31 @@ class ClipPredictor(nn.Module):
             visualStructureLoss = (
                 structureError[offDiagonal] * validWeights
             ).sum() / validWeights.sum().clamp(min=1.0)
+            if (
+                self.mtmStructureDebugEnabled
+                and logger is not None
+                and int(self.mtmDebugIteration.item()) % self.mtmStructureDebugStep == 0
+            ):
+                with torch.no_grad():
+                    visualValues = inputVisualSimilarity[offDiagonal].float()
+                    mtmValues = predictedSimilarity[offDiagonal].float()
+                    errorValues = structureError[offDiagonal].float()
+                    logger.info(
+                        "MTM structure debug iter=%d: "
+                        "visual_cos_mean=%.6f visual_cos_std=%.6f visual_cos_min=%.6f visual_cos_max=%.6f "
+                        "mtm_cos_mean=%.6f mtm_cos_std=%.6f mtm_cos_min=%.6f mtm_cos_max=%.6f "
+                        "structure_abs_error=%.6f",
+                        int(self.mtmDebugIteration.item()),
+                        visualValues.mean().item(),
+                        visualValues.std(unbiased=False).item(),
+                        visualValues.min().item(),
+                        visualValues.max().item(),
+                        mtmValues.mean().item(),
+                        mtmValues.std(unbiased=False).item(),
+                        mtmValues.min().item(),
+                        mtmValues.max().item(),
+                        errorValues.mean().item(),
+                    )
 
         return {
             "loss_mtm_align": self.mtmLossWeight * self.mtmAlignWeight * baseAlignLoss,
@@ -1346,8 +1329,6 @@ class ClipPredictor(nn.Module):
         relationLabelsForMtm = []
         subjLabelsForMtm = []
         objLabelsForMtm = []
-        relationnessLogitsForLoss = []
-        relationnessLabelsForLoss = []
         for i in range(len(num_rels)):
             image_tensor=[]
             with torch.no_grad():
@@ -1387,20 +1368,6 @@ class ClipPredictor(nn.Module):
             cross_output1 = self.adaper_clip1(sub_features, obj_features, text_sub)
             cross_output2 = self.adaper_clip2(obj_features, sub_features, text_obj)
             cross_output = (cross_output1 + cross_output2) / 2
-            pair_spatial_features = self.buildPairSpatialFeatures(proposals[i], pair_idx).to(
-                device=cross_output.device,
-                dtype=cross_output.dtype,
-            )
-            if self.relationnessEnabled:
-                relationness_logits = self.relationnessHead(cross_output.detach(), pair_spatial_features)
-                relationness_scores = torch.sigmoid(relationness_logits).to(dtype=cross_output.dtype).unsqueeze(-1)
-            else:
-                relationness_logits = None
-                relationness_scores = cross_output.new_ones((cross_output.size(0), 1))
-            if self.training and self.relationnessLossEnabled and rel_labels is not None:
-                relationnessLogitsForLoss.append(relationness_logits)
-                relationnessLabelsForLoss.append(rel_labels[i].to(relationness_logits.device))
-
             mtm_relation_features = None
             need_mtm_features = (
                 (self.training and self.mtmLossEnabled)
@@ -1473,9 +1440,6 @@ class ClipPredictor(nn.Module):
                         rel_dist_per_batch.dtype,
                     )
                     rel_dist_per_batch = rel_dist_per_batch + self.mtmInferenceWeight * mtmScores
-                if self.useRelationnessInference:
-                    proposals[i].add_field("relationness_scores", relationness_scores.squeeze(-1).detach())
-
             rel_dists.append(rel_dist_per_batch)
 
 
@@ -1485,9 +1449,15 @@ class ClipPredictor(nn.Module):
 
         add_losses = {}
         if self.training and self.mtmLossEnabled:
-            add_losses.update(self.computeMtmLosses(relationFeaturesForMtm, relationLabelsForMtm, subjLabelsForMtm, objLabelsForMtm))
-        if self.training and self.relationnessLossEnabled:
-            add_losses.update(self.computeRelationnessLoss(relationnessLogitsForLoss, relationnessLabelsForLoss))
+            add_losses.update(
+                self.computeMtmLosses(
+                    relationFeaturesForMtm,
+                    relationLabelsForMtm,
+                    subjLabelsForMtm,
+                    objLabelsForMtm,
+                    logger,
+                )
+            )
         return obj_dists, rel_dists, add_losses
 
 

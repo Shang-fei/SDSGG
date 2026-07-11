@@ -20,20 +20,6 @@ METRIC_RE = re.compile(
 DETAIL_RE = re.compile(r"\(([^:]+):([0-9.]+)\)")
 
 
-def parse_bool_values(value):
-    if value == "both":
-        return [False, True]
-    if value == "on":
-        return [True]
-    if value == "off":
-        return [False]
-    raise ValueError("expected one of: on, off, both")
-
-
-def bool_str(value):
-    return "on" if value else "off"
-
-
 def parse_metrics(text):
     metrics = {}
     lines = text.splitlines()
@@ -71,7 +57,7 @@ def parse_metrics(text):
     return metrics
 
 
-def build_test_command(args, run_output_dir, split_name, part, relationness, mtm_weight):
+def build_test_command(args, run_output_dir, split_name, part, mtm_weight):
     command = [
         sys.executable,
         args.test_script,
@@ -87,10 +73,6 @@ def build_test_command(args, run_output_dir, split_name, part, relationness, mtm
         "True",
         "MODEL.ROI_RELATION_HEAD.MTM.USE_INFERENCE",
         "True",
-        "MODEL.ROI_RELATION_HEAD.RELATIONNESS.ENABLED",
-        "True",
-        "MODEL.ROI_RELATION_HEAD.RELATIONNESS.USE_INFERENCE",
-        str(relationness),
         "MODEL.ROI_RELATION_HEAD.MTM.INFERENCE_WEIGHT",
         str(mtm_weight),
         "OUTPUT_DIR",
@@ -134,7 +116,6 @@ def write_summary_csv(rows, path):
         "split",
         "part",
         "mtm_inference",
-        "relationness_prior",
         "mtm_weight",
         "returncode",
         "log_path",
@@ -169,7 +150,7 @@ def write_summary_csv(rows, path):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Run MTM/relationness inference sensitivity sweeps."
+        description="Run MTM inference sensitivity sweeps."
     )
     parser.add_argument("--config-file", required=True)
     parser.add_argument("--weight", default="")
@@ -177,7 +158,6 @@ def main():
     parser.add_argument("--test-script", default="tools/relation_test_net.py")
     parser.add_argument("--predictor", default="ClipPredictor")
     parser.add_argument("--output-dir", default="output/mtm_sensitivity")
-    parser.add_argument("--relationness", choices=["on", "off", "both"], default="both")
     parser.add_argument("--mtm-weights", nargs="+", type=float, default=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0])
     parser.add_argument("--base-split", default="val")
     parser.add_argument("--novel-split", default="test")
@@ -200,7 +180,6 @@ def main():
     with open(os.path.join(sweep_dir, "sweep_args.json"), "w") as f:
         json.dump(vars(args), f, indent=2)
 
-    relationness_values = parse_bool_values(args.relationness)
     targets = []
     if not args.skip_base:
         targets.append(("base", args.base_split, args.base_part))
@@ -208,52 +187,47 @@ def main():
         targets.append(("novel", args.novel_split, args.novel_part))
 
     rows = []
-    for relationness in relationness_values:
-        for mtm_weight in args.mtm_weights:
-            for target_name, split_name, part in targets:
-                run_name = (
-                    target_name
-                    + "_"
-                    + split_name
-                    + "_rel-"
-                    + bool_str(relationness)
-                    + "_w-"
-                    + str(mtm_weight).replace(".", "p")
-                )
-                run_output_dir = os.path.join(sweep_dir, run_name, "model_output")
-                os.makedirs(run_output_dir, exist_ok=True)
-                log_path = os.path.join(sweep_dir, run_name, "eval.log")
-                command = build_test_command(
-                    args,
-                    run_output_dir,
-                    split_name,
-                    part,
-                    relationness,
-                    mtm_weight,
-                )
-                print("\n==> Running", run_name)
-                returncode, output = run_command(command, log_path, args.dry_run)
-                metrics = parse_metrics(output)
-                row = {
-                    "target": target_name,
-                    "split": split_name,
-                    "part": part,
-                    "mtm_inference": True,
-                    "relationness_prior": relationness,
-                    "mtm_weight": mtm_weight,
-                    "returncode": returncode,
-                    "log_path": log_path,
-                }
-                row.update(metrics)
-                rows.append(row)
-                result_path = os.path.join(sweep_dir, run_name, "metrics.json")
-                with open(result_path, "w") as f:
-                    json.dump(row, f, indent=2, sort_keys=True)
-                write_summary_csv(rows, os.path.join(sweep_dir, "summary.csv"))
-                with open(os.path.join(sweep_dir, "summary.json"), "w") as f:
-                    json.dump(rows, f, indent=2, sort_keys=True)
-                if returncode != 0:
-                    raise RuntimeError("Run failed: {}. See {}".format(run_name, log_path))
+    for mtm_weight in args.mtm_weights:
+        for target_name, split_name, part in targets:
+            run_name = (
+                target_name
+                + "_"
+                + split_name
+                + "_w-"
+                + str(mtm_weight).replace(".", "p")
+            )
+            run_output_dir = os.path.join(sweep_dir, run_name, "model_output")
+            os.makedirs(run_output_dir, exist_ok=True)
+            log_path = os.path.join(sweep_dir, run_name, "eval.log")
+            command = build_test_command(
+                args,
+                run_output_dir,
+                split_name,
+                part,
+                mtm_weight,
+            )
+            print("\n==> Running", run_name)
+            returncode, output = run_command(command, log_path, args.dry_run)
+            metrics = parse_metrics(output)
+            row = {
+                "target": target_name,
+                "split": split_name,
+                "part": part,
+                "mtm_inference": True,
+                "mtm_weight": mtm_weight,
+                "returncode": returncode,
+                "log_path": log_path,
+            }
+            row.update(metrics)
+            rows.append(row)
+            result_path = os.path.join(sweep_dir, run_name, "metrics.json")
+            with open(result_path, "w") as f:
+                json.dump(row, f, indent=2, sort_keys=True)
+            write_summary_csv(rows, os.path.join(sweep_dir, "summary.csv"))
+            with open(os.path.join(sweep_dir, "summary.json"), "w") as f:
+                json.dump(rows, f, indent=2, sort_keys=True)
+            if returncode != 0:
+                raise RuntimeError("Run failed: {}. See {}".format(run_name, log_path))
 
     print("\nSweep results saved to", sweep_dir)
 
