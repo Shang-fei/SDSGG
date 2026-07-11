@@ -1046,7 +1046,7 @@ class ClipPredictor(nn.Module):
             encoded = self.clip_model.encode_image(cropChunk)
             if encoded.dim() == 3 and not returnTokens:
                 encoded = encoded[:, 0, :]
-            encodedChunks.append(encoded.float())
+            encodedChunks.append(encoded)
         return torch.cat(encodedChunks, dim=0)
 
     def buildMtmUnionCropFeatures(self, image, proposal, pairIdx):
