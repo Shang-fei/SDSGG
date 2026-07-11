@@ -10,6 +10,8 @@ def make_optimizer(cfg, model, logger, slow_heads=None, slow_ratio=5.0, rl_facto
     for key, value in model.named_parameters():
         if not value.requires_grad:
             continue
+        if "shipFeatureGenerator" in key:
+            continue
         lr = cfg.SOLVER.BASE_LR
         weight_decay = cfg.SOLVER.WEIGHT_DECAY
         if "bias" in key:
@@ -31,6 +33,24 @@ def make_optimizer(cfg, model, logger, slow_heads=None, slow_ratio=5.0, rl_facto
 
     #optimizer = torch.optim.Adam(params, lr=cfg.SOLVER.BASE_LR,eps=1e-4)
     return optimizer
+
+
+def make_ship_optimizer(cfg, model):
+    if not cfg.MODEL.ROI_RELATION_HEAD.MTM.SHIP_ENABLED:
+        return None
+    parameters = [
+        value
+        for key, value in model.named_parameters()
+        if value.requires_grad and "shipFeatureGenerator" in key
+    ]
+    if len(parameters) == 0:
+        return None
+    return torch.optim.AdamW(
+        parameters,
+        lr=cfg.MODEL.ROI_RELATION_HEAD.MTM.SHIP_LR,
+        weight_decay=cfg.MODEL.ROI_RELATION_HEAD.MTM.SHIP_WEIGHT_DECAY,
+        betas=(0.9, 0.999),
+    )
 
 
 def make_lr_scheduler(cfg, optimizer, logger=None):
