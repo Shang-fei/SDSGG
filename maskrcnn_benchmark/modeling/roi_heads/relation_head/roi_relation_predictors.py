@@ -136,7 +136,7 @@ class MVA(nn.Module):
 
 
 class MTMVisualResidualAdapter(nn.Module):
-    def __init__(self, featureDim=512, spatialDim=32, dropout=0.1, mode="union"):
+    def __init__(self, featureDim=512, spatialDim=32, dropout=0.1, mode="union", maxScale=0.1):
         super(MTMVisualResidualAdapter, self).__init__()
         mode = str(mode).lower()
         if mode not in {"union", "context"}:
@@ -152,6 +152,10 @@ class MTMVisualResidualAdapter(nn.Module):
             nn.Linear(hiddenDim, featureDim),
         )
         self.alpha = nn.Parameter(torch.zeros(()))
+        self.maxScale = float(maxScale)
+
+    def residualScale(self):
+        return self.maxScale * torch.tanh(self.alpha)
 
     def forward(self, unionFeatures, subFeatures, objFeatures, spatialFeatures):
         unionFeatures = unionFeatures.float()
@@ -168,7 +172,7 @@ class MTMVisualResidualAdapter(nn.Module):
         else:
             adapterInputs = unionFeatures
         delta = self.deltaNet(adapterInputs)
-        return unionFeatures + torch.tanh(self.alpha) * delta
+        return unionFeatures + self.residualScale() * delta
 
 
 def initializeShipLayer(module, initStd=0.02):
@@ -179,52 +183,55 @@ def initializeShipLayer(module, initStd=0.02):
 
 
 class ShipVisualEncoder(nn.Module):
-    def __init__(self, visualDim=512, semanticDim=512, hiddenDim=2048, latentDim=512, initStd=0.02):
+    def __init__(self, visualDim=512, hiddenDim=2048, latentDim=512, initStd=0.02):
         super(ShipVisualEncoder, self).__init__()
         self.featureEncoder = nn.Sequential(
-            nn.Linear(visualDim + semanticDim, hiddenDim),
+            nn.Linear(visualDim, hiddenDim),
             nn.ReLU(inplace=True),
         )
         self.mean = nn.Linear(hiddenDim, latentDim)
         self.logvar = nn.Linear(hiddenDim, latentDim)
         self.apply(lambda module: initializeShipLayer(module, initStd))
 
-    def forward(self, visualFeatures, semanticFeatures):
-        hidden = self.featureEncoder(torch.cat([visualFeatures, semanticFeatures], dim=-1).float())
+    def forward(self, visualFeatures):
+        hidden = self.featureEncoder(visualFeatures.float())
         return self.mean(hidden), self.logvar(hidden)
 
 
 class ShipLatentGenerator(nn.Module):
-    def __init__(self, latentDim=512, semanticDim=512, hiddenDim=4096, outputDim=512, initStd=0.02):
+    def __init__(self, latentDim=512, hiddenDim=4096, outputDim=512, initStd=0.02):
         super(ShipLatentGenerator, self).__init__()
         self.net = nn.Sequential(
-            nn.Linear(latentDim + semanticDim, hiddenDim),
+            nn.Linear(latentDim, hiddenDim),
             nn.ReLU(inplace=True),
             nn.Linear(hiddenDim, outputDim),
         )
         self.apply(lambda module: initializeShipLayer(module, initStd))
 
-    def forward(self, latentFeatures, semanticFeatures):
-        inputs = torch.cat([latentFeatures, semanticFeatures], dim=-1)
-        return self.net(inputs.float())
+    def forward(self, latentFeatures):
+        return self.net(latentFeatures.float())
 
 
 class ShipTripletFeatureGenerator(nn.Module):
-    def __init__(self, visualDim=512, semanticDim=512, latentDim=512, initStd=0.02):
+    def __init__(self, clipModel, visualDim=512, embedDim=512, latentDim=512, ctxLen=4, initStd=0.02):
         super(ShipTripletFeatureGenerator, self).__init__()
+        if visualDim != embedDim:
+            raise ValueError("SHIP prompt reconstruction requires visualDim == embedDim")
+        object.__setattr__(self, "clipModel", clipModel)
         self.latentDim = latentDim
+        self.ctxLen = ctxLen
+        self.ctx = nn.Parameter(torch.empty(ctxLen, embedDim))
+        nn.init.normal_(self.ctx, mean=0.0, std=initStd)
         self.visualEncoder = ShipVisualEncoder(
             visualDim=visualDim,
-            semanticDim=semanticDim,
             hiddenDim=2048,
             latentDim=latentDim,
             initStd=initStd,
         )
         self.latentGenerator = ShipLatentGenerator(
             latentDim=latentDim,
-            semanticDim=semanticDim,
             hiddenDim=4096,
-            outputDim=visualDim,
+            outputDim=embedDim,
             initStd=initStd,
         )
 
@@ -232,25 +239,46 @@ class ShipTripletFeatureGenerator(nn.Module):
         noise = torch.randn_like(mean)
         return mean + noise * torch.exp(0.5 * logvar)
 
-    def reconstruct(self, visualFeatures, semanticFeatures):
+    def encodePromptEmbeddings(self, prompts, tokenizedPrompts):
+        dtype = self.clipModel.dtype
+        x = prompts.to(dtype=dtype) + self.clipModel.positional_embedding.type(dtype)
+        x = x.permute(1, 0, 2)
+        x = self.clipModel.transformer(x)
+        x = x.permute(1, 0, 2)
+        x = self.clipModel.ln_final(x).type(dtype)
+        eosPositions = tokenizedPrompts.argmax(dim=-1)
+        x = x[torch.arange(x.size(0), device=x.device), eosPositions]
+        return (x @ self.clipModel.text_projection).float()
+
+    def encodeResidualPrompts(self, tripletTexts, residuals):
+        promptPrefix = " ".join(["X"] * self.ctxLen)
+        promptedTexts = [promptPrefix + " " + text for text in tripletTexts]
+        tokenizedPrompts = clip.tokenize(promptedTexts).to(residuals.device)
+        with torch.no_grad():
+            tokenEmbeddings = self.clipModel.token_embedding(tokenizedPrompts).float()
+        prefix = tokenEmbeddings[:, :1, :]
+        suffix = tokenEmbeddings[:, 1 + self.ctxLen :, :]
+        ctx = self.ctx.unsqueeze(0).expand(residuals.size(0), -1, -1)
+        prompts = torch.cat([prefix, ctx + residuals.unsqueeze(1), suffix], dim=1)
+        return F.normalize(self.encodePromptEmbeddings(prompts, tokenizedPrompts), dim=-1)
+
+    def reconstruct(self, tripletTexts, visualFeatures):
         reconstructionTargets = F.normalize(visualFeatures.detach().float(), dim=-1)
-        semanticConditions = F.normalize(semanticFeatures.detach().float(), dim=-1)
-        mean, logvar = self.visualEncoder(reconstructionTargets, semanticConditions)
+        mean, logvar = self.visualEncoder(reconstructionTargets)
         latentFeatures = self.reparameterize(mean, logvar)
-        reconstructedFeatures = self.latentGenerator(latentFeatures, semanticConditions)
-        reconstructedFeatures = F.normalize(reconstructedFeatures.float(), dim=-1)
+        residuals = self.latentGenerator(latentFeatures)
+        reconstructedFeatures = self.encodeResidualPrompts(tripletTexts, residuals)
         return reconstructedFeatures, mean, logvar
 
-    def generate(self, semanticFeatures):
-        semanticConditions = F.normalize(semanticFeatures.detach().float(), dim=-1)
+    def generate(self, tripletTexts, device):
         latentFeatures = torch.randn(
-            semanticConditions.size(0),
+            len(tripletTexts),
             self.latentDim,
-            device=semanticConditions.device,
+            device=device,
             dtype=torch.float32,
         )
-        generatedFeatures = self.latentGenerator(latentFeatures, semanticConditions)
-        return F.normalize(generatedFeatures.float(), dim=-1)
+        residuals = self.latentGenerator(latentFeatures)
+        return self.encodeResidualPrompts(tripletTexts, residuals)
 
     def klLoss(self, mean, logvar):
         return (-0.5 * (1.0 + logvar - mean.pow(2) - logvar.exp()).sum(dim=-1)).mean()
@@ -695,12 +723,16 @@ class ClipPredictor(nn.Module):
         self.mtmTextSvdEnabled = mtmConfig.TEXT_SVD_ENABLED
         self.mtmTextSvdComponents = mtmConfig.TEXT_SVD_COMPONENTS
         self.mtmTextSvdChunkSize = mtmConfig.TEXT_SVD_CHUNK_SIZE
+        self.mtmVisualAdapterEnabled = mtmConfig.VISUAL_ADAPTER_ENABLED
         self.mtmVisualAdapterMode = mtmConfig.VISUAL_ADAPTER_MODE
         self.mtmShipEnabled = mtmConfig.SHIP_ENABLED
         self.mtmShipPseudoRatio = mtmConfig.SHIP_PSEUDO_RATIO
         self.mtmShipReconWeight = mtmConfig.SHIP_RECON_WEIGHT
         self.mtmShipKlWeight = mtmConfig.SHIP_KL_WEIGHT
         self.mtmShipNovelAlignWeight = mtmConfig.SHIP_NOVEL_ALIGN_WEIGHT
+        self.mtmShipVisualTransferEnabled = mtmConfig.SHIP_VISUAL_TRANSFER_ENABLED
+        self.mtmShipVisualTransferWeight = mtmConfig.SHIP_VISUAL_TRANSFER_WEIGHT
+        self.mtmShipTransferTemperature = max(float(mtmConfig.SHIP_TRANSFER_TEMPERATURE), 1e-6)
         self.mtmShipWarmupIters = max(int(mtmConfig.SHIP_WARMUP_ITERS), 0)
         self.mtmShipRampIters = max(int(mtmConfig.SHIP_RAMP_ITERS), 1)
         self.clipInputSize = self.clip_model.visual.input_resolution
@@ -715,13 +747,18 @@ class ClipPredictor(nn.Module):
             spatialDim=32,
             dropout=mtmConfig.DROPOUT,
             mode=self.mtmVisualAdapterMode,
+            maxScale=mtmConfig.VISUAL_ADAPTER_MAX_SCALE,
         ).to(self.device)
         self.shipFeatureGenerator = None
         if self.mtmShipEnabled:
+            if self.mtmVisualAdapterEnabled and self.mtmVisualAdapterMode != "union":
+                raise ValueError("SHIP pseudo union features require MTM.VISUAL_ADAPTER_MODE='union'")
             self.shipFeatureGenerator = ShipTripletFeatureGenerator(
+                self.clip_model,
                 visualDim=mtmConfig.INPUT_DIM,
-                semanticDim=mtmConfig.EMBED_DIM,
+                embedDim=mtmConfig.EMBED_DIM,
                 latentDim=mtmConfig.EMBED_DIM,
+                ctxLen=mtmConfig.SHIP_CTX_LEN,
                 initStd=mtmConfig.SHIP_INIT_STD,
             ).to(self.device)
         self.relationMtm = RelationModalityTransfer(
@@ -870,7 +907,7 @@ class ClipPredictor(nn.Module):
 
     def buildNovelTripletTexts(self, subjLabels, objLabels, pseudoCount):
         if pseudoCount <= 0 or len(self.novelRelNames) == 0:
-            return []
+            return [], None, None
         sampledPairIndices = torch.randint(
             subjLabels.numel(),
             (pseudoCount,),
@@ -899,7 +936,11 @@ class ClipPredictor(nn.Module):
                 int(torch.randint(len(compatibleRelations), (1,)).item())
             ]
             texts.append("a photo of a " + subjName + " " + sampledRelation + " a " + objName)
-        return texts
+        return (
+            texts,
+            subjLabels.index_select(0, sampledPairIndices),
+            objLabels.index_select(0, sampledPairIndices),
+        )
 
     def buildFilteredTripletTexts(self, subjLabel, objLabels):
         texts = []
@@ -1012,7 +1053,7 @@ class ClipPredictor(nn.Module):
         bottomRight = torch.max(subBoxes[:, 2:], objBoxes[:, 2:])
         return torch.cat([topLeft, bottomRight], dim=-1)
 
-    def buildMtmRoiRelationFeatures(self, clipFeatureMap, proposal, pairIdx, image):
+    def buildMtmRoiRelationFeatures(self, clipFeatureMap, proposal, pairIdx, image, returnRawUnion=False):
         pairIdx = pairIdx.to(proposal.bbox.device)
         clipBoxes = self.scaleBoxesToClipInput(proposal.bbox, image)
         subBoxes = clipBoxes.index_select(0, pairIdx[:, 0])
@@ -1025,12 +1066,17 @@ class ClipPredictor(nn.Module):
             device=unionFeatures.device,
             dtype=unionFeatures.dtype,
         )
-        relationFeatures = self.mtmVisualAdapter(
-            unionFeatures,
-            subFeatures,
-            objFeatures,
-            spatialFeatures,
-        )
+        if self.mtmVisualAdapterEnabled:
+            relationFeatures = self.mtmVisualAdapter(
+                unionFeatures,
+                subFeatures,
+                objFeatures,
+                spatialFeatures,
+            )
+        else:
+            relationFeatures = unionFeatures
+        if returnRawUnion:
+            return relationFeatures, unionFeatures.detach()
         return relationFeatures
 
     def buildPairSpatialFeatures(self, proposal, pairIdx):
@@ -1046,13 +1092,23 @@ class ClipPredictor(nn.Module):
             "loss_mtm_visual_structure": zero,
             "loss_mtm_ship_recon": zero,
             "loss_mtm_ship_kl": zero,
+            "loss_mtm_ship_visual_transfer": zero,
         }
 
-    def computeMtmLosses(self, relationFeatures, relationLabels, subjLabels, objLabels, logger=None):
+    def computeMtmLosses(
+        self,
+        relationFeatures,
+        rawUnionFeatures,
+        relationLabels,
+        subjLabels,
+        objLabels,
+        logger=None,
+    ):
         if not self.mtmLossEnabled or len(relationFeatures) == 0 or relationLabels is None:
             return self.emptyMtmLosses(self.relationMtm.norm.weight.sum() * 0.0)
 
         relationFeatures = torch.cat(relationFeatures, dim=0).float()
+        rawUnionFeatures = torch.cat(rawUnionFeatures, dim=0).float().to(relationFeatures.device)
         relationLabels = torch.cat(relationLabels, dim=0).view(-1).long().to(relationFeatures.device)
         subjLabels = torch.cat(subjLabels, dim=0).view(-1).long().to(relationFeatures.device)
         objLabels = torch.cat(objLabels, dim=0).view(-1).long().to(relationFeatures.device)
@@ -1068,6 +1124,7 @@ class ClipPredictor(nn.Module):
             return self.emptyMtmLosses(relationFeatures.sum() * 0.0)
 
         relationFeatures = relationFeatures[positive]
+        rawUnionFeatures = rawUnionFeatures[positive]
         relationLabels = relationLabels[positive]
         subjLabels = subjLabels[positive]
         objLabels = objLabels[positive]
@@ -1080,11 +1137,13 @@ class ClipPredictor(nn.Module):
                 device=relationFeatures.device,
             ).long()
             relationFeatures = relationFeatures.index_select(0, sampleIndex)
+            rawUnionFeatures = rawUnionFeatures.index_select(0, sampleIndex)
             relationLabels = relationLabels.index_select(0, sampleIndex)
             subjLabels = subjLabels.index_select(0, sampleIndex)
             objLabels = objLabels.index_select(0, sampleIndex)
 
         baseVisualFeatures = F.normalize(relationFeatures.float(), dim=-1)
+        baseRawUnionFeatures = F.normalize(rawUnionFeatures.detach().float(), dim=-1)
         baseTexts = self.buildTargetTripletTexts(subjLabels, relationLabels, objLabels)
         baseTextTargets = F.normalize(
             self.encodeTripletTexts(baseTexts).to(baseVisualFeatures.device).float(),
@@ -1094,7 +1153,10 @@ class ClipPredictor(nn.Module):
         novelAlignLoss = zero
         reconstructionLoss = zero
         klLoss = zero
+        visualTransferLoss = zero
+        visualTransferCosine = None
         pseudoVisualFeatures = None
+        pseudoRawUnionFeatures = None
         pseudoWeight = 0.0
         klWeight = 0.0
 
@@ -1108,28 +1170,45 @@ class ClipPredictor(nn.Module):
             pseudoWeight = rampProgress
             klWeight = rampProgress
             reconstructedFeatures, shipMean, shipLogvar = self.shipFeatureGenerator.reconstruct(
-                baseVisualFeatures,
-                baseTextTargets,
+                baseTexts,
+                baseRawUnionFeatures,
             )
             reconstructionLoss = (
-                reconstructedFeatures - baseVisualFeatures.detach()
+                reconstructedFeatures - baseRawUnionFeatures
             ).pow(2).sum(dim=-1).mean()
             klLoss = self.shipFeatureGenerator.klLoss(shipMean, shipLogvar)
             if currentStep > self.mtmShipWarmupIters and self.mtmShipPseudoRatio > 0:
                 pseudoCount = int(round(baseVisualFeatures.size(0) * float(self.mtmShipPseudoRatio)))
                 if pseudoCount == 0:
                     pseudoCount = 1
-                novelTexts = self.buildNovelTripletTexts(subjLabels, objLabels, pseudoCount)
+                novelTexts, novelSubjLabels, novelObjLabels = self.buildNovelTripletTexts(
+                    subjLabels,
+                    objLabels,
+                    pseudoCount,
+                )
             else:
                 novelTexts = []
+                novelSubjLabels = None
+                novelObjLabels = None
             if len(novelTexts) > 0:
                 novelTextTargets = F.normalize(
                     self.encodeTripletTexts(novelTexts).to(baseVisualFeatures.device).float(),
                     dim=-1,
                 ).detach()
-                pseudoVisualFeatures = self.shipFeatureGenerator.generate(
-                    novelTextTargets,
+                pseudoRawUnionFeatures = self.shipFeatureGenerator.generate(
+                    novelTexts,
+                    baseVisualFeatures.device,
                 )
+                if self.mtmVisualAdapterEnabled:
+                    pseudoVisualFeatures = self.mtmVisualAdapter(
+                        pseudoRawUnionFeatures,
+                        None,
+                        None,
+                        None,
+                    )
+                else:
+                    pseudoVisualFeatures = pseudoRawUnionFeatures
+                pseudoVisualFeatures = F.normalize(pseudoVisualFeatures.float(), dim=-1)
                 allVisualFeatures = torch.cat([baseVisualFeatures, pseudoVisualFeatures], dim=0)
             else:
                 novelTextTargets = None
@@ -1149,6 +1228,39 @@ class ClipPredictor(nn.Module):
             novelAlignLoss = (
                 1.0 - (novelPredictedFeatures * novelTextTargets).sum(dim=-1)
             ).mean()
+            if self.mtmShipVisualTransferEnabled:
+                transferTargets = []
+                detachedBaseKeys = basePredictedFeatures.detach()
+                detachedBaseValues = baseVisualFeatures.detach()
+                for novelIndex in range(pseudoVisualFeatures.size(0)):
+                    candidateMask = (
+                        (subjLabels == novelSubjLabels[novelIndex])
+                        & (objLabels == novelObjLabels[novelIndex])
+                    )
+                    candidateRelations = relationLabels[candidateMask]
+                    candidateKeys = []
+                    candidateValues = []
+                    maskedKeys = detachedBaseKeys[candidateMask]
+                    maskedValues = detachedBaseValues[candidateMask]
+                    for baseRelation in candidateRelations.unique():
+                        relationMask = candidateRelations == baseRelation
+                        candidateKeys.append(maskedKeys[relationMask].mean(dim=0))
+                        candidateValues.append(maskedValues[relationMask].mean(dim=0))
+                    candidateKeys = F.normalize(torch.stack(candidateKeys, dim=0), dim=-1)
+                    candidateValues = F.normalize(torch.stack(candidateValues, dim=0), dim=-1)
+                    transferLogits = torch.matmul(
+                        candidateKeys,
+                        novelTextTargets[novelIndex],
+                    ) / self.mtmShipTransferTemperature
+                    transferWeights = F.softmax(transferLogits, dim=0)
+                    transferTargets.append(
+                        torch.sum(candidateValues * transferWeights.unsqueeze(-1), dim=0)
+                    )
+                transferTargets = F.normalize(torch.stack(transferTargets, dim=0), dim=-1)
+                visualTransferCosine = (
+                    pseudoVisualFeatures * transferTargets
+                ).sum(dim=-1).mean()
+                visualTransferLoss = 1.0 - visualTransferCosine
 
         if predictedFeatures.size(0) < 2:
             visualStructureLoss = zero
@@ -1198,9 +1310,14 @@ class ClipPredictor(nn.Module):
                         dtype=torch.bool,
                         device=predictedSimilarity.device,
                     )
+                    baseRawSimilarity = torch.matmul(
+                        baseRawUnionFeatures,
+                        baseRawUnionFeatures.t(),
+                    )
                     baseVisualSimilarity = inputVisualSimilarity[:baseCount, :baseCount]
                     baseMtmSimilarity = predictedSimilarity[:baseCount, :baseCount]
                     baseTextSimilarity = torch.matmul(baseTextTargets, baseTextTargets.t())
+                    baseRawStats = similarityStats(baseRawSimilarity, baseMask)
                     baseTextStats = similarityStats(baseTextSimilarity, baseMask)
                     baseMtmStats = similarityStats(baseMtmSimilarity, baseMask)
                     baseVisualStats = similarityStats(baseVisualSimilarity, baseMask)
@@ -1212,17 +1329,20 @@ class ClipPredictor(nn.Module):
                     ).sum(dim=-1).mean().item()
                     logger.info(
                         "MTM debug i=%d base "
-                        "svd(mean/max/min/std)=%.4f/%.4f/%.4f/%.4f "
-                        "mtm(mean/max/min/std)=%.4f/%.4f/%.4f/%.4f "
-                        "visual(mean/max/min/std)=%.4f/%.4f/%.4f/%.4f "
-                        "align=%.4f err=%.4f alpha=%.4f",
+                        "raw(mean/max/min/std)=%.4f/%.4f/%.4f/%.4f "
+                        "xrel(mean/max/min/std)=%.4f/%.4f/%.4f/%.4f "
+                        "qrel(mean/max/min/std)=%.4f/%.4f/%.4f/%.4f "
+                        "tsvd(mean/max/min/std)=%.4f/%.4f/%.4f/%.4f "
+                        "align=%.4f err=%.4f scale=%.4f",
                         int(self.mtmDebugIteration.item()),
-                        *baseTextStats,
-                        *baseMtmStats,
+                        *baseRawStats,
                         *baseVisualStats,
+                        *baseMtmStats,
+                        *baseTextStats,
                         baseAlignCosine,
                         baseStructureError,
-                        torch.tanh(self.mtmVisualAdapter.alpha).item(),
+                        self.mtmVisualAdapter.residualScale().item()
+                        if self.mtmVisualAdapterEnabled else 0.0,
                     )
                     novelCount = predictedFeatures.size(0) - baseCount
                     if pseudoVisualFeatures is not None and novelCount >= 2:
@@ -1234,6 +1354,11 @@ class ClipPredictor(nn.Module):
                         novelVisualSimilarity = inputVisualSimilarity[baseCount:, baseCount:]
                         novelMtmSimilarity = predictedSimilarity[baseCount:, baseCount:]
                         novelTextSimilarity = torch.matmul(novelTextTargets, novelTextTargets.t())
+                        novelRawSimilarity = torch.matmul(
+                            pseudoRawUnionFeatures,
+                            pseudoRawUnionFeatures.t(),
+                        )
+                        novelRawStats = similarityStats(novelRawSimilarity, novelMask)
                         novelTextStats = similarityStats(novelTextSimilarity, novelMask)
                         novelMtmStats = similarityStats(novelMtmSimilarity, novelMask)
                         novelVisualStats = similarityStats(novelVisualSimilarity, novelMask)
@@ -1249,15 +1374,19 @@ class ClipPredictor(nn.Module):
                         ).abs().mean().item()
                         logger.info(
                             "MTM debug i=%d novel "
-                            "svd(mean/max/min/std)=%.4f/%.4f/%.4f/%.4f "
-                            "mtm(mean/max/min/std)=%.4f/%.4f/%.4f/%.4f "
-                            "visual(mean/max/min/std)=%.4f/%.4f/%.4f/%.4f "
-                            "align=%.4f err=%.4f cross_err=%.4f ramp=%.4f",
+                            "raw(mean/max/min/std)=%.4f/%.4f/%.4f/%.4f "
+                            "xrel(mean/max/min/std)=%.4f/%.4f/%.4f/%.4f "
+                            "qrel(mean/max/min/std)=%.4f/%.4f/%.4f/%.4f "
+                            "tsvd(mean/max/min/std)=%.4f/%.4f/%.4f/%.4f "
+                            "align=%.4f transfer=%.4f err=%.4f cross_err=%.4f ramp=%.4f",
                             int(self.mtmDebugIteration.item()),
-                            *novelTextStats,
-                            *novelMtmStats,
+                            *novelRawStats,
                             *novelVisualStats,
+                            *novelMtmStats,
+                            *novelTextStats,
                             novelAlignCosine,
+                            visualTransferCosine.item()
+                            if visualTransferCosine is not None else float("nan"),
                             novelStructureError,
                             crossStructureError,
                             pseudoWeight,
@@ -1269,6 +1398,7 @@ class ClipPredictor(nn.Module):
             "loss_mtm_visual_structure": self.mtmLossWeight * self.mtmStructureWeight * self.mtmVisualStructureWeight * visualStructureLoss,
             "loss_mtm_ship_recon": self.mtmLossWeight * self.mtmShipReconWeight * reconstructionLoss,
             "loss_mtm_ship_kl": self.mtmLossWeight * self.mtmShipKlWeight * klWeight * klLoss,
+            "loss_mtm_ship_visual_transfer": self.mtmLossWeight * self.mtmShipVisualTransferWeight * pseudoWeight * visualTransferLoss,
         }
 
     def computeMtmInferenceScores(self, relationFeatures, subjLabels, objLabels, outShape, outDtype):
@@ -1399,6 +1529,7 @@ class ClipPredictor(nn.Module):
 
         rel_dists=[]
         relationFeaturesForMtm = []
+        rawUnionFeaturesForMtm = []
         relationLabelsForMtm = []
         subjLabelsForMtm = []
         objLabelsForMtm = []
@@ -1459,15 +1590,21 @@ class ClipPredictor(nn.Module):
                     mtm_image = self.cropImagePadding(img[i], proposals[i])
                     with torch.no_grad():
                         _, mtm_clip_feature_map = self.encodeClipImageFeatureMap(mtm_image)
-                    mtm_relation_features = self.buildMtmRoiRelationFeatures(
+                    mtmFeatureOutput = self.buildMtmRoiRelationFeatures(
                         mtm_clip_feature_map,
                         proposals[i],
                         mtm_pair_idx,
                         mtm_image,
+                        returnRawUnion=(self.training and self.mtmLossEnabled),
                     )
+                    if self.training and self.mtmLossEnabled:
+                        mtm_relation_features, mtm_raw_union_features = mtmFeatureOutput
+                    else:
+                        mtm_relation_features = mtmFeatureOutput
 
             if self.training and self.mtmLossEnabled and mtm_relation_features is not None:
                 relationFeaturesForMtm.append(mtm_relation_features)
+                rawUnionFeaturesForMtm.append(mtm_raw_union_features)
                 relationLabelsForMtm.append(rel_labels[i].to(mtm_feature_pos.device).index_select(0, mtm_feature_pos))
                 if proposals[i].has_field("labels"):
                     gtObjLabels = proposals[i].get_field("labels").long()
@@ -1526,6 +1663,7 @@ class ClipPredictor(nn.Module):
             add_losses.update(
                 self.computeMtmLosses(
                     relationFeaturesForMtm,
+                    rawUnionFeaturesForMtm,
                     relationLabelsForMtm,
                     subjLabelsForMtm,
                     objLabelsForMtm,
