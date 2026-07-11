@@ -969,6 +969,10 @@ class ClipPredictor(nn.Module):
         featureMap = patchTokens.permute(0, 2, 1).contiguous().view(1, patchTokens.size(-1), gridSize, gridSize)
         return globalFeature, featureMap
 
+    def cropImagePadding(self, image, proposal):
+        imageWidth, imageHeight = proposal.size
+        return image[:, : int(imageHeight), : int(imageWidth)]
+
     def scaleBoxesToClipInput(self, boxes, image):
         _, imageHeight, imageWidth = image.shape
         scaledBoxes = boxes.float().clone()
@@ -1383,13 +1387,14 @@ class ClipPredictor(nn.Module):
                     ).view(-1)
                     mtm_pair_idx = pair_idx.index_select(0, mtm_feature_pos)
                 if mtm_pair_idx.numel() > 0:
+                    mtm_image = self.cropImagePadding(img[i], proposals[i])
                     with torch.no_grad():
-                        _, mtm_clip_feature_map = self.encodeClipImageFeatureMap(img[i])
+                        _, mtm_clip_feature_map = self.encodeClipImageFeatureMap(mtm_image)
                     mtm_relation_features = self.buildMtmRoiRelationFeatures(
                         mtm_clip_feature_map,
                         proposals[i],
                         mtm_pair_idx,
-                        img[i],
+                        mtm_image,
                     )
 
             if self.training and self.mtmLossEnabled and mtm_relation_features is not None:
