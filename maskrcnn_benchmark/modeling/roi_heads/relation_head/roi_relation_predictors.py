@@ -167,93 +167,86 @@ class MTMUnionGateFusion(nn.Module):
         return self.outputNorm(unionFeatures + gate * delta)
 
 
-def initializeShipLayer(module):
+def initializeShipLayer(module, initStd=0.02):
     if isinstance(module, nn.Linear):
-        nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        nn.init.normal_(module.weight, mean=0.0, std=initStd)
         if module.bias is not None:
             nn.init.zeros_(module.bias)
 
 
 class ShipVisualEncoder(nn.Module):
-    def __init__(self, inputDim=512, hiddenDim=2048, latentDim=512):
+    def __init__(self, visualDim=512, semanticDim=512, hiddenDim=2048, latentDim=512, initStd=0.02):
         super(ShipVisualEncoder, self).__init__()
         self.featureEncoder = nn.Sequential(
-            nn.Linear(inputDim, hiddenDim),
+            nn.Linear(visualDim + semanticDim, hiddenDim),
             nn.ReLU(inplace=True),
         )
         self.mean = nn.Linear(hiddenDim, latentDim)
         self.logvar = nn.Linear(hiddenDim, latentDim)
-        self.apply(initializeShipLayer)
+        self.apply(lambda module: initializeShipLayer(module, initStd))
 
-    def forward(self, visualFeatures):
-        hidden = self.featureEncoder(visualFeatures.float())
+    def forward(self, visualFeatures, semanticFeatures):
+        hidden = self.featureEncoder(torch.cat([visualFeatures, semanticFeatures], dim=-1).float())
         return self.mean(hidden), self.logvar(hidden)
 
 
 class ShipLatentGenerator(nn.Module):
-    def __init__(self, latentDim=512, hiddenDim=4096, outputDim=512):
+    def __init__(self, latentDim=512, semanticDim=512, hiddenDim=4096, outputDim=512, initStd=0.02):
         super(ShipLatentGenerator, self).__init__()
         self.net = nn.Sequential(
-            nn.Linear(latentDim, hiddenDim),
+            nn.Linear(latentDim + semanticDim, hiddenDim),
             nn.ReLU(inplace=True),
             nn.Linear(hiddenDim, outputDim),
         )
-        self.apply(initializeShipLayer)
+        self.apply(lambda module: initializeShipLayer(module, initStd))
 
-    def forward(self, latentFeatures):
-        return self.net(latentFeatures.float())
+    def forward(self, latentFeatures, semanticFeatures):
+        inputs = torch.cat([latentFeatures, semanticFeatures], dim=-1)
+        return self.net(inputs.float())
 
 
 class ShipTripletFeatureGenerator(nn.Module):
-    def __init__(self, clipModel, ctxLen=4, embedDim=512, initStd=0.02):
+    def __init__(self, visualDim=512, semanticDim=512, latentDim=512, initStd=0.02):
         super(ShipTripletFeatureGenerator, self).__init__()
-        object.__setattr__(self, "clipModel", clipModel)
-        self.ctxLen = ctxLen
-        self.ctx = nn.Parameter(torch.empty(ctxLen, embedDim))
-        nn.init.normal_(self.ctx, std=initStd)
-        self.visualEncoder = ShipVisualEncoder(embedDim, 2048, embedDim)
-        self.latentGenerator = ShipLatentGenerator(embedDim, 4096, embedDim)
+        self.latentDim = latentDim
+        self.visualEncoder = ShipVisualEncoder(
+            visualDim=visualDim,
+            semanticDim=semanticDim,
+            hiddenDim=2048,
+            latentDim=latentDim,
+            initStd=initStd,
+        )
+        self.latentGenerator = ShipLatentGenerator(
+            latentDim=latentDim,
+            semanticDim=semanticDim,
+            hiddenDim=4096,
+            outputDim=visualDim,
+            initStd=initStd,
+        )
 
     def reparameterize(self, mean, logvar):
         noise = torch.randn_like(mean)
         return mean + noise * torch.exp(0.5 * logvar)
 
-    def encodePromptEmbeddings(self, prompts, tokenizedPrompts):
-        dtype = self.clipModel.dtype
-        x = prompts.to(dtype=dtype) + self.clipModel.positional_embedding.type(dtype)
-        x = x.permute(1, 0, 2)
-        x = self.clipModel.transformer(x)
-        x = x.permute(1, 0, 2)
-        x = self.clipModel.ln_final(x).type(dtype)
-        x = x[torch.arange(x.shape[0], device=x.device), tokenizedPrompts.argmax(dim=-1)] @ self.clipModel.text_projection
-        return x.float()
-
-    def encodeResidualPrompts(self, tripletTexts, residuals):
-        promptPrefix = " ".join(["X"] * self.ctxLen)
-        promptedTexts = [promptPrefix + " " + text for text in tripletTexts]
-        tokenizedPrompts = clip.tokenize(promptedTexts).to(residuals.device)
-        with torch.no_grad():
-            tokenEmbeddings = self.clipModel.token_embedding(tokenizedPrompts).float()
-        prefix = tokenEmbeddings[:, :1, :]
-        suffix = tokenEmbeddings[:, 1 + self.ctxLen :, :]
-        ctx = self.ctx.unsqueeze(0).expand(residuals.size(0), -1, -1)
-        shiftedCtx = ctx + residuals.unsqueeze(1)
-        prompts = torch.cat([prefix, shiftedCtx, suffix], dim=1)
-        features = self.encodePromptEmbeddings(prompts, tokenizedPrompts)
-        return F.normalize(features.float(), dim=-1)
-
-    def reconstruct(self, tripletTexts, visualFeatures):
+    def reconstruct(self, visualFeatures, semanticFeatures):
         reconstructionTargets = F.normalize(visualFeatures.detach().float(), dim=-1)
-        mean, logvar = self.visualEncoder(reconstructionTargets)
+        semanticConditions = F.normalize(semanticFeatures.detach().float(), dim=-1)
+        mean, logvar = self.visualEncoder(reconstructionTargets, semanticConditions)
         latentFeatures = self.reparameterize(mean, logvar)
-        residuals = self.latentGenerator(latentFeatures)
-        reconstructedFeatures = self.encodeResidualPrompts(tripletTexts, residuals)
+        reconstructedFeatures = self.latentGenerator(latentFeatures, semanticConditions)
+        reconstructedFeatures = F.normalize(reconstructedFeatures.float(), dim=-1)
         return reconstructedFeatures, mean, logvar
 
-    def generate(self, tripletTexts, device):
-        latentFeatures = torch.randn(len(tripletTexts), self.ctx.size(1), device=device, dtype=torch.float32)
-        residuals = self.latentGenerator(latentFeatures)
-        return self.encodeResidualPrompts(tripletTexts, residuals)
+    def generate(self, semanticFeatures):
+        semanticConditions = F.normalize(semanticFeatures.detach().float(), dim=-1)
+        latentFeatures = torch.randn(
+            semanticConditions.size(0),
+            self.latentDim,
+            device=semanticConditions.device,
+            dtype=torch.float32,
+        )
+        generatedFeatures = self.latentGenerator(latentFeatures, semanticConditions)
+        return F.normalize(generatedFeatures.float(), dim=-1)
 
     def klLoss(self, mean, logvar):
         return (-0.5 * (1.0 + logvar - mean.pow(2) - logvar.exp()).sum(dim=-1)).mean()
@@ -724,6 +717,7 @@ class ClipPredictor(nn.Module):
         self.mtmShipReconWeight = mtmConfig.SHIP_RECON_WEIGHT
         self.mtmShipKlWeight = mtmConfig.SHIP_KL_WEIGHT
         self.mtmShipNovelAlignWeight = mtmConfig.SHIP_NOVEL_ALIGN_WEIGHT
+        self.mtmShipWarmupIters = max(int(mtmConfig.SHIP_WARMUP_ITERS), 0)
         self.mtmShipRampIters = max(int(mtmConfig.SHIP_RAMP_ITERS), 1)
         self.clipInputSize = self.clip_model.visual.input_resolution
         self.clipImageNormalize = Normalize(
@@ -744,9 +738,9 @@ class ClipPredictor(nn.Module):
         self.shipFeatureGenerator = None
         if self.mtmShipEnabled:
             self.shipFeatureGenerator = ShipTripletFeatureGenerator(
-                self.clip_model,
-                ctxLen=mtmConfig.SHIP_CTX_LEN,
-                embedDim=mtmConfig.EMBED_DIM,
+                visualDim=mtmConfig.INPUT_DIM,
+                semanticDim=mtmConfig.EMBED_DIM,
+                latentDim=mtmConfig.EMBED_DIM,
                 initStd=mtmConfig.SHIP_INIT_STD,
             ).to(self.device)
         self.relationMtm = RelationModalityTransfer(
@@ -1124,38 +1118,54 @@ class ClipPredictor(nn.Module):
         baseTextTargets = F.normalize(
             self.encodeTripletTexts(baseTexts).to(baseVisualFeatures.device).float(),
             dim=-1,
-        )
+        ).detach()
         zero = baseVisualFeatures.sum() * 0.0
         novelAlignLoss = zero
         reconstructionLoss = zero
         klLoss = zero
         pseudoVisualFeatures = None
+        pseudoWeight = 0.0
+        klWeight = 0.0
 
         if self.mtmShipEnabled:
             self.shipTrainingStep.add_(1)
+            currentStep = int(self.shipTrainingStep.item())
+            rampProgress = min(
+                max(float(currentStep - self.mtmShipWarmupIters), 0.0) / float(self.mtmShipRampIters),
+                1.0,
+            )
+            pseudoWeight = rampProgress
+            klWeight = rampProgress
             reconstructedFeatures, shipMean, shipLogvar = self.shipFeatureGenerator.reconstruct(
-                baseTexts,
                 baseVisualFeatures,
+                baseTextTargets,
             )
             reconstructionLoss = (
                 reconstructedFeatures - baseVisualFeatures.detach()
             ).pow(2).sum(dim=-1).mean()
             klLoss = self.shipFeatureGenerator.klLoss(shipMean, shipLogvar)
-            pseudoCount = int(round(baseVisualFeatures.size(0) * float(self.mtmShipPseudoRatio)))
-            if self.mtmShipPseudoRatio > 0 and pseudoCount == 0:
-                pseudoCount = 1
-            novelTexts = self.buildNovelTripletTexts(subjLabels, objLabels, pseudoCount)
+            if currentStep > self.mtmShipWarmupIters and self.mtmShipPseudoRatio > 0:
+                pseudoCount = int(round(baseVisualFeatures.size(0) * float(self.mtmShipPseudoRatio)))
+                if pseudoCount == 0:
+                    pseudoCount = 1
+                novelTexts = self.buildNovelTripletTexts(subjLabels, objLabels, pseudoCount)
+            else:
+                novelTexts = []
             if len(novelTexts) > 0:
+                novelTextTargets = F.normalize(
+                    self.encodeTripletTexts(novelTexts).to(baseVisualFeatures.device).float(),
+                    dim=-1,
+                ).detach()
                 pseudoVisualFeatures = self.shipFeatureGenerator.generate(
-                    novelTexts,
-                    baseVisualFeatures.device,
+                    novelTextTargets,
                 )
                 allVisualFeatures = torch.cat([baseVisualFeatures, pseudoVisualFeatures], dim=0)
             else:
-                novelTexts = []
+                novelTextTargets = None
                 allVisualFeatures = baseVisualFeatures
         else:
             novelTexts = []
+            novelTextTargets = None
             allVisualFeatures = baseVisualFeatures
 
         predictedFeatures = F.normalize(self.relationMtm(allVisualFeatures).float(), dim=-1)
@@ -1163,19 +1173,7 @@ class ClipPredictor(nn.Module):
         basePredictedFeatures = predictedFeatures[:baseCount]
         baseAlignLoss = (1.0 - (basePredictedFeatures * baseTextTargets).sum(dim=-1)).mean()
 
-        if self.mtmShipEnabled:
-            rampProgress = min(float(self.shipTrainingStep.item()) / float(self.mtmShipRampIters), 1.0)
-            pseudoWeight = 0.1 + 0.9 * rampProgress
-            klWeight = rampProgress
-        else:
-            pseudoWeight = 0.0
-            klWeight = 0.0
-
         if pseudoVisualFeatures is not None:
-            novelTextTargets = F.normalize(
-                self.encodeTripletTexts(novelTexts).to(predictedFeatures.device).float(),
-                dim=-1,
-            )
             novelPredictedFeatures = predictedFeatures[baseCount:]
             novelAlignLoss = (
                 1.0 - (novelPredictedFeatures * novelTextTargets).sum(dim=-1)
