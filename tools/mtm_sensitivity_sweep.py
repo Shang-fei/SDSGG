@@ -85,7 +85,7 @@ def build_test_command(args, run_output_dir, split_name, part, relationness, mtm
         args.predictor,
         "MODEL.ROI_RELATION_HEAD.MTM.ENABLED",
         "True",
-        "MODEL.ROI_RELATION_HEAD.MTM.USE_INFERENCE",
+        "MODEL.ROI_RELATION_HEAD.MTM.INFERENCE_ENABLED",
         "True",
         "MODEL.ROI_RELATION_HEAD.RELATIONNESS.ENABLED",
         "True",

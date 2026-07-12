@@ -5,7 +5,7 @@ import torch
 from maskrcnn_benchmark.modeling import registry
 from torch import nn
 from torch.nn import functional as F
-from torchvision.transforms import Normalize, ToPILImage
+from torchvision.transforms import Normalize
 from torchvision.transforms import functional as FF
 from maskrcnn_benchmark.layers import smooth_l1_loss, kl_div_loss, entropy_loss, Label_Smoothing_Regression
 from maskrcnn_benchmark.modeling.utils import cat
@@ -17,16 +17,12 @@ from .utils_motifs import obj_edge_vectors
 from .model_motifs_with_attribute import AttributeLSTMContext
 from .model_transformer import TransformerContext
 from .utils_relation import layer_init, get_box_info, get_box_pair_info
+from .mtm_ship import MTMShipBranch
 from maskrcnn_benchmark.data import get_dataset_statistics
-from maskrcnn_benchmark.utils.comm import get_rank
 from CLIP import clip
 import time
-import numpy as np
-import cv2
 from PIL import Image
 import pandas as pd
-import torch.nn.functional as F
-import os, sys
 curpath=os.path.dirname(__file__)
 PRDCS_BASE = ['has', 'hanging from', 'from', 'in', 'walking on', 'watching', 'with', 'behind', 'for', 'to', 'belonging to', 'at', 'wearing', 'standing on', 'holding', 'riding', 'near', 'looking at', 'sitting on', 'on', 'over', 'in front of', 'between', 'made of', 'of', 'carrying', 'parked on', 'against', 'attached to', 'playing', 'covering', 'covered in', 'wears', 'above', 'under']
 PRDCS_NOVEL = ['mounted on', 'says', 'part of', 'across', 'flying in', 'using', 'on back of', 'lying on', 'growing on', 'walking in', 'laying on', 'along', 'eating', 'and', 'painted on']
@@ -133,213 +129,6 @@ class MVA(nn.Module):
         sub_features= ratio * x + (1 - ratio) * sub_features[:,0,:]
 
         return sub_features
-
-
-class MTMRelationAdapter(nn.Module):
-    def __init__(self, inputDim=512, embedDim=512, dropout=0.1, reduction=4):
-        super(MTMRelationAdapter, self).__init__()
-        bottleneckDim = max(embedDim // reduction, 1)
-        self.inputProj = nn.Linear(inputDim, embedDim)
-        self.inputNorm = nn.LayerNorm(embedDim)
-        self.downProj = nn.Linear(embedDim, bottleneckDim)
-        self.upProj = nn.Linear(bottleneckDim, embedDim)
-        self.gate = nn.Linear(embedDim, embedDim)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, relationFeatures):
-        x = self.inputProj(relationFeatures.float())
-        residual = x
-        x = self.inputNorm(x)
-        delta = self.downProj(x)
-        delta = F.gelu(delta)
-        delta = self.dropout(delta)
-        delta = self.upProj(delta)
-        return residual + torch.sigmoid(self.gate(x)) * delta
-
-
-def initializeShipLayer(module, initStd=0.02):
-    if isinstance(module, nn.Linear):
-        nn.init.normal_(module.weight, mean=0.0, std=initStd)
-        if module.bias is not None:
-            nn.init.zeros_(module.bias)
-
-
-class ShipVisualEncoder(nn.Module):
-    def __init__(self, visualDim=512, hiddenDim=2048, latentDim=512, initStd=0.02):
-        super(ShipVisualEncoder, self).__init__()
-        self.featureEncoder = nn.Sequential(
-            nn.Linear(visualDim, hiddenDim),
-            nn.ReLU(inplace=True),
-        )
-        self.mean = nn.Linear(hiddenDim, latentDim)
-        self.logvar = nn.Linear(hiddenDim, latentDim)
-        self.apply(lambda module: initializeShipLayer(module, initStd))
-
-    def forward(self, visualFeatures):
-        hidden = self.featureEncoder(visualFeatures.float())
-        return self.mean(hidden), self.logvar(hidden)
-
-
-class ShipLatentGenerator(nn.Module):
-    def __init__(self, latentDim=512, hiddenDim=4096, outputDim=512, initStd=0.02):
-        super(ShipLatentGenerator, self).__init__()
-        self.net = nn.Sequential(
-            nn.Linear(latentDim, hiddenDim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hiddenDim, outputDim),
-        )
-        self.apply(lambda module: initializeShipLayer(module, initStd))
-
-    def forward(self, latentFeatures):
-        return self.net(latentFeatures.float())
-
-
-class ShipTextVisualAdapter(nn.Module):
-    def __init__(self, embedDim=512, hiddenDim=1024, dropout=0.1, initStd=0.02):
-        super(ShipTextVisualAdapter, self).__init__()
-        self.norm = nn.LayerNorm(embedDim)
-        self.net = nn.Sequential(
-            nn.Linear(embedDim, hiddenDim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hiddenDim, embedDim),
-        )
-        self.net.apply(lambda module: initializeShipLayer(module, initStd))
-
-    def forward(self, textFeatures):
-        textFeatures = textFeatures.float()
-        return F.normalize(textFeatures + self.net(self.norm(textFeatures)), dim=-1)
-
-
-class ShipTripletFeatureGenerator(nn.Module):
-    def __init__(
-        self,
-        clipModel,
-        visualDim=512,
-        embedDim=512,
-        latentDim=512,
-        ctxLen=4,
-        initStd=0.02,
-        textAdapterEnabled=True,
-        textAdapterHiddenDim=1024,
-        textAdapterDropout=0.1,
-    ):
-        super(ShipTripletFeatureGenerator, self).__init__()
-        if visualDim != embedDim:
-            raise ValueError("SHIP prompt reconstruction requires visualDim == embedDim")
-        object.__setattr__(self, "clipModel", clipModel)
-        self.latentDim = latentDim
-        self.ctxLen = ctxLen
-        self.ctx = nn.Parameter(torch.empty(ctxLen, embedDim))
-        nn.init.normal_(self.ctx, mean=0.0, std=initStd)
-        self.visualEncoder = ShipVisualEncoder(
-            visualDim=visualDim,
-            hiddenDim=2048,
-            latentDim=latentDim,
-            initStd=initStd,
-        )
-        self.latentGenerator = ShipLatentGenerator(
-            latentDim=latentDim,
-            hiddenDim=4096,
-            outputDim=embedDim,
-            initStd=initStd,
-        )
-        self.textVisualAdapter = (
-            ShipTextVisualAdapter(
-                embedDim=embedDim,
-                hiddenDim=textAdapterHiddenDim,
-                dropout=textAdapterDropout,
-                initStd=initStd,
-            )
-            if textAdapterEnabled
-            else None
-        )
-
-    def reparameterize(self, mean, logvar):
-        noise = torch.randn_like(mean)
-        return mean + noise * torch.exp(0.5 * logvar)
-
-    def encodePromptEmbeddings(self, prompts, tokenizedPrompts):
-        dtype = self.clipModel.dtype
-        x = prompts.to(dtype=dtype) + self.clipModel.positional_embedding.type(dtype)
-        x = x.permute(1, 0, 2)
-        x = self.clipModel.transformer(x)
-        x = x.permute(1, 0, 2)
-        x = self.clipModel.ln_final(x).type(dtype)
-        eosPositions = tokenizedPrompts.argmax(dim=-1)
-        x = x[torch.arange(x.size(0), device=x.device), eosPositions]
-        return (x @ self.clipModel.text_projection).float()
-
-    def encodeResidualPrompts(self, tripletTexts, residuals):
-        promptPrefix = " ".join(["X"] * self.ctxLen)
-        promptedTexts = [promptPrefix + " " + text for text in tripletTexts]
-        tokenizedPrompts = clip.tokenize(promptedTexts).to(residuals.device)
-        with torch.no_grad():
-            tokenEmbeddings = self.clipModel.token_embedding(tokenizedPrompts).float()
-        prefix = tokenEmbeddings[:, :1, :]
-        suffix = tokenEmbeddings[:, 1 + self.ctxLen :, :]
-        ctx = self.ctx.unsqueeze(0).expand(residuals.size(0), -1, -1)
-        prompts = torch.cat([prefix, ctx + residuals.unsqueeze(1), suffix], dim=1)
-        textFeatures = F.normalize(self.encodePromptEmbeddings(prompts, tokenizedPrompts), dim=-1)
-        if self.textVisualAdapter is not None:
-            return self.textVisualAdapter(textFeatures)
-        return textFeatures
-
-    def reconstruct(self, tripletTexts, visualFeatures):
-        reconstructionTargets = F.normalize(visualFeatures.detach().float(), dim=-1)
-        mean, logvar = self.visualEncoder(reconstructionTargets)
-        latentFeatures = self.reparameterize(mean, logvar)
-        residuals = self.latentGenerator(latentFeatures)
-        reconstructedFeatures = self.encodeResidualPrompts(tripletTexts, residuals)
-        return reconstructedFeatures, mean, logvar
-
-    def generate(self, tripletTexts, device):
-        latentFeatures = torch.randn(
-            len(tripletTexts),
-            self.latentDim,
-            device=device,
-            dtype=torch.float32,
-        )
-        residuals = self.latentGenerator(latentFeatures)
-        return self.encodeResidualPrompts(tripletTexts, residuals)
-
-    def klLoss(self, mean, logvar):
-        return (-0.5 * (1.0 + logvar - mean.pow(2) - logvar.exp()).sum(dim=-1)).mean()
-
-
-class RelationModalityTransfer(nn.Module):
-    def __init__(self, inputDim=512, embedDim=512, fcLayers=3, attentionLayers=3, numHeads=8, dropout=0.1):
-        super(RelationModalityTransfer, self).__init__()
-        self.adapter = MTMRelationAdapter(inputDim, embedDim, dropout)
-        layers = []
-        currentDim = embedDim
-        for _ in range(max(fcLayers - 1, 0)):
-            layers.append(nn.Linear(currentDim, embedDim))
-            layers.append(nn.ReLU(inplace=True))
-            layers.append(nn.Dropout(dropout))
-            currentDim = embedDim
-        self.fc = nn.Sequential(*layers)
-        encoderLayer = nn.TransformerEncoderLayer(
-            d_model=embedDim,
-            nhead=numHeads,
-            dim_feedforward=embedDim * 4,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-        )
-        self.selfAttention = nn.TransformerEncoder(encoderLayer, num_layers=attentionLayers)
-        self.norm = nn.LayerNorm(embedDim)
-
-    def encode_visual(self, relationFeatures):
-        return self.adapter(relationFeatures)
-
-    def encode_text_space(self, visualFeatures):
-        x = self.fc(visualFeatures).unsqueeze(0)
-        x = self.selfAttention(x).squeeze(0)
-        return self.norm(x)
-
-    def forward(self, relationFeatures):
-        return self.encode_text_space(self.encode_visual(relationFeatures))
 
 
 class RelationnessHead(nn.Module):
@@ -757,34 +546,9 @@ class ClipPredictor(nn.Module):
         mtmConfig = config.MODEL.ROI_RELATION_HEAD.MTM
         relationnessConfig = config.MODEL.ROI_RELATION_HEAD.RELATIONNESS
         self.mtmEnabled = mtmConfig.ENABLED
-        self.mtmLossEnabled = mtmConfig.ENABLED and mtmConfig.LOSS_ENABLED
-        self.mtmLossWeight = mtmConfig.LOSS_WEIGHT
-        self.mtmAlignWeight = mtmConfig.ALIGN_WEIGHT
-        self.mtmAlignLossType = str(mtmConfig.ALIGN_LOSS_TYPE).lower()
-        self.mtmAlignNegWeight = float(mtmConfig.ALIGN_NEG_WEIGHT)
-        self.mtmAlignNegMargin = float(mtmConfig.ALIGN_NEG_MARGIN)
-        self.mtmStructureWeight = mtmConfig.STRUCTURE_WEIGHT
-        self.mtmVisualStructureWeight = mtmConfig.VISUAL_STRUCTURE_WEIGHT
-        self.mtmTextStructureWeight = mtmConfig.TEXT_STRUCTURE_WEIGHT
-        self.mtmStructureDebugEnabled = mtmConfig.STRUCTURE_DEBUG_ENABLED
-        self.mtmStructureDebugStep = max(int(mtmConfig.STRUCTURE_DEBUG_STEP), 1)
-        self.mtmMaxPairs = mtmConfig.MAX_PAIRS
-        self.mtmUseInference = mtmConfig.ENABLED and mtmConfig.USE_INFERENCE
+        self.mtmTrainEnabled = mtmConfig.ENABLED and mtmConfig.TRAIN_ENABLED
+        self.mtmInferenceEnabled = mtmConfig.ENABLED and mtmConfig.INFERENCE_ENABLED
         self.mtmInferenceWeight = mtmConfig.INFERENCE_WEIGHT
-        self.mtmTextSvdEnabled = mtmConfig.TEXT_SVD_ENABLED
-        self.mtmTextSvdComponents = mtmConfig.TEXT_SVD_COMPONENTS
-        self.mtmTextSvdChunkSize = mtmConfig.TEXT_SVD_CHUNK_SIZE
-        self.mtmVisualAdapterEnabled = mtmConfig.VISUAL_ADAPTER_ENABLED
-        self.mtmUnionCropChunkSize = max(int(mtmConfig.UNION_CROP_CHUNK_SIZE), 1)
-        self.mtmShipEnabled = mtmConfig.SHIP_ENABLED
-        self.mtmShipPseudoRatio = mtmConfig.SHIP_PSEUDO_RATIO
-        self.mtmShipReconWeight = mtmConfig.SHIP_RECON_WEIGHT
-        self.mtmShipKlWeight = mtmConfig.SHIP_KL_WEIGHT
-        self.mtmShipVisualTransferEnabled = mtmConfig.SHIP_VISUAL_TRANSFER_ENABLED
-        self.mtmShipVisualTransferWeight = mtmConfig.SHIP_VISUAL_TRANSFER_WEIGHT
-        self.mtmShipTransferTemperature = max(float(mtmConfig.SHIP_TRANSFER_TEMPERATURE), 1e-6)
-        self.mtmShipWarmupIters = max(int(mtmConfig.SHIP_WARMUP_ITERS), 0)
-        self.mtmShipRampIters = max(int(mtmConfig.SHIP_RAMP_ITERS), 1)
         self.relationnessEnabled = relationnessConfig.ENABLED
         self.relationnessLossEnabled = relationnessConfig.ENABLED and relationnessConfig.LOSS_ENABLED
         self.relationnessLossWeight = relationnessConfig.LOSS_WEIGHT
@@ -796,48 +560,26 @@ class ClipPredictor(nn.Module):
         )
         for param in self.clip_model.parameters():
             param.requires_grad_(False)
-        self.shipFeatureGenerator = None
-        if self.mtmShipEnabled:
-            self.shipFeatureGenerator = ShipTripletFeatureGenerator(
-                self.clip_model,
-                visualDim=mtmConfig.INPUT_DIM,
-                embedDim=mtmConfig.EMBED_DIM,
-                latentDim=mtmConfig.EMBED_DIM,
-                ctxLen=mtmConfig.SHIP_CTX_LEN,
-                initStd=mtmConfig.SHIP_INIT_STD,
-                textAdapterEnabled=mtmConfig.SHIP_TEXT_ADAPTER_ENABLED,
-                textAdapterHiddenDim=mtmConfig.SHIP_TEXT_ADAPTER_HIDDEN_DIM,
-                textAdapterDropout=mtmConfig.SHIP_TEXT_ADAPTER_DROPOUT,
-            ).to(self.device)
-        self.relationMtm = RelationModalityTransfer(
-            mtmConfig.INPUT_DIM,
-            mtmConfig.EMBED_DIM,
-            mtmConfig.FC_LAYERS,
-            mtmConfig.ATTENTION_LAYERS,
-            mtmConfig.NUM_HEADS,
-            mtmConfig.DROPOUT,
-        ).to(self.device)
         self.relationnessHead = RelationnessHead(
             relationDim=mtmConfig.EMBED_DIM,
             hiddenDim=mtmConfig.EMBED_DIM // 2,
             dropout=mtmConfig.DROPOUT,
         ).to(self.device)
         self.activeRelNames = activeRelNames
-        self.filteredTripletEmbeddingCache = {}
-        self.mtmAlignTripletEmbeddingCache = {}
-        self.tripletTextSvdCache = {}
-        self.tripletTextPrincipalComponents = None
-        self.novelRelNames = [self.relNames[index] for index in self.novel if index != 0]
-        self.mtmAlignRelNames = [
-            relationName for relationName in self.relNames[1:] if relationName is not None
-        ]
-        self.mtmAlignRelNameToIndex = {
-            relationName: index for index, relationName in enumerate(self.mtmAlignRelNames)
-        }
-        self.novelRelationCandidates = {}
-        self.register_buffer("shipTrainingStep", torch.zeros((), dtype=torch.long))
-        self.register_buffer("mtmDebugIteration", torch.zeros((), dtype=torch.long))
-        self.updateMtmTextSvdBasis()
+        self.mtm_branch = MTMShipBranch(
+            mtmConfig,
+            self.clip_model,
+            self.obj_names,
+            self.relNames,
+            self.activeRelNames,
+            self.base,
+            self.novel,
+            self.mtmTextSvdFilter,
+            self.sub_filter_novel,
+            self.device,
+            config.OUTPUT_DIR,
+        ).to(self.device) if self.mtmEnabled else None
+        self.textEncodeChunkSize = max(int(mtmConfig.TEXT_ENCODE_CHUNK_SIZE), 1)
         self.mtmModeStateCache = {
             mode: {
                 "description_relation": self.description_relation,
@@ -847,13 +589,43 @@ class ClipPredictor(nn.Module):
                 "texts5Tensor": self.texts5Tensor,
             }
         }
-        self.filteredTripletEmbeddingCaches = {mode: self.filteredTripletEmbeddingCache}
 
-    def encodeRawTripletTexts(self, tripletTexts):
-        with torch.no_grad():
-            tripletTokens = clip.tokenize(tripletTexts).to(self.device)
-            tripletTextFeatures = self.clip_model.encode_text(tripletTokens).float()
-            return F.normalize(tripletTextFeatures, dim=-1)
+    def _load_from_state_dict(
+        self, state_dict, prefix, local_metadata, strict,
+        missing_keys, unexpected_keys, error_msgs,
+    ):
+        # Keep learned MTM/SHIP weights loadable after moving them into mtm_branch.
+        keyMappings = (
+            ("relationMtm.adapter.inputProj", "mtm_branch.projector.visual_adapter.input_proj"),
+            ("relationMtm.adapter.inputNorm", "mtm_branch.projector.visual_adapter.norm"),
+            ("relationMtm.adapter.downProj", "mtm_branch.projector.visual_adapter.down"),
+            ("relationMtm.adapter.upProj", "mtm_branch.projector.visual_adapter.up"),
+            ("relationMtm.adapter.gate", "mtm_branch.projector.visual_adapter.gate"),
+            ("relationMtm.fc", "mtm_branch.projector.fc"),
+            ("relationMtm.selfAttention", "mtm_branch.projector.self_attention"),
+            ("relationMtm.norm", "mtm_branch.projector.norm"),
+            ("shipFeatureGenerator.ctx", "mtm_branch.generator.ctx"),
+            ("shipFeatureGenerator.visualEncoder.featureEncoder", "mtm_branch.generator.encoder.body"),
+            ("shipFeatureGenerator.visualEncoder.mean", "mtm_branch.generator.encoder.mean"),
+            ("shipFeatureGenerator.visualEncoder.logvar", "mtm_branch.generator.encoder.logvar"),
+            ("shipFeatureGenerator.latentGenerator.net", "mtm_branch.generator.generator"),
+            ("shipFeatureGenerator.textVisualAdapter.norm", "mtm_branch.generator.text_adapter.norm"),
+            ("shipFeatureGenerator.textVisualAdapter.net", "mtm_branch.generator.text_adapter.body"),
+            ("shipTrainingStep", "mtm_branch.training_step"),
+        )
+        for oldName, newName in keyMappings:
+            oldPrefix = prefix + oldName
+            newPrefix = prefix + newName
+            for key in [key for key in state_dict if key == oldPrefix or key.startswith(oldPrefix + ".")]:
+                mappedKey = newPrefix + key[len(oldPrefix):]
+                if mappedKey not in state_dict:
+                    state_dict[mappedKey] = state_dict[key]
+                del state_dict[key]
+        state_dict.pop(prefix + "mtmDebugIteration", None)
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict,
+            missing_keys, unexpected_keys, error_msgs,
+        )
 
     def encodeSubjectFilterTextFeatures(self, subjectFilter):
         allTexts = []
@@ -864,7 +636,7 @@ class ClipPredictor(nn.Module):
             featureCounts.append(len(objectTexts))
 
         encodedChunks = []
-        chunkSize = max(int(getattr(self, "mtmTextSvdChunkSize", 1024)), 1)
+        chunkSize = getattr(self, "textEncodeChunkSize", 1024)
         with torch.no_grad():
             for offset in range(0, len(allTexts), chunkSize):
                 tokens = clip.tokenize(allTexts[offset : offset + chunkSize]).to(self.device)
@@ -872,282 +644,37 @@ class ClipPredictor(nn.Module):
         encodedFeatures = torch.cat(encodedChunks, dim=0)
         return list(encodedFeatures.split(featureCounts, dim=0))
 
-    def iterFilteredTripletTextChunks(self):
-        chunk = []
-        chunkSize = max(int(self.mtmTextSvdChunkSize), 1)
-        objectNames = self.obj_names[1:] if len(self.obj_names) > 1 else self.obj_names
-        for subjName in objectNames:
-            candidateRelations = list(self.mtmTextSvdFilter[subjName])
-            for relationName in candidateRelations:
-                if relationName == "__background__":
-                    continue
-                for objName in objectNames:
-                    chunk.append("a photo of a " + subjName + " " + relationName + " a " + objName)
-                    if len(chunk) >= chunkSize:
-                        yield chunk
-                        chunk = []
-        if len(chunk) > 0:
-            yield chunk
-
-    def updateMtmTextSvdBasis(self):
-        if not self.mtmEnabled or not self.mtmTextSvdEnabled or self.mtmTextSvdComponents <= 0:
-            self.tripletTextPrincipalComponents = None
-            return
-        cacheKey = "filter_total"
-        if cacheKey in self.tripletTextSvdCache:
-            cachedComponents = self.tripletTextSvdCache[cacheKey]
-            if cachedComponents is None:
-                self.tripletTextPrincipalComponents = None
-            else:
-                self.tripletTextPrincipalComponents = cachedComponents.to(self.device)
-            return
-
-        covariance = None
-        numTriplets = 0
-        with torch.no_grad():
-            for tripletTexts in self.iterFilteredTripletTextChunks():
-                tripletFeatures = self.encodeRawTripletTexts(tripletTexts).float()
-                if covariance is None:
-                    featureDim = tripletFeatures.size(-1)
-                    covariance = tripletFeatures.new_zeros((featureDim, featureDim))
-                covariance = covariance + torch.matmul(tripletFeatures.t(), tripletFeatures)
-                numTriplets += tripletFeatures.size(0)
-
-        if covariance is None or numTriplets < 2:
-            self.tripletTextPrincipalComponents = None
-            self.tripletTextSvdCache[cacheKey] = None
-            return
-
-        covariance = covariance / float(numTriplets)
-        try:
-            _, eigvecs = torch.linalg.eigh(covariance.float())
-        except AttributeError:
-            _, eigvecs = torch.symeig(covariance.float(), eigenvectors=True)
-        numComponents = min(int(self.mtmTextSvdComponents), eigvecs.size(1))
-        principalComponents = eigvecs[:, -numComponents:].contiguous()
-        principalComponents = F.normalize(principalComponents, dim=0).detach().cpu()
-        self.tripletTextSvdCache[cacheKey] = principalComponents
-        self.tripletTextPrincipalComponents = principalComponents.to(self.device)
-
-    def refineTripletTextFeatures(self, tripletTextFeatures):
-        tripletTextFeatures = F.normalize(tripletTextFeatures.float(), dim=-1)
-        if self.tripletTextPrincipalComponents is None:
-            return tripletTextFeatures
-        components = self.tripletTextPrincipalComponents.to(
-            device=tripletTextFeatures.device,
-            dtype=tripletTextFeatures.dtype,
-        )
-        projection = torch.matmul(torch.matmul(tripletTextFeatures, components), components.t())
-        return F.normalize(tripletTextFeatures - projection, dim=-1)
-
-    def encodeTripletTexts(self, tripletTexts):
-        tripletTextFeatures = self.encodeRawTripletTexts(tripletTexts)
-        return self.refineTripletTextFeatures(tripletTextFeatures)
-
-    def buildTargetTripletTexts(self, subjLabels, relationLabels, objLabels):
-        texts = []
-        for subjLabel, relationLabel, objLabel in zip(
-            subjLabels.detach().cpu().tolist(),
-            relationLabels.detach().cpu().tolist(),
-            objLabels.detach().cpu().tolist(),
-        ):
-            subjName = self.obj_names[int(subjLabel)]
-            relIndex = int(relationLabel)
-            if relIndex >= len(self.activeRelNames):
-                raise ValueError(
-                    "MTM relation label {} is outside active relation names length {}. "
-                    "The dataset relation labels and MTM relation-name table are misaligned.".format(
-                        relIndex, len(self.activeRelNames)
-                    )
-                )
-            relationName = self.activeRelNames[relIndex]
-            objName = self.obj_names[int(objLabel)]
-            texts.append("a photo of a " + subjName + " " + relationName + " a " + objName)
-        return texts
-
-    def buildTargetRelationNames(self, relationLabels):
-        relationNames = []
-        for relationLabel in relationLabels.detach().cpu().tolist():
-            relIndex = int(relationLabel)
-            if relIndex >= len(self.activeRelNames):
-                raise ValueError(
-                    "MTM relation label {} is outside active relation names length {}.".format(
-                        relIndex, len(self.activeRelNames)
-                    )
-                )
-            relationNames.append(self.activeRelNames[relIndex])
-        return relationNames
-
-    def buildNovelTripletTexts(self, subjLabels, objLabels, pseudoCount):
-        if pseudoCount <= 0 or len(self.novelRelNames) == 0:
-            return [], None, None, []
-        sampledPairIndices = torch.randint(
-            subjLabels.numel(),
-            (pseudoCount,),
-            device=subjLabels.device,
-        )
-        sampledSubjLabels = subjLabels.index_select(0, sampledPairIndices).detach().cpu().tolist()
-        sampledObjLabels = objLabels.index_select(0, sampledPairIndices).detach().cpu().tolist()
-        texts = []
-        relationNames = []
-        for subjLabel, objLabel in zip(sampledSubjLabels, sampledObjLabels):
-            subjName = self.obj_names[int(subjLabel)]
-            objName = self.obj_names[int(objLabel)]
-            if subjName not in self.novelRelationCandidates:
-                compatibleRelations = []
-                if subjName in self.mtmTextSvdFilter.columns:
-                    for relationIndex in self.novel:
-                        if relationIndex == 0 or relationIndex >= len(self.mtmTextSvdFilter):
-                            continue
-                        relationName = self.relNames[relationIndex]
-                        if str(self.mtmTextSvdFilter.iloc[relationIndex][subjName]) == relationName:
-                            compatibleRelations.append(relationName)
-                if len(compatibleRelations) == 0:
-                    compatibleRelations = self.novelRelNames
-                self.novelRelationCandidates[subjName] = compatibleRelations
-            compatibleRelations = self.novelRelationCandidates[subjName]
-            sampledRelation = compatibleRelations[
-                int(torch.randint(len(compatibleRelations), (1,)).item())
-            ]
-            relationNames.append(sampledRelation)
-            texts.append("a photo of a " + subjName + " " + sampledRelation + " a " + objName)
-        return (
-            texts,
-            subjLabels.index_select(0, sampledPairIndices),
-            objLabels.index_select(0, sampledPairIndices),
-            relationNames,
-        )
-
-    def buildAllPredicateTripletTexts(self, subjLabel, objLabel):
-        subjName = self.obj_names[int(subjLabel)]
-        objName = self.obj_names[int(objLabel)]
-        return [
-            "a photo of a " + subjName + " " + relationName + " a " + objName
-            for relationName in self.mtmAlignRelNames
-        ]
-
-    def getAllPredicateTripletEmbeddings(self, subjLabel, objLabel):
-        cacheKey = (int(subjLabel), int(objLabel))
-        if cacheKey not in self.mtmAlignTripletEmbeddingCache:
-            texts = self.buildAllPredicateTripletTexts(cacheKey[0], cacheKey[1])
-            embeddings = self.encodeTripletTexts(texts).detach().cpu()
-            self.mtmAlignTripletEmbeddingCache[cacheKey] = embeddings
-        return self.mtmAlignTripletEmbeddingCache[cacheKey].to(self.device)
-
-    def buildFilteredTripletTexts(self, subjLabel, objLabels):
-        texts = []
-        subjName = self.obj_names[int(subjLabel)]
-        candidateRelations = list(self.sub_filter_novel[subjName])
-        for objLabel in objLabels.detach().cpu().tolist():
-            objName = self.obj_names[int(objLabel)]
-            for relationName in candidateRelations:
-                texts.append("a photo of a " + subjName + " " + relationName + " a " + objName)
-        return texts, len(candidateRelations)
-
-    def getFilteredTripletEmbeddings(self, subjLabel, objLabel):
-        cacheKey = (int(subjLabel), int(objLabel))
-        if cacheKey not in self.filteredTripletEmbeddingCache:
-            objLabels = torch.tensor([cacheKey[1]], device=self.device)
-            texts, numCandidateRelations = self.buildFilteredTripletTexts(cacheKey[0], objLabels)
-            embeddings = self.encodeTripletTexts(texts).cpu()
-            self.filteredTripletEmbeddingCache[cacheKey] = (embeddings, numCandidateRelations)
-        embeddings, numCandidateRelations = self.filteredTripletEmbeddingCache[cacheKey]
-        return embeddings.to(self.device), numCandidateRelations
-
-    def populateFilteredTripletEmbeddingCache(self, subjLabels, objLabels):
-        labelPairs = torch.stack([subjLabels, objLabels], dim=-1).detach().cpu().tolist()
-        missingKeys = []
-        seenKeys = set()
-        for subjLabel, objLabel in labelPairs:
-            cacheKey = (int(subjLabel), int(objLabel))
-            if cacheKey not in self.filteredTripletEmbeddingCache and cacheKey not in seenKeys:
-                missingKeys.append(cacheKey)
-                seenKeys.add(cacheKey)
-        if len(missingKeys) == 0:
-            return
-
-        pendingTexts = []
-        pendingEntries = []
-        chunkSize = max(int(self.mtmTextSvdChunkSize), 1)
-
-        def encodePendingTexts():
-            if len(pendingTexts) == 0:
-                return
-            encoded = self.encodeTripletTexts(pendingTexts).detach().cpu()
-            offset = 0
-            for cacheKey, candidateCount in pendingEntries:
-                self.filteredTripletEmbeddingCache[cacheKey] = (
-                    encoded[offset : offset + candidateCount],
-                    candidateCount,
-                )
-                offset += candidateCount
-            del pendingTexts[:]
-            del pendingEntries[:]
-
-        for cacheKey in missingKeys:
-            objLabelsForText = torch.tensor([cacheKey[1]], device=self.device)
-            texts, candidateCount = self.buildFilteredTripletTexts(cacheKey[0], objLabelsForText)
-            if len(pendingTexts) > 0 and len(pendingTexts) + len(texts) > chunkSize:
-                encodePendingTexts()
-            pendingTexts.extend(texts)
-            pendingEntries.append((cacheKey, candidateCount))
-        encodePendingTexts()
-
     def cropImagePadding(self, image, proposal):
         imageWidth, imageHeight = proposal.size
         return image[:, : int(imageHeight), : int(imageWidth)]
-
-    def buildUnionBoxes(self, boxes, pairIdx):
-        subBoxes = boxes.index_select(0, pairIdx[:, 0].to(boxes.device))
-        objBoxes = boxes.index_select(0, pairIdx[:, 1].to(boxes.device))
-        topLeft = torch.min(subBoxes[:, :2], objBoxes[:, :2])
-        bottomRight = torch.max(subBoxes[:, 2:], objBoxes[:, 2:])
-        return torch.cat([topLeft, bottomRight], dim=-1)
 
     def encodeClipBoxCrops(self, image, boxes, returnTokens=False):
         boxes = boxes.long()
         _, imageHeight, imageWidth = image.shape
         if boxes.size(0) == 0:
-            return image.new_zeros((0, self.relationMtm.adapter.inputProj.in_features)).float()
+            featureShape = (0, 50, 512) if returnTokens else (0, 512)
+            return image.new_zeros(featureShape).float()
 
         encodedChunks = []
-        for offset in range(0, boxes.size(0), self.mtmUnionCropChunkSize):
+        chunkSize = max(int(self.mtm_branch.cfg.UNION_CROP_CHUNK_SIZE), 1) if self.mtm_branch else 128
+        for offset in range(0, boxes.size(0), chunkSize):
             cropChunk = []
-            for box in boxes[offset : offset + self.mtmUnionCropChunkSize]:
+            for box in boxes[offset : offset + chunkSize]:
                 left = int(box[0].clamp(min=0, max=max(imageWidth - 1, 0)).item())
                 top = int(box[1].clamp(min=0, max=max(imageHeight - 1, 0)).item())
                 right = int(box[2].clamp(min=left + 1, max=imageWidth).item())
                 bottom = int(box[3].clamp(min=top + 1, max=imageHeight).item())
                 crop = FF.resized_crop(
-                    image,
-                    top,
-                    left,
-                    bottom - top,
-                    right - left,
+                    image, top, left, bottom - top, right - left,
                     (self.clipInputSize, self.clipInputSize),
                 )
                 crop = (crop * 255.0).to(torch.uint8).to(crop.dtype) / 255.0
                 cropChunk.append(self.clipImageNormalize(crop))
-            cropChunk = torch.stack(cropChunk, dim=0).to(self.device)
-            encoded = self.clip_model.encode_image(cropChunk)
+            encoded = self.clip_model.encode_image(torch.stack(cropChunk).to(self.device))
             if encoded.dim() == 3 and not returnTokens:
                 encoded = encoded[:, 0, :]
             encodedChunks.append(encoded)
         return torch.cat(encodedChunks, dim=0)
-
-    def buildMtmUnionCropFeatures(self, image, proposal, pairIdx):
-        pairIdx = pairIdx.to(proposal.bbox.device)
-        unionBoxes = self.buildUnionBoxes(proposal.bbox, pairIdx).long()
-        if unionBoxes.size(0) == 0:
-            return image.new_zeros((0, self.relationMtm.adapter.inputProj.in_features)).float()
-        uniqueBoxes, inverse = torch.unique(
-            unionBoxes,
-            dim=0,
-            sorted=False,
-            return_inverse=True,
-        )
-        uniqueFeatures = self.encodeClipBoxCrops(image, uniqueBoxes)
-        return uniqueFeatures.index_select(0, inverse.to(uniqueFeatures.device))
 
     def buildPairSpatialFeatures(self, proposal, pairIdx):
         boxInfo = get_box_info(proposal.bbox, need_norm=True, proposal=proposal)
@@ -1170,525 +697,13 @@ class ClipPredictor(nn.Module):
         loss = (positiveLoss + negativeLoss).sum() / normalizer
         return {"loss_mtm_relationness": self.relationnessLossWeight * loss}
 
-    def emptyMtmLosses(self, zero):
-        return {
-            "loss_mtm_align": zero,
-            "loss_mtm_visual_structure": zero,
-            "loss_mtm_text_structure": zero,
-            "loss_mtm_ship_recon": zero,
-            "loss_mtm_ship_kl": zero,
-            "loss_mtm_ship_visual_transfer": zero,
-        }
-
-    def buildMtmPredicateAlignmentTargets(self, subjLabels, objLabels, relationNames, device):
-        candidateFeatures = []
-        targetIndices = []
-        for subjLabel, objLabel, relationName in zip(
-            subjLabels.detach().cpu().tolist(),
-            objLabels.detach().cpu().tolist(),
-            relationNames,
-        ):
-            if relationName not in self.mtmAlignRelNameToIndex:
-                raise ValueError("Unknown MTM alignment relation name: {}".format(relationName))
-            candidateFeatures.append(
-                self.getAllPredicateTripletEmbeddings(subjLabel, objLabel)
-            )
-            targetIndices.append(self.mtmAlignRelNameToIndex[relationName])
-        candidateFeatures = torch.stack(candidateFeatures, dim=0).to(
-            device=device,
-            dtype=torch.float32,
-        )
-        targetIndices = torch.tensor(
-            targetIndices,
-            device=device,
-            dtype=torch.long,
-        )
-        return candidateFeatures, targetIndices
-
-    def computeMtmCosineNegativeAlignment(
-        self,
-        predictedFeatures,
-        positiveFeatures,
-        subjLabels,
-        objLabels,
-        relationNames,
-    ):
-        positiveLoss = 1.0 - (predictedFeatures * positiveFeatures).sum(dim=-1).mean()
-        candidateFeatures, targetIndices = self.buildMtmPredicateAlignmentTargets(
-            subjLabels,
-            objLabels,
-            relationNames,
-            predictedFeatures.device,
-        )
-        similarities = torch.bmm(
-            candidateFeatures,
-            predictedFeatures.float().unsqueeze(-1),
-        ).squeeze(-1)
-        negativeMask = torch.ones_like(similarities, dtype=torch.bool)
-        negativeMask.scatter_(1, targetIndices.unsqueeze(1), False)
-        negativeLoss = F.relu(
-            similarities[negativeMask] - self.mtmAlignNegMargin
-        ).mean()
-        return positiveLoss + self.mtmAlignNegWeight * negativeLoss
-
-    def computeMtmLosses(
-        self,
-        relationFeatures,
-        rawUnionFeatures,
-        relationLabels,
-        subjLabels,
-        objLabels,
-        logger=None,
-    ):
-        if not self.mtmLossEnabled or len(relationFeatures) == 0 or relationLabels is None:
-            return self.emptyMtmLosses(self.relationMtm.norm.weight.sum() * 0.0)
-
-        relationFeatures = torch.cat(relationFeatures, dim=0).float()
-        rawUnionFeatures = torch.cat(rawUnionFeatures, dim=0).float().to(relationFeatures.device)
-        relationLabels = torch.cat(relationLabels, dim=0).view(-1).long().to(relationFeatures.device)
-        subjLabels = torch.cat(subjLabels, dim=0).view(-1).long().to(relationFeatures.device)
-        objLabels = torch.cat(objLabels, dim=0).view(-1).long().to(relationFeatures.device)
-        positive = relationLabels > 0
-        if positive.any() and relationLabels[positive].max().item() >= len(self.activeRelNames):
-            raise ValueError(
-                "MTM received relation label {} but active relation names only has {} entries. "
-                "Use dataset rel_classes for MTM targets or regenerate stale dataset-statistics cache.".format(
-                    relationLabels[positive].max().item(), len(self.activeRelNames)
-                )
-            )
-        if not positive.any():
-            return self.emptyMtmLosses(relationFeatures.sum() * 0.0)
-
-        relationFeatures = relationFeatures[positive]
-        rawUnionFeatures = rawUnionFeatures[positive]
-        relationLabels = relationLabels[positive]
-        subjLabels = subjLabels[positive]
-        objLabels = objLabels[positive]
-        self.mtmDebugIteration.add_(1)
-        if self.mtmMaxPairs > 0 and relationFeatures.size(0) > self.mtmMaxPairs:
-            sampleIndex = torch.linspace(
-                0,
-                relationFeatures.size(0) - 1,
-                steps=self.mtmMaxPairs,
-                device=relationFeatures.device,
-            ).long()
-            relationFeatures = relationFeatures.index_select(0, sampleIndex)
-            rawUnionFeatures = rawUnionFeatures.index_select(0, sampleIndex)
-            relationLabels = relationLabels.index_select(0, sampleIndex)
-            subjLabels = subjLabels.index_select(0, sampleIndex)
-            objLabels = objLabels.index_select(0, sampleIndex)
-
-        baseRawUnionFeatures = F.normalize(rawUnionFeatures.detach().float(), dim=-1)
-        if self.mtmVisualAdapterEnabled:
-            baseAdaptedFeatures = self.relationMtm.encode_visual(relationFeatures.float())
-        else:
-            baseAdaptedFeatures = relationFeatures.float()
-        baseVisualFeatures = F.normalize(baseAdaptedFeatures, dim=-1)
-        baseTexts = self.buildTargetTripletTexts(subjLabels, relationLabels, objLabels)
-        baseRelationNames = self.buildTargetRelationNames(relationLabels)
-        baseTextTargets = F.normalize(
-            self.encodeTripletTexts(baseTexts).to(baseVisualFeatures.device).float(),
-            dim=-1,
-        ).detach()
-        zero = baseVisualFeatures.sum() * 0.0
-        reconstructionLoss = zero
-        klLoss = zero
-        visualTransferLoss = zero
-        visualTransferCosine = None
-        reconstructedFeatures = None
-        pseudoVisualFeatures = None
-        pseudoRawUnionFeatures = None
-        pseudoWeight = 0.0
-        klWeight = 0.0
-
-        if self.mtmShipEnabled:
-            self.shipTrainingStep.add_(1)
-            currentStep = int(self.shipTrainingStep.item())
-            rampProgress = min(
-                max(float(currentStep - self.mtmShipWarmupIters), 0.0) / float(self.mtmShipRampIters),
-                1.0,
-            )
-            pseudoWeight = rampProgress
-            klWeight = rampProgress
-            reconstructedFeatures, shipMean, shipLogvar = self.shipFeatureGenerator.reconstruct(
-                baseTexts,
-                baseRawUnionFeatures,
-            )
-            reconstructionLoss = (
-                reconstructedFeatures - baseRawUnionFeatures
-            ).pow(2).sum(dim=-1).mean()
-            klLoss = self.shipFeatureGenerator.klLoss(shipMean, shipLogvar)
-            if currentStep > self.mtmShipWarmupIters and self.mtmShipPseudoRatio > 0:
-                pseudoCount = int(
-                    round(
-                        baseVisualFeatures.size(0)
-                        * float(self.mtmShipPseudoRatio)
-                        * rampProgress
-                    )
-                )
-                novelTexts, novelSubjLabels, novelObjLabels, novelRelationNames = self.buildNovelTripletTexts(
-                    subjLabels,
-                    objLabels,
-                    pseudoCount,
-                )
-            else:
-                novelTexts = []
-                novelSubjLabels = None
-                novelObjLabels = None
-                novelRelationNames = []
-            if len(novelTexts) > 0:
-                novelTextTargets = F.normalize(
-                    self.encodeTripletTexts(novelTexts).to(baseVisualFeatures.device).float(),
-                    dim=-1,
-                ).detach()
-                pseudoRawUnionFeatures = self.shipFeatureGenerator.generate(
-                    novelTexts,
-                    baseVisualFeatures.device,
-                )
-                baseInputNorm = relationFeatures.detach().float().norm(
-                    dim=-1,
-                ).mean().clamp(min=1e-6)
-                pseudoRawUnionFeatures = pseudoRawUnionFeatures * baseInputNorm
-                if self.mtmVisualAdapterEnabled:
-                    pseudoAdaptedFeatures = self.relationMtm.encode_visual(pseudoRawUnionFeatures)
-                else:
-                    pseudoAdaptedFeatures = pseudoRawUnionFeatures
-                pseudoVisualFeatures = F.normalize(pseudoAdaptedFeatures.float(), dim=-1)
-                allAdaptedFeatures = torch.cat(
-                    [baseAdaptedFeatures, pseudoAdaptedFeatures],
-                    dim=0,
-                )
-                allVisualFeatures = torch.cat([baseVisualFeatures, pseudoVisualFeatures], dim=0)
-                allTextTargets = torch.cat([baseTextTargets, novelTextTargets], dim=0)
-                allTexts = baseTexts + novelTexts
-                allSubjLabels = torch.cat([subjLabels, novelSubjLabels], dim=0)
-                allObjLabels = torch.cat([objLabels, novelObjLabels], dim=0)
-                allRelationNames = baseRelationNames + novelRelationNames
-            else:
-                novelTextTargets = None
-                allAdaptedFeatures = baseAdaptedFeatures
-                allVisualFeatures = baseVisualFeatures
-                allTextTargets = baseTextTargets
-                allTexts = baseTexts
-                allSubjLabels = subjLabels
-                allObjLabels = objLabels
-                allRelationNames = baseRelationNames
-        else:
-            novelTexts = []
-            novelTextTargets = None
-            allAdaptedFeatures = baseAdaptedFeatures
-            allVisualFeatures = baseVisualFeatures
-            allTextTargets = baseTextTargets
-            allTexts = baseTexts
-            allSubjLabels = subjLabels
-            allObjLabels = objLabels
-            allRelationNames = baseRelationNames
-
-        predictedFeatures = F.normalize(
-            self.relationMtm.encode_text_space(allAdaptedFeatures).float(),
-            dim=-1,
-        )
-        baseCount = baseVisualFeatures.size(0)
-        basePredictedFeatures = predictedFeatures[:baseCount]
-        if self.mtmAlignLossType == "cosine":
-            alignLoss = 1.0 - (predictedFeatures * allTextTargets).sum(dim=-1).mean()
-        elif self.mtmAlignLossType == "cosine_neg":
-            alignLoss = self.computeMtmCosineNegativeAlignment(
-                predictedFeatures,
-                allTextTargets,
-                allSubjLabels,
-                allObjLabels,
-                allRelationNames,
-            )
-        else:
-            raise ValueError("Unsupported MTM.ALIGN_LOSS_TYPE: {}".format(self.mtmAlignLossType))
-
-        if pseudoVisualFeatures is not None:
-            novelPredictedFeatures = predictedFeatures[baseCount:]
-            if self.mtmShipVisualTransferEnabled:
-                transferTargets = []
-                detachedBaseKeys = basePredictedFeatures.detach()
-                detachedBaseValues = baseVisualFeatures.detach()
-                for novelIndex in range(pseudoVisualFeatures.size(0)):
-                    candidateMask = (
-                        (subjLabels == novelSubjLabels[novelIndex])
-                        & (objLabels == novelObjLabels[novelIndex])
-                    )
-                    candidateRelations = relationLabels[candidateMask]
-                    candidateKeys = []
-                    candidateValues = []
-                    maskedKeys = detachedBaseKeys[candidateMask]
-                    maskedValues = detachedBaseValues[candidateMask]
-                    for baseRelation in candidateRelations.unique():
-                        relationMask = candidateRelations == baseRelation
-                        candidateKeys.append(maskedKeys[relationMask].mean(dim=0))
-                        candidateValues.append(maskedValues[relationMask].mean(dim=0))
-                    candidateKeys = F.normalize(torch.stack(candidateKeys, dim=0), dim=-1)
-                    candidateValues = F.normalize(torch.stack(candidateValues, dim=0), dim=-1)
-                    transferLogits = torch.matmul(
-                        candidateKeys,
-                        novelTextTargets[novelIndex],
-                    ) / self.mtmShipTransferTemperature
-                    transferWeights = F.softmax(transferLogits, dim=0)
-                    transferTargets.append(
-                        torch.sum(candidateValues * transferWeights.unsqueeze(-1), dim=0)
-                    )
-                transferTargets = F.normalize(torch.stack(transferTargets, dim=0), dim=-1)
-                visualTransferCosine = (
-                    pseudoVisualFeatures * transferTargets
-                ).sum(dim=-1).mean()
-                visualTransferLoss = 1.0 - visualTransferCosine
-        if predictedFeatures.size(0) < 2:
-            visualStructureLoss = zero
-            textStructureLoss = zero
-        else:
-            inputVisualSimilarity = torch.matmul(allVisualFeatures, allVisualFeatures.t())
-            predictedSimilarity = torch.matmul(predictedFeatures, predictedFeatures.t())
-            targetSimilarity = torch.matmul(allTextTargets, allTextTargets.t())
-            offDiagonal = ~torch.eye(
-                predictedFeatures.size(0),
-                dtype=torch.bool,
-                device=predictedSimilarity.device,
-            )
-            visualStructureLoss = (
-                inputVisualSimilarity - predictedSimilarity
-            ).abs()[offDiagonal].mean()
-            textStructureLoss = (
-                predictedSimilarity - targetSimilarity
-            ).abs()[offDiagonal].mean()
-            if (
-                self.mtmStructureDebugEnabled
-                and logger is not None
-                and get_rank() == 0
-                and baseCount >= 2
-                and int(self.mtmDebugIteration.item()) % self.mtmStructureDebugStep == 0
-            ):
-                with torch.no_grad():
-                    def similarityStats(similarity, mask):
-                        values = similarity[mask].float().clamp(min=-1.0, max=1.0)
-                        return (
-                            values.mean().item(),
-                            values.max().item(),
-                            values.min().item(),
-                            values.std(unbiased=False).item(),
-                        )
-
-                    baseMask = ~torch.eye(
-                        baseCount,
-                        dtype=torch.bool,
-                        device=predictedSimilarity.device,
-                    )
-                    baseRawSimilarity = torch.matmul(
-                        baseRawUnionFeatures,
-                        baseRawUnionFeatures.t(),
-                    )
-                    baseVisualSimilarity = inputVisualSimilarity[:baseCount, :baseCount]
-                    baseMtmSimilarity = predictedSimilarity[:baseCount, :baseCount]
-                    baseTextSimilarity = torch.matmul(baseTextTargets, baseTextTargets.t())
-                    baseRawStats = similarityStats(baseRawSimilarity, baseMask)
-                    baseTextStats = similarityStats(baseTextSimilarity, baseMask)
-                    baseMtmStats = similarityStats(baseMtmSimilarity, baseMask)
-                    baseVisualStats = similarityStats(baseVisualSimilarity, baseMask)
-                    baseStructureError = (
-                        baseVisualSimilarity - baseMtmSimilarity
-                    ).abs()[baseMask].mean().item()
-                    baseTextStructureError = (
-                        baseMtmSimilarity - baseTextSimilarity
-                    ).abs()[baseMask].mean().item()
-                    baseAlignCosine = (
-                        basePredictedFeatures * baseTextTargets
-                    ).sum(dim=-1).mean().item()
-                    baseCandidateTargets, baseTargetIndices = self.buildMtmPredicateAlignmentTargets(
-                        subjLabels,
-                        objLabels,
-                        baseRelationNames,
-                        basePredictedFeatures.device,
-                    )
-                    basePredicateCos = torch.bmm(
-                        baseCandidateTargets,
-                        basePredictedFeatures.float().unsqueeze(-1),
-                    ).squeeze(-1)
-                    basePredicateMask = torch.ones_like(basePredicateCos, dtype=torch.bool)
-                    basePredicateMask.scatter_(1, baseTargetIndices.unsqueeze(1), False)
-                    basePositiveCos = basePredicateCos.gather(
-                        1,
-                        baseTargetIndices.unsqueeze(1),
-                    )
-                    baseNegativeCos = basePredicateCos.masked_fill(~basePredicateMask, -1e4)
-                    baseMaxNegativeCos = baseNegativeCos.max(dim=1, keepdim=True)[0]
-                    baseNegativeMeanCos = basePredicateCos[basePredicateMask].mean().item()
-                    baseMargin = (basePositiveCos - baseMaxNegativeCos).mean().item()
-                    baseTop1 = (
-                        basePredicateCos.argmax(dim=1) == baseTargetIndices
-                    ).float().mean().item()
-                    baseReconstructionCosine = (
-                        reconstructedFeatures * baseRawUnionFeatures
-                    ).sum(dim=-1).mean().item() if reconstructedFeatures is not None else float("nan")
-                    baseRawNorm = relationFeatures.norm(dim=-1).mean().item()
-                    baseAdaptedNorm = baseAdaptedFeatures.norm(dim=-1).mean().item()
-                    logger.info(
-                        "MTM debug i=%d base "
-                        "raw(mean/max/min/std)=%.4f/%.4f/%.4f/%.4f "
-                        "h(mean/max/min/std)=%.4f/%.4f/%.4f/%.4f "
-                        "q(mean/max/min/std)=%.4f/%.4f/%.4f/%.4f "
-                        "t(mean/max/min/std)=%.4f/%.4f/%.4f/%.4f "
-                        "align=%.4f neg=%.4f maxneg=%.4f margin=%.4f top1=%.3f recon=%.4f v_err=%.4f t_err=%.4f kl=%.4f norm(raw/h)=%.3f/%.3f",
-                        int(self.mtmDebugIteration.item()),
-                        *baseRawStats,
-                        *baseVisualStats,
-                        *baseMtmStats,
-                        *baseTextStats,
-                        baseAlignCosine,
-                        baseNegativeMeanCos,
-                        baseMaxNegativeCos.mean().item(),
-                        baseMargin,
-                        baseTop1,
-                        baseReconstructionCosine,
-                        baseStructureError,
-                        baseTextStructureError,
-                        klLoss.item(),
-                        baseRawNorm,
-                        baseAdaptedNorm,
-                    )
-                    novelCount = predictedFeatures.size(0) - baseCount
-                    if pseudoVisualFeatures is not None and novelCount >= 2:
-                        novelMask = ~torch.eye(
-                            novelCount,
-                            dtype=torch.bool,
-                            device=predictedSimilarity.device,
-                        )
-                        novelVisualSimilarity = inputVisualSimilarity[baseCount:, baseCount:]
-                        novelMtmSimilarity = predictedSimilarity[baseCount:, baseCount:]
-                        novelTextSimilarity = torch.matmul(novelTextTargets, novelTextTargets.t())
-                        novelRawSimilarity = torch.matmul(
-                            F.normalize(pseudoRawUnionFeatures, dim=-1),
-                            F.normalize(pseudoRawUnionFeatures, dim=-1).t(),
-                        )
-                        novelRawStats = similarityStats(novelRawSimilarity, novelMask)
-                        novelTextStats = similarityStats(novelTextSimilarity, novelMask)
-                        novelMtmStats = similarityStats(novelMtmSimilarity, novelMask)
-                        novelVisualStats = similarityStats(novelVisualSimilarity, novelMask)
-                        novelStructureError = (
-                            novelVisualSimilarity - novelMtmSimilarity
-                        ).abs()[novelMask].mean().item()
-                        novelTextStructureError = (
-                            novelMtmSimilarity - novelTextSimilarity
-                        ).abs()[novelMask].mean().item()
-                        novelAlignCosine = (
-                            novelPredictedFeatures * novelTextTargets
-                        ).sum(dim=-1).mean().item()
-                        novelCandidateTargets, novelTargetIndices = self.buildMtmPredicateAlignmentTargets(
-                            novelSubjLabels,
-                            novelObjLabels,
-                            novelRelationNames,
-                            novelPredictedFeatures.device,
-                        )
-                        novelPredicateCos = torch.bmm(
-                            novelCandidateTargets,
-                            novelPredictedFeatures.float().unsqueeze(-1),
-                        ).squeeze(-1)
-                        novelPredicateMask = torch.ones_like(novelPredicateCos, dtype=torch.bool)
-                        novelPredicateMask.scatter_(1, novelTargetIndices.unsqueeze(1), False)
-                        novelPositiveCos = novelPredicateCos.gather(
-                            1,
-                            novelTargetIndices.unsqueeze(1),
-                        )
-                        novelNegativeCos = novelPredicateCos.masked_fill(~novelPredicateMask, -1e4)
-                        novelMaxNegativeCos = novelNegativeCos.max(dim=1, keepdim=True)[0]
-                        novelNegativeMeanCos = novelPredicateCos[novelPredicateMask].mean().item()
-                        novelMargin = (novelPositiveCos - novelMaxNegativeCos).mean().item()
-                        novelTop1 = (
-                            novelPredicateCos.argmax(dim=1) == novelTargetIndices
-                        ).float().mean().item()
-                        novelRawBaseNearest = torch.matmul(
-                            F.normalize(pseudoRawUnionFeatures, dim=-1),
-                            baseRawUnionFeatures.t(),
-                        ).max(dim=1)[0].mean().item()
-                        novelVisualBaseNearest = torch.matmul(
-                            pseudoVisualFeatures,
-                            baseVisualFeatures.t(),
-                        ).max(dim=1)[0].mean().item()
-                        novelRawNorm = pseudoRawUnionFeatures.norm(dim=-1).mean().item()
-                        novelAdaptedNorm = pseudoAdaptedFeatures.norm(dim=-1).mean().item()
-                        crossStructureError = (
-                            inputVisualSimilarity[:baseCount, baseCount:]
-                            - predictedSimilarity[:baseCount, baseCount:]
-                        ).abs().mean().item()
-                        logger.info(
-                            "MTM debug i=%d novel "
-                            "raw(mean/max/min/std)=%.4f/%.4f/%.4f/%.4f "
-                            "h(mean/max/min/std)=%.4f/%.4f/%.4f/%.4f "
-                            "q(mean/max/min/std)=%.4f/%.4f/%.4f/%.4f "
-                            "t(mean/max/min/std)=%.4f/%.4f/%.4f/%.4f "
-                            "align=%.4f neg=%.4f maxneg=%.4f margin=%.4f top1=%.3f transfer=%.4f nnbase(raw/h)=%.4f/%.4f "
-                            "v_err=%.4f t_err=%.4f cross=%.4f ramp=%.4f n=%d norm(raw/h)=%.3f/%.3f",
-                            int(self.mtmDebugIteration.item()),
-                            *novelRawStats,
-                            *novelVisualStats,
-                            *novelMtmStats,
-                            *novelTextStats,
-                            novelAlignCosine,
-                            novelNegativeMeanCos,
-                            novelMaxNegativeCos.mean().item(),
-                            novelMargin,
-                            novelTop1,
-                            visualTransferCosine.item()
-                            if visualTransferCosine is not None else float("nan"),
-                            novelRawBaseNearest,
-                            novelVisualBaseNearest,
-                            novelStructureError,
-                            novelTextStructureError,
-                            crossStructureError,
-                            pseudoWeight,
-                            novelCount,
-                            novelRawNorm,
-                            novelAdaptedNorm,
-                        )
-
-        return {
-            "loss_mtm_align": self.mtmLossWeight * self.mtmAlignWeight * alignLoss,
-            "loss_mtm_visual_structure": self.mtmLossWeight * self.mtmStructureWeight * self.mtmVisualStructureWeight * visualStructureLoss,
-            "loss_mtm_text_structure": self.mtmLossWeight * self.mtmStructureWeight * self.mtmTextStructureWeight * textStructureLoss,
-            "loss_mtm_ship_recon": self.mtmLossWeight * self.mtmShipReconWeight * reconstructionLoss,
-            "loss_mtm_ship_kl": self.mtmLossWeight * self.mtmShipKlWeight * klWeight * klLoss,
-            "loss_mtm_ship_visual_transfer": self.mtmLossWeight * self.mtmShipVisualTransferWeight * pseudoWeight * visualTransferLoss,
-        }
-
-    def computeMtmInferenceScores(self, relationFeatures, subjLabels, objLabels, outShape, outDtype):
-        if self.mtmVisualAdapterEnabled:
-            visualFeatures = self.relationMtm.encode_visual(relationFeatures.float())
-        else:
-            visualFeatures = relationFeatures.float()
-        predicted_embeddings = F.normalize(
-            self.relationMtm.encode_text_space(visualFeatures).float(),
-            dim=-1,
-        )
-        scores = relationFeatures.new_zeros(outShape, dtype=torch.float32)
-        self.populateFilteredTripletEmbeddingCache(subjLabels, objLabels)
-        labelPairs = torch.stack([subjLabels, objLabels], dim=-1).detach().cpu().tolist()
-        chunkSize = max(int(self.mtmTextSvdChunkSize), 1)
-        for offset in range(0, len(labelPairs), chunkSize):
-            chunkPairs = labelPairs[offset : offset + chunkSize]
-            candidateFeatures = [
-                self.filteredTripletEmbeddingCache[(int(subjLabel), int(objLabel))][0]
-                for subjLabel, objLabel in chunkPairs
-            ]
-            candidateEmbeddings = torch.stack(candidateFeatures, dim=0).to(
-                device=predicted_embeddings.device,
-                dtype=torch.float32,
-            )
-            chunkPredicted = predicted_embeddings[offset : offset + len(chunkPairs)]
-            chunkScores = (chunkPredicted.unsqueeze(1) * candidateEmbeddings).sum(dim=-1)
-            scores[offset : offset + len(chunkPairs), :outShape[1]] = chunkScores[:, :outShape[1]]
-        return scores.to(dtype=outDtype)
-
     def computePairFilterScores(self, subFeatures, objFeatures, subjLabels, numRelations):
         textFeatureBank = self.texts5Tensor.to(
             device=subFeatures.device,
             dtype=subFeatures.dtype,
         )
         scores = subFeatures.new_empty((subFeatures.size(0), numRelations))
-        chunkSize = max(int(self.mtmTextSvdChunkSize), 1)
+        chunkSize = self.textEncodeChunkSize
         for offset in range(0, subFeatures.size(0), chunkSize):
             end = min(offset + chunkSize, subFeatures.size(0))
             relationTextFeatures = textFeatureBank.index_select(
@@ -1714,7 +729,8 @@ class ClipPredictor(nn.Module):
             self.activeRelNames = cachedState["activeRelNames"]
             self.texts5 = cachedState["texts5"]
             self.texts5Tensor = cachedState["texts5Tensor"]
-            self.filteredTripletEmbeddingCache = self.filteredTripletEmbeddingCaches[mode]
+            if self.mtm_branch is not None:
+                self.mtm_branch.set_mode(self.activeRelNames, self.sub_filter_novel)
             return
 
         self.description_relation = pd.read_csv(
@@ -1753,8 +769,8 @@ class ClipPredictor(nn.Module):
         self.description_relation = np.array([[np.array(item) for item in inner_list] for inner_list in self.description_relation])
         self.description_relation=torch.Tensor(self.description_relation).to(self.device)
         self.activeRelNames = activeRelNames
-        self.filteredTripletEmbeddingCache = self.filteredTripletEmbeddingCaches.setdefault(mode, {})
-        self.updateMtmTextSvdBasis()
+        if self.mtm_branch is not None:
+            self.mtm_branch.set_mode(self.activeRelNames, self.sub_filter_novel)
 
         self.texts5 = self.encodeSubjectFilterTextFeatures(self.sub_filter_novel)
         self.texts5Tensor = F.normalize(torch.stack(self.texts5, dim=0), dim=-1)
@@ -1785,13 +801,22 @@ class ClipPredictor(nn.Module):
         assert len(num_rels) == len(num_objs)
         obj_preds = obj_preds.split(num_objs, dim=0)
 
+        mtm_output = {"scores": [None] * len(num_rels), "losses": {}}
+        run_mtm = (
+            self.mtm_branch is not None
+            and ((self.training and self.mtmTrainEnabled)
+                 or (not self.training and self.mtmInferenceEnabled and self.mtmInferenceWeight != 0))
+        )
+        if run_mtm:
+            mtm_output = self.mtm_branch(
+                img,
+                proposals,
+                rel_pair_idxs,
+                rel_labels,
+                obj_preds,
+            )
 
         rel_dists=[]
-        relationFeaturesForMtm = []
-        rawUnionFeaturesForMtm = []
-        relationLabelsForMtm = []
-        subjLabelsForMtm = []
-        objLabelsForMtm = []
         relationnessLogitsForLoss = []
         relationnessLabelsForLoss = []
         for i in range(len(num_rels)):
@@ -1844,43 +869,6 @@ class ClipPredictor(nn.Module):
             if self.training and self.relationnessLossEnabled and rel_labels is not None:
                 relationnessLogitsForLoss.append(relationnessLogits)
                 relationnessLabelsForLoss.append(rel_labels[i].to(relationnessLogits.device))
-            mtm_relation_features = None
-            need_mtm_features = (
-                (self.training and self.mtmLossEnabled)
-                or ((not self.training) and self.mtmUseInference and self.mtmInferenceWeight != 0)
-            )
-            if need_mtm_features:
-                mtm_pair_idx = pair_idx
-                mtm_feature_pos = None
-                if self.training and rel_labels is not None:
-                    mtm_feature_pos = torch.nonzero(
-                        rel_labels[i].to(pair_idx.device).view(-1) > 0,
-                        as_tuple=False,
-                    ).view(-1)
-                    mtm_pair_idx = pair_idx.index_select(0, mtm_feature_pos)
-                if mtm_pair_idx.numel() > 0:
-                    mtm_image = self.cropImagePadding(img[i], proposals[i])
-                    with torch.no_grad():
-                        mtm_relation_features = self.buildMtmUnionCropFeatures(
-                            mtm_image,
-                            proposals[i],
-                            mtm_pair_idx,
-                        )
-                    if self.training and self.mtmLossEnabled:
-                        mtm_raw_union_features = mtm_relation_features.detach()
-
-            if self.training and self.mtmLossEnabled and mtm_relation_features is not None:
-                relationFeaturesForMtm.append(mtm_relation_features)
-                rawUnionFeaturesForMtm.append(mtm_raw_union_features)
-                relationLabelsForMtm.append(rel_labels[i].to(mtm_feature_pos.device).index_select(0, mtm_feature_pos))
-                if proposals[i].has_field("labels"):
-                    gtObjLabels = proposals[i].get_field("labels").long()
-                    subjLabelsForMtm.append(gtObjLabels.index_select(0, sub_idx).index_select(0, mtm_feature_pos))
-                    objLabelsForMtm.append(gtObjLabels.index_select(0, obj_idx).index_select(0, mtm_feature_pos))
-                else:
-                    subjLabelsForMtm.append(obj_n1.index_select(0, mtm_feature_pos))
-                    objLabelsForMtm.append(obj_n2.index_select(0, mtm_feature_pos))
-
             cross_norm = cross_output / cross_output.norm(dim=-1, keepdim=True).clamp(min=1e-6)
             similarity1 = cross_norm @ text1_norm.t()
             similarity2 = cross_norm @ text2_norm.t()
@@ -1909,15 +897,13 @@ class ClipPredictor(nn.Module):
                     description_scores.size(1),
                 ).to(dtype=description_scores.dtype)
                 rel_dist_per_batch = description_scores * 0.2 + filter_scores * 0.8
-                if self.mtmUseInference and self.mtmInferenceWeight != 0:
-                    mtmScores = self.computeMtmInferenceScores(
-                        mtm_relation_features,
-                        obj_n1,
-                        obj_n2,
-                        rel_dist_per_batch.shape,
-                        rel_dist_per_batch.dtype,
-                    )
-                    rel_dist_per_batch = rel_dist_per_batch + self.mtmInferenceWeight * mtmScores
+                if self.mtmInferenceEnabled and self.mtmInferenceWeight != 0:
+                    mtm_scores = mtm_output["scores"][i]
+                    if mtm_scores is not None:
+                        rel_dist_per_batch = rel_dist_per_batch + self.mtmInferenceWeight * mtm_scores.to(
+                            device=rel_dist_per_batch.device,
+                            dtype=rel_dist_per_batch.dtype,
+                        )
                 if self.useRelationnessInference:
                     proposals[i].add_field(
                         "relationness_scores",
@@ -1931,17 +917,8 @@ class ClipPredictor(nn.Module):
         rel_dists = tuple(rel_dists)
 
         add_losses = {}
-        if self.training and self.mtmLossEnabled:
-            add_losses.update(
-                self.computeMtmLosses(
-                    relationFeaturesForMtm,
-                    rawUnionFeaturesForMtm,
-                    relationLabelsForMtm,
-                    subjLabelsForMtm,
-                    objLabelsForMtm,
-                    logger,
-                )
-            )
+        if self.training and self.mtmTrainEnabled:
+            add_losses.update(mtm_output["losses"])
         if self.training and self.relationnessLossEnabled:
             add_losses.update(
                 self.computeRelationnessLoss(

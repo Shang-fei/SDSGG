@@ -10,7 +10,7 @@ def make_optimizer(cfg, model, logger, slow_heads=None, slow_ratio=5.0, rl_facto
     for key, value in model.named_parameters():
         if not value.requires_grad:
             continue
-        if "shipFeatureGenerator" in key:
+        if "mtm_branch.generator" in key:
             continue
         lr = cfg.SOLVER.BASE_LR
         weight_decay = cfg.SOLVER.WEIGHT_DECAY
@@ -36,19 +36,20 @@ def make_optimizer(cfg, model, logger, slow_heads=None, slow_ratio=5.0, rl_facto
 
 
 def make_ship_optimizer(cfg, model):
-    if not cfg.MODEL.ROI_RELATION_HEAD.MTM.SHIP_ENABLED:
+    mtm_cfg = cfg.MODEL.ROI_RELATION_HEAD.MTM
+    if not (mtm_cfg.ENABLED and mtm_cfg.TRAIN_ENABLED and mtm_cfg.SHIP_ENABLED):
         return None
     parameters = [
         value
         for key, value in model.named_parameters()
-        if value.requires_grad and "shipFeatureGenerator" in key
+        if value.requires_grad and "mtm_branch.generator" in key
     ]
     if len(parameters) == 0:
         return None
     return torch.optim.AdamW(
         parameters,
-        lr=cfg.MODEL.ROI_RELATION_HEAD.MTM.SHIP_LR,
-        weight_decay=cfg.MODEL.ROI_RELATION_HEAD.MTM.SHIP_WEIGHT_DECAY,
+        lr=mtm_cfg.SHIP_LR,
+        weight_decay=mtm_cfg.SHIP_WEIGHT_DECAY,
         betas=(0.9, 0.999),
     )
 
