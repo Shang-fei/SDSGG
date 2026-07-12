@@ -720,8 +720,8 @@ class ClipPredictor(nn.Module):
         self.mtmLossWeight = mtmConfig.LOSS_WEIGHT
         self.mtmAlignWeight = mtmConfig.ALIGN_WEIGHT
         self.mtmAlignLossType = str(mtmConfig.ALIGN_LOSS_TYPE).lower()
-        self.mtmAlignTemperature = max(float(mtmConfig.ALIGN_TEMPERATURE), 1e-6)
-        self.mtmAlignFocalGamma = float(mtmConfig.ALIGN_FOCAL_GAMMA)
+        self.mtmAlignNegWeight = float(mtmConfig.ALIGN_NEG_WEIGHT)
+        self.mtmAlignNegMargin = float(mtmConfig.ALIGN_NEG_MARGIN)
         self.mtmStructureWeight = mtmConfig.STRUCTURE_WEIGHT
         self.mtmVisualStructureWeight = mtmConfig.VISUAL_STRUCTURE_WEIGHT
         self.mtmTextStructureWeight = mtmConfig.TEXT_STRUCTURE_WEIGHT
@@ -1161,35 +1161,31 @@ class ClipPredictor(nn.Module):
         )
         return candidateFeatures, targetIndices
 
-    def computeMtmFocalAlignment(self, predictedFeatures, subjLabels, objLabels, relationNames):
+    def computeMtmCosineNegativeAlignment(
+        self,
+        predictedFeatures,
+        positiveFeatures,
+        subjLabels,
+        objLabels,
+        relationNames,
+    ):
+        positiveLoss = 1.0 - (predictedFeatures * positiveFeatures).sum(dim=-1).mean()
         candidateFeatures, targetIndices = self.buildMtmPredicateAlignmentTargets(
             subjLabels,
             objLabels,
             relationNames,
             predictedFeatures.device,
         )
-        logits = torch.bmm(
+        similarities = torch.bmm(
             candidateFeatures,
             predictedFeatures.float().unsqueeze(-1),
-        ).squeeze(-1) / self.mtmAlignTemperature
-        targets = logits.new_zeros(logits.shape)
-        targets.scatter_(1, targetIndices.unsqueeze(1), 1.0)
-
-        probabilities = torch.sigmoid(logits).clamp(min=1e-5, max=1.0 - 1e-5)
-        positiveWeight = targets.sum(dim=1, keepdim=True).clamp(min=1.0)
-        positiveLoss = (
-            -torch.log(probabilities)
-            * (1.0 - probabilities).pow(self.mtmAlignFocalGamma)
-            * targets
-            / positiveWeight
-        )
-        negativeLoss = (
-            -torch.log(1.0 - probabilities)
-            * probabilities.pow(self.mtmAlignFocalGamma)
-            * (1.0 - targets)
-            / positiveWeight
-        )
-        return (positiveLoss.sum() + negativeLoss.sum()) / logits.size(0)
+        ).squeeze(-1)
+        negativeMask = torch.ones_like(similarities, dtype=torch.bool)
+        negativeMask.scatter_(1, targetIndices.unsqueeze(1), False)
+        negativeLoss = F.relu(
+            similarities[negativeMask] - self.mtmAlignNegMargin
+        ).mean()
+        return positiveLoss + self.mtmAlignNegWeight * negativeLoss
 
     def computeMtmLosses(
         self,
@@ -1352,9 +1348,10 @@ class ClipPredictor(nn.Module):
         basePredictedFeatures = predictedFeatures[:baseCount]
         if self.mtmAlignLossType == "cosine":
             alignLoss = 1.0 - (predictedFeatures * allTextTargets).sum(dim=-1).mean()
-        elif self.mtmAlignLossType == "focal":
-            alignLoss = self.computeMtmFocalAlignment(
+        elif self.mtmAlignLossType == "cosine_neg":
+            alignLoss = self.computeMtmCosineNegativeAlignment(
                 predictedFeatures,
+                allTextTargets,
                 allSubjLabels,
                 allObjLabels,
                 allRelationNames,
@@ -1463,18 +1460,23 @@ class ClipPredictor(nn.Module):
                         baseRelationNames,
                         basePredictedFeatures.device,
                     )
-                    basePredicateLogits = torch.bmm(
+                    basePredicateCos = torch.bmm(
                         baseCandidateTargets,
                         basePredictedFeatures.float().unsqueeze(-1),
-                    ).squeeze(-1) / self.mtmAlignTemperature
-                    basePredicateProb = torch.sigmoid(basePredicateLogits)
-                    basePredicateMask = torch.ones_like(basePredicateProb, dtype=torch.bool)
+                    ).squeeze(-1)
+                    basePredicateMask = torch.ones_like(basePredicateCos, dtype=torch.bool)
                     basePredicateMask.scatter_(1, baseTargetIndices.unsqueeze(1), False)
-                    basePositiveProb = basePredicateProb.gather(
+                    basePositiveCos = basePredicateCos.gather(
                         1,
                         baseTargetIndices.unsqueeze(1),
-                    ).mean().item()
-                    baseNegativeProb = basePredicateProb[basePredicateMask].mean().item()
+                    )
+                    baseNegativeCos = basePredicateCos.masked_fill(~basePredicateMask, -1e4)
+                    baseMaxNegativeCos = baseNegativeCos.max(dim=1, keepdim=True)[0]
+                    baseNegativeMeanCos = basePredicateCos[basePredicateMask].mean().item()
+                    baseMargin = (basePositiveCos - baseMaxNegativeCos).mean().item()
+                    baseTop1 = (
+                        basePredicateCos.argmax(dim=1) == baseTargetIndices
+                    ).float().mean().item()
                     baseReconstructionCosine = (
                         reconstructedFeatures * baseRawUnionFeatures
                     ).sum(dim=-1).mean().item() if reconstructedFeatures is not None else float("nan")
@@ -1486,15 +1488,17 @@ class ClipPredictor(nn.Module):
                         "h(mean/max/min/std)=%.4f/%.4f/%.4f/%.4f "
                         "q(mean/max/min/std)=%.4f/%.4f/%.4f/%.4f "
                         "t(mean/max/min/std)=%.4f/%.4f/%.4f/%.4f "
-                        "align=%.4f prob(p/n)=%.3f/%.3f recon=%.4f v_err=%.4f t_err=%.4f kl=%.4f norm(raw/h)=%.3f/%.3f",
+                        "align=%.4f neg=%.4f maxneg=%.4f margin=%.4f top1=%.3f recon=%.4f v_err=%.4f t_err=%.4f kl=%.4f norm(raw/h)=%.3f/%.3f",
                         int(self.mtmDebugIteration.item()),
                         *baseRawStats,
                         *baseVisualStats,
                         *baseMtmStats,
                         *baseTextStats,
                         baseAlignCosine,
-                        basePositiveProb,
-                        baseNegativeProb,
+                        baseNegativeMeanCos,
+                        baseMaxNegativeCos.mean().item(),
+                        baseMargin,
+                        baseTop1,
                         baseReconstructionCosine,
                         baseStructureError,
                         baseTextStructureError,
@@ -1535,18 +1539,23 @@ class ClipPredictor(nn.Module):
                             novelRelationNames,
                             novelPredictedFeatures.device,
                         )
-                        novelPredicateLogits = torch.bmm(
+                        novelPredicateCos = torch.bmm(
                             novelCandidateTargets,
                             novelPredictedFeatures.float().unsqueeze(-1),
-                        ).squeeze(-1) / self.mtmAlignTemperature
-                        novelPredicateProb = torch.sigmoid(novelPredicateLogits)
-                        novelPredicateMask = torch.ones_like(novelPredicateProb, dtype=torch.bool)
+                        ).squeeze(-1)
+                        novelPredicateMask = torch.ones_like(novelPredicateCos, dtype=torch.bool)
                         novelPredicateMask.scatter_(1, novelTargetIndices.unsqueeze(1), False)
-                        novelPositiveProb = novelPredicateProb.gather(
+                        novelPositiveCos = novelPredicateCos.gather(
                             1,
                             novelTargetIndices.unsqueeze(1),
-                        ).mean().item()
-                        novelNegativeProb = novelPredicateProb[novelPredicateMask].mean().item()
+                        )
+                        novelNegativeCos = novelPredicateCos.masked_fill(~novelPredicateMask, -1e4)
+                        novelMaxNegativeCos = novelNegativeCos.max(dim=1, keepdim=True)[0]
+                        novelNegativeMeanCos = novelPredicateCos[novelPredicateMask].mean().item()
+                        novelMargin = (novelPositiveCos - novelMaxNegativeCos).mean().item()
+                        novelTop1 = (
+                            novelPredicateCos.argmax(dim=1) == novelTargetIndices
+                        ).float().mean().item()
                         novelRawBaseNearest = torch.matmul(
                             F.normalize(pseudoRawUnionFeatures, dim=-1),
                             baseRawUnionFeatures.t(),
@@ -1567,7 +1576,7 @@ class ClipPredictor(nn.Module):
                             "h(mean/max/min/std)=%.4f/%.4f/%.4f/%.4f "
                             "q(mean/max/min/std)=%.4f/%.4f/%.4f/%.4f "
                             "t(mean/max/min/std)=%.4f/%.4f/%.4f/%.4f "
-                            "align=%.4f prob(p/n)=%.3f/%.3f transfer=%.4f nnbase(raw/h)=%.4f/%.4f "
+                            "align=%.4f neg=%.4f maxneg=%.4f margin=%.4f top1=%.3f transfer=%.4f nnbase(raw/h)=%.4f/%.4f "
                             "v_err=%.4f t_err=%.4f cross=%.4f ramp=%.4f n=%d norm(raw/h)=%.3f/%.3f",
                             int(self.mtmDebugIteration.item()),
                             *novelRawStats,
@@ -1575,8 +1584,10 @@ class ClipPredictor(nn.Module):
                             *novelMtmStats,
                             *novelTextStats,
                             novelAlignCosine,
-                            novelPositiveProb,
-                            novelNegativeProb,
+                            novelNegativeMeanCos,
+                            novelMaxNegativeCos.mean().item(),
+                            novelMargin,
+                            novelTop1,
                             visualTransferCosine.item()
                             if visualTransferCosine is not None else float("nan"),
                             novelRawBaseNearest,
