@@ -194,8 +194,36 @@ class ShipLatentGenerator(nn.Module):
         return self.net(latentFeatures.float())
 
 
+class ShipTextVisualAdapter(nn.Module):
+    def __init__(self, embedDim=512, hiddenDim=1024, dropout=0.1, initStd=0.02):
+        super(ShipTextVisualAdapter, self).__init__()
+        self.norm = nn.LayerNorm(embedDim)
+        self.net = nn.Sequential(
+            nn.Linear(embedDim, hiddenDim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hiddenDim, embedDim),
+        )
+        self.net.apply(lambda module: initializeShipLayer(module, initStd))
+
+    def forward(self, textFeatures):
+        textFeatures = textFeatures.float()
+        return F.normalize(textFeatures + self.net(self.norm(textFeatures)), dim=-1)
+
+
 class ShipTripletFeatureGenerator(nn.Module):
-    def __init__(self, clipModel, visualDim=512, embedDim=512, latentDim=512, ctxLen=4, initStd=0.02):
+    def __init__(
+        self,
+        clipModel,
+        visualDim=512,
+        embedDim=512,
+        latentDim=512,
+        ctxLen=4,
+        initStd=0.02,
+        textAdapterEnabled=True,
+        textAdapterHiddenDim=1024,
+        textAdapterDropout=0.1,
+    ):
         super(ShipTripletFeatureGenerator, self).__init__()
         if visualDim != embedDim:
             raise ValueError("SHIP prompt reconstruction requires visualDim == embedDim")
@@ -215,6 +243,16 @@ class ShipTripletFeatureGenerator(nn.Module):
             hiddenDim=4096,
             outputDim=embedDim,
             initStd=initStd,
+        )
+        self.textVisualAdapter = (
+            ShipTextVisualAdapter(
+                embedDim=embedDim,
+                hiddenDim=textAdapterHiddenDim,
+                dropout=textAdapterDropout,
+                initStd=initStd,
+            )
+            if textAdapterEnabled
+            else None
         )
 
     def reparameterize(self, mean, logvar):
@@ -242,7 +280,10 @@ class ShipTripletFeatureGenerator(nn.Module):
         suffix = tokenEmbeddings[:, 1 + self.ctxLen :, :]
         ctx = self.ctx.unsqueeze(0).expand(residuals.size(0), -1, -1)
         prompts = torch.cat([prefix, ctx + residuals.unsqueeze(1), suffix], dim=1)
-        return F.normalize(self.encodePromptEmbeddings(prompts, tokenizedPrompts), dim=-1)
+        textFeatures = F.normalize(self.encodePromptEmbeddings(prompts, tokenizedPrompts), dim=-1)
+        if self.textVisualAdapter is not None:
+            return self.textVisualAdapter(textFeatures)
+        return textFeatures
 
     def reconstruct(self, tripletTexts, visualFeatures):
         reconstructionTargets = F.normalize(visualFeatures.detach().float(), dim=-1)
@@ -764,6 +805,9 @@ class ClipPredictor(nn.Module):
                 latentDim=mtmConfig.EMBED_DIM,
                 ctxLen=mtmConfig.SHIP_CTX_LEN,
                 initStd=mtmConfig.SHIP_INIT_STD,
+                textAdapterEnabled=mtmConfig.SHIP_TEXT_ADAPTER_ENABLED,
+                textAdapterHiddenDim=mtmConfig.SHIP_TEXT_ADAPTER_HIDDEN_DIM,
+                textAdapterDropout=mtmConfig.SHIP_TEXT_ADAPTER_DROPOUT,
             ).to(self.device)
         self.relationMtm = RelationModalityTransfer(
             mtmConfig.INPUT_DIM,
