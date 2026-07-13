@@ -111,8 +111,15 @@ def train(cfg, local_rank, distributed, logger):
         is_distributed=distributed,
         start_iter=arguments["iteration"],
     )
+    # DATASETS.VAL may intentionally point to a dataset catalog entry whose
+    # internal split is "test". In that case VGDataset reads TEST_PART while
+    # it is being built, so mirror VAL_PART into a local evaluation config.
+    val_cfg = cfg.clone()
+    val_cfg.defrost()
+    val_cfg.OV_SETTING.TEST_PART = cfg.OV_SETTING.VAL_PART
+    val_cfg.freeze()
     val_data_loaders = make_data_loader(
-        cfg,
+        val_cfg,
         mode='val',
         is_distributed=distributed,
     )
