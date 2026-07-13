@@ -9,9 +9,11 @@ from maskrcnn_benchmark.utils.env import setup_environment  # noqa F401 isort:sk
 
 import argparse
 import os
+import random
 import time
 import datetime
 
+import numpy as np
 import torch
 from torch.nn.utils import clip_grad_norm_
 
@@ -31,6 +33,13 @@ from maskrcnn_benchmark.utils.imports import import_file
 from maskrcnn_benchmark.utils.logger import setup_logger, debug_print
 from maskrcnn_benchmark.utils.miscellaneous import mkdir, save_config
 from maskrcnn_benchmark.utils.metric_logger import MetricLogger
+
+
+def set_random_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 
 # See if we can use apex.DistributedDataParallel instead of the torch default,
@@ -387,12 +396,18 @@ def main():
     cfg.merge_from_list(args.opts)
     cfg.freeze()
 
+    process_seed = int(cfg.SEED) + get_rank()
+    set_random_seed(process_seed)
+
     output_dir = cfg.OUTPUT_DIR
     if output_dir:
         mkdir(output_dir)
 
     logger = setup_logger("maskrcnn_benchmark", output_dir, get_rank())
     logger.info("Using {} GPUs".format(num_gpus))
+    logger.info("Using random seed {} (base seed {}, rank {})".format(
+        process_seed, cfg.SEED, get_rank()
+    ))
     logger.info(args)
 
     logger.info("Collecting env info (might take some time)")
