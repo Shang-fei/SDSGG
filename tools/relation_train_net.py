@@ -69,6 +69,7 @@ def train(cfg, local_rank, distributed, logger):
     num_gpus = int(os.environ["WORLD_SIZE"]) if "WORLD_SIZE" in os.environ else 1
     num_batch = cfg.SOLVER.IMS_PER_BATCH
     optimizer = make_optimizer(cfg, model, logger, slow_heads=slow_heads, slow_ratio=10.0, rl_factor=float(num_batch))
+    ship_optimizer = make_ship_optimizer(cfg, model)
     scheduler = make_lr_scheduler(cfg, optimizer, logger)
     debug_print(logger, 'end optimizer and shcedule')
     # Initialize mixed-precision training
@@ -95,6 +96,9 @@ def train(cfg, local_rank, distributed, logger):
     if checkpointer.has_checkpoint():
         extra_checkpoint_data = checkpointer.load(cfg.MODEL.PRETRAINED_DETECTOR_CKPT, 
                                        update_schedule=cfg.SOLVER.UPDATE_SCHEDULE_DURING_LOAD)
+        ship_optimizer_state = extra_checkpoint_data.pop("ship_optimizer", None)
+        if ship_optimizer is not None and ship_optimizer_state is not None:
+            ship_optimizer.load_state_dict(ship_optimizer_state)
         arguments.update(extra_checkpoint_data)
     else:
         # load_mapping is only used when we init current model from detection model.
@@ -160,6 +164,8 @@ def train(cfg, local_rank, distributed, logger):
         meters.update(loss=losses_reduced, **loss_dict_reduced)
 
         optimizer.zero_grad()
+        if ship_optimizer is not None:
+            ship_optimizer.zero_grad()
         # Note: If mixed precision is not used, this ends up doing nothing
         # Otherwise apply loss scaling for mixed-precision recipe
 
@@ -171,6 +177,8 @@ def train(cfg, local_rank, distributed, logger):
         clip_grad_norm([(n, p) for n, p in model.named_parameters() if p.requires_grad], max_norm=cfg.SOLVER.GRAD_NORM_CLIP, logger=logger, verbose=verbose, clip=True)
 
         optimizer.step()
+        if ship_optimizer is not None:
+            ship_optimizer.step()
 
         batch_time = time.time() - end
         end = time.time()
@@ -199,9 +207,17 @@ def train(cfg, local_rank, distributed, logger):
             )
 
         if iteration % checkpoint_period == 0 and iteration>=12000:
-            checkpointer.save("model_{:07d}".format(iteration), **arguments)
+            checkpointer.save(
+                "model_{:07d}".format(iteration),
+                ship_optimizer=ship_optimizer.state_dict() if ship_optimizer is not None else None,
+                **arguments
+            )
         if iteration == max_iter :
-            checkpointer.save("model_final", **arguments)
+            checkpointer.save(
+                "model_final",
+                ship_optimizer=ship_optimizer.state_dict() if ship_optimizer is not None else None,
+                **arguments
+            )
 
         val_result = None # used for scheduler updating
         if cfg.SOLVER.TO_VAL and iteration % cfg.SOLVER.VAL_PERIOD == 0 and iteration>=8000:
