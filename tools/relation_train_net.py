@@ -111,25 +111,17 @@ def train(cfg, local_rank, distributed, logger):
         is_distributed=distributed,
         start_iter=arguments["iteration"],
     )
-    # DATASETS.VAL may intentionally point to a dataset catalog entry whose
-    # internal split is "test". In that case VGDataset reads TEST_PART while
-    # it is being built, so mirror VAL_PART into a local evaluation config.
-    val_cfg = cfg.clone()
-    val_cfg.defrost()
-    val_cfg.OV_SETTING.TEST_PART = cfg.OV_SETTING.VAL_PART
-    val_cfg.freeze()
-    val_data_loaders = make_data_loader(
-        val_cfg,
-        mode='val',
-        is_distributed=distributed,
-    )
+    test_data_loaders = None
+    if cfg.SOLVER.TO_VAL:
+        test_data_loaders = {
+            "novel": build_test_data_loaders(cfg, distributed, "novel"),
+            "base": build_test_data_loaders(cfg, distributed, "base"),
+        }
     debug_print(logger, 'end dataloader')
     checkpoint_period = cfg.SOLVER.CHECKPOINT_PERIOD
 
     if cfg.SOLVER.PRE_VAL:
-        logger.info("Validate before training")
-        #run_val(cfg, model, val_data_loaders, distributed, logger)
-        #run_test(cfg, model, distributed, logger)
+        logger.info("Evaluation before training is disabled")
 
     logger.info("Start training")
     meters = MetricLogger(delimiter="  ")
@@ -230,11 +222,17 @@ def train(cfg, local_rank, distributed, logger):
 
         val_result = None # used for scheduler updating
         if cfg.SOLVER.TO_VAL and iteration % cfg.SOLVER.VAL_PERIOD == 0:
-            logger.info("Start validating")
-            test_result = run_test(cfg, model, distributed, logger)
-            logger.info("Test Result: %.4f" % test_result)
-            val_result = run_val(cfg, model, val_data_loaders, distributed, logger)
-            logger.info("Validation Result: %.4f" % val_result)
+            logger.info("Start evaluating test-novel")
+            novel_result = run_test(
+                cfg, model, test_data_loaders["novel"], distributed, logger, "novel"
+            )
+            logger.info("Test Novel Result: %.4f" % novel_result)
+            logger.info("Start evaluating test-base")
+            base_result = run_test(
+                cfg, model, test_data_loaders["base"], distributed, logger, "base"
+            )
+            logger.info("Test Base Result: %.4f" % base_result)
+            val_result = base_result
             last_eval_iteration = iteration
 
              
@@ -264,102 +262,90 @@ def fix_eval_modules(eval_modules):
             param.requires_grad = False
         # DO NOT use module.eval(), otherwise the module will be in the test mode, i.e., all self.training condition is set to False
 
-def run_val(cfg, model, val_data_loaders, distributed, logger):
-    if distributed:
-        model = model.module
-    torch.cuda.empty_cache()
-    model.updata(cfg.OV_SETTING.VAL_PART)
-    iou_types = ("bbox",)
-    if cfg.MODEL.MASK_ON:
-        iou_types = iou_types + ("segm",)
-    if cfg.MODEL.KEYPOINT_ON:
-        iou_types = iou_types + ("keypoints",)
-    if cfg.MODEL.RELATION_ON:
-        iou_types = iou_types + ("relations", )
-    if cfg.MODEL.ATTRIBUTE_ON:
-        iou_types = iou_types + ("attributes", )
+def build_test_data_loaders(cfg, distributed, eval_part):
+    """Build test data once with GT filtered for one predicate subset."""
+    if eval_part not in {"base", "novel", "total", "semantic"}:
+        raise ValueError("Unsupported test predicate part: {}".format(eval_part))
 
-    dataset_names = cfg.DATASETS.VAL
-    val_result = []
-    
-    for dataset_name, val_data_loader in zip(dataset_names, val_data_loaders):
-        dataset_result = inference(
-                            cfg,
-                            model,
-                            val_data_loader,
-                            dataset_name=dataset_name,
-                            iou_types=iou_types,
-                            box_only=False if cfg.MODEL.RETINANET_ON else cfg.MODEL.RPN_ONLY,
-                            device=cfg.MODEL.DEVICE,
-                            expected_results=cfg.TEST.EXPECTED_RESULTS,
-                            expected_results_sigma_tol=cfg.TEST.EXPECTED_RESULTS_SIGMA_TOL,
-                            output_folder=None,
-                            logger=logger,
-                        )
-        synchronize()
-        val_result.append(dataset_result)
-    # support for multi gpu distributed testing
-    gathered_result = all_gather(torch.tensor(dataset_result).cpu())
-    gathered_result = [t.view(-1) for t in gathered_result]
-    gathered_result = torch.cat(gathered_result, dim=-1).view(-1)
-    valid_result = gathered_result[gathered_result>=0]
-    val_result = float(valid_result.mean())
-    del gathered_result, valid_result
-    torch.cuda.empty_cache()
-
-    model.updata(cfg.OV_SETTING.TRAIN_PART)
-    return val_result
-
-def run_test(cfg, model, distributed, logger):
-    if distributed:
-        model = model.module
-
-    torch.cuda.empty_cache()
-    model.updata(cfg.OV_SETTING.TEST_PART)
-    iou_types = ("bbox",)
-    if cfg.MODEL.MASK_ON:
-        iou_types = iou_types + ("segm",)
-    if cfg.MODEL.KEYPOINT_ON:
-        iou_types = iou_types + ("keypoints",)
-    if cfg.MODEL.RELATION_ON:
-        iou_types = iou_types + ("relations", )
-    if cfg.MODEL.ATTRIBUTE_ON:
-        iou_types = iou_types + ("attributes", )
-    output_folders = [None] * len(cfg.DATASETS.TEST)
-    
-    dataset_names = cfg.DATASETS.TEST
-    if cfg.OUTPUT_DIR:
-        for idx, dataset_name in enumerate(dataset_names):
-            output_folder = os.path.join(cfg.OUTPUT_DIR, "inference", dataset_name)
-            mkdir(output_folder)
-            output_folders[idx] = output_folder
-    data_loaders_val = make_data_loader(cfg, mode='test', is_distributed=distributed)
-    test_result = []
-    for output_folder, dataset_name, data_loader_val in zip(output_folders, dataset_names, data_loaders_val):
-        dataset_result = inference(
+    # VGDataset reads the process-global cfg during construction.
+    original_test_part = cfg.OV_SETTING.TEST_PART
+    cfg.defrost()
+    cfg.OV_SETTING.TEST_PART = eval_part
+    try:
+        return make_data_loader(
             cfg,
-            model,
-            data_loader_val,
-            dataset_name=dataset_name,
-            iou_types=iou_types,
-            box_only=False if cfg.MODEL.RETINANET_ON else cfg.MODEL.RPN_ONLY,
-            device=cfg.MODEL.DEVICE,
-            expected_results=cfg.TEST.EXPECTED_RESULTS,
-            expected_results_sigma_tol=cfg.TEST.EXPECTED_RESULTS_SIGMA_TOL,
-            output_folder=output_folder,
-            logger=logger,
+            mode="test",
+            is_distributed=distributed,
+        )
+    finally:
+        cfg.OV_SETTING.TEST_PART = original_test_part
+        cfg.freeze()
+
+
+def run_test(cfg, model, test_data_loaders, distributed, logger, eval_part):
+    if distributed:
+        model = model.module
+
+    torch.cuda.empty_cache()
+    model.updata(eval_part)
+
+    eval_cfg = cfg.clone()
+    eval_cfg.defrost()
+    eval_cfg.OV_SETTING.TEST_PART = eval_part
+    eval_cfg.freeze()
+
+    iou_types = ("bbox",)
+    if eval_cfg.MODEL.MASK_ON:
+        iou_types += ("segm",)
+    if eval_cfg.MODEL.KEYPOINT_ON:
+        iou_types += ("keypoints",)
+    if eval_cfg.MODEL.RELATION_ON:
+        iou_types += ("relations",)
+    if eval_cfg.MODEL.ATTRIBUTE_ON:
+        iou_types += ("attributes",)
+
+    dataset_names = eval_cfg.DATASETS.TEST
+    output_folders = [None] * len(dataset_names)
+    if eval_cfg.OUTPUT_DIR:
+        for index, dataset_name in enumerate(dataset_names):
+            output_folder = os.path.join(
+                eval_cfg.OUTPUT_DIR,
+                "inference",
+                eval_part,
+                dataset_name,
+            )
+            mkdir(output_folder)
+            output_folders[index] = output_folder
+
+    results = []
+    for output_folder, dataset_name, data_loader in zip(
+        output_folders, dataset_names, test_data_loaders
+    ):
+        results.append(
+            inference(
+                eval_cfg,
+                model,
+                data_loader,
+                dataset_name=dataset_name,
+                iou_types=iou_types,
+                box_only=False if eval_cfg.MODEL.RETINANET_ON else eval_cfg.MODEL.RPN_ONLY,
+                device=eval_cfg.MODEL.DEVICE,
+                expected_results=eval_cfg.TEST.EXPECTED_RESULTS,
+                expected_results_sigma_tol=eval_cfg.TEST.EXPECTED_RESULTS_SIGMA_TOL,
+                output_folder=output_folder,
+                logger=logger,
+            )
         )
         synchronize()
-        test_result.append(dataset_result)
-    gathered_result = all_gather(torch.tensor(test_result).cpu())
-    gathered_result = [t.view(-1) for t in gathered_result]
-    gathered_result = torch.cat(gathered_result, dim=-1).view(-1)
-    valid_result = gathered_result[gathered_result>=0]
-    test_result = float(valid_result.mean())
-    del gathered_result, valid_result
+
+    gathered = all_gather(torch.tensor(results).cpu())
+    gathered = torch.cat([value.view(-1) for value in gathered], dim=-1).view(-1)
+    valid = gathered[gathered >= 0]
+    result = float(valid.mean())
+    del gathered, valid
     torch.cuda.empty_cache()
     model.updata(cfg.OV_SETTING.TRAIN_PART)
-    return test_result
+    return result
 
 
 def main():
@@ -426,7 +412,17 @@ def main():
     model, final_eval_done = train(cfg, args.local_rank, args.distributed, logger)
 
     if not args.skip_test and not final_eval_done:
-        run_test(cfg, model, args.distributed, logger)
+        novel_loaders = build_test_data_loaders(cfg, args.distributed, "novel")
+        novel_result = run_test(
+            cfg, model, novel_loaders, args.distributed, logger, "novel"
+        )
+        logger.info("Test Novel Result: %.4f" % novel_result)
+
+        base_loaders = build_test_data_loaders(cfg, args.distributed, "base")
+        base_result = run_test(
+            cfg, model, base_loaders, args.distributed, logger, "base"
+        )
+        logger.info("Test Base Result: %.4f" % base_result)
 
 
 if __name__ == "__main__":
