@@ -11,6 +11,16 @@ from maskrcnn_benchmark.utils.comm import get_rank
 
 
 SHIP_INIT_STD = 0.02
+LOW_RECALL_NOVEL_RELATIONS = frozenset({
+    "across",
+    "along",
+    "and",
+    "laying on",
+    "mounted on",
+    "on back of",
+    "painted on",
+    "part of",
+})
 
 
 def _init_ship_layer(module):
@@ -429,7 +439,15 @@ class MTMShipBranch(nn.Module):
                               and str(self.teacher.text_filter.iloc[index][subject_name]) == name]
                 compatible = compatible or self.novel_relations
                 self.novel_candidates[subject_name] = compatible
-            predicate = compatible[int(torch.randint(len(compatible), (1,)).item())]
+            sampling_pool = compatible
+            if self.cfg.SHIP_LOW_RECALL_SAMPLING_ENABLED:
+                low_recall = [
+                    predicate for predicate in compatible
+                    if predicate in LOW_RECALL_NOVEL_RELATIONS
+                ]
+                if low_recall:
+                    sampling_pool = low_recall
+            predicate = sampling_pool[int(torch.randint(len(sampling_pool), (1,)).item())]
             predicates.append(predicate)
             texts.append(self.teacher.format_triplet(subject_name, predicate, object_name))
         return texts, sampled_subjects, sampled_objects, predicates
