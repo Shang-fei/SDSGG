@@ -1,8 +1,5 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved.
-import sys
 import os
-
-sys.path.append("../../../config")
 
 import torch
 import torch.nn as nn
@@ -17,7 +14,6 @@ from maskrcnn_benchmark.structures.boxlist_ops import boxlist_iou
 from maskrcnn_benchmark.modeling.utils import cat
 import pandas as pd
 
-from  defaults import PRDCS_BASE ,PRDCS_NOVEL,SEMAN,TRAIN_PART,DATA_OPTION
 curpath=os.path.dirname(__file__)
 
 
@@ -36,7 +32,9 @@ class RelationLossComputation(object):
         attribute_bgfg_ratio,
         use_label_smoothing,
         predicate_proportion,
-        device
+        device,
+        data_option,
+        train_part,
     ):
         """
         Arguments:
@@ -55,7 +53,14 @@ class RelationLossComputation(object):
             self.criterion_loss = Label_Smoothing_Regression(e=0.01)
         else:
             self.criterion_loss = nn.CrossEntropyLoss()
-        self.loss=Loss(gamma=2.0, alpha=1, size_average=True,device=device)
+        self.loss = Loss(
+            gamma=2.0,
+            alpha=1,
+            size_average=True,
+            device=device,
+            data_option=data_option,
+            train_part=train_part,
+        )
         #self.focal_loss=MultiCEFocalLoss(class_num=25,device=device)
 
     def __call__(self, proposals, rel_labels, relation_logits, refine_logits):
@@ -155,10 +160,10 @@ class RelationLossComputation(object):
 
 
 class Loss(nn.Module):
-    def __init__(self, gamma=0, alpha=None, size_average=True, device=None):
+    def __init__(self, gamma=0, alpha=None, size_average=True, device=None,
+                 data_option="vg", train_part="base"):
         super(Loss, self).__init__()
         self.gamma = gamma
-        global PRDCS_BASE,PRDCS_NOVEL,SEMAN,datamode
 
         self.alpha = alpha
         self.size_average = size_average
@@ -174,14 +179,16 @@ class Loss(nn.Module):
                         'to': 42, 'under': 43, 'using': 44, 'walking in': 45, 'walking on': 46, 'watching': 47,
                         'wearing': 48, 'wears': 49, 'with': 50}
 
-        if DATA_OPTION == "vg":
+        if data_option == "vg":
             self.base=[0,1, 3, 6, 7, 8, 9, 10, 11, 12, 13, 16, 17, 19, 20, 21, 22, 23, 25, 27, 29, 30, 31, 33, 35, 37, 38, 40, 41, 42, 43, 46, 47, 48, 49, 50]
-        elif DATA_OPTION == "gqa":
+        elif data_option == "gqa":
             self.base = [0, 31, 48, 30, 29, 22, 8, 23, 21, 1, 50, 40, 43, 38, 41, 11, 46, 6, 13, 35, 47, 12]  # gqa
+        else:
+            raise ValueError("Unsupported OV data option: {}".format(data_option))
 
-        if TRAIN_PART=="base":
+        if train_part=="base":
             self.description_relation_loss = self.description_relation_loss.iloc[self.base, 1:]
-        elif TRAIN_PART=="total":
+        elif train_part=="total":
             self.description_relation_loss = self.description_relation_loss.iloc[:, 1:]
 
 
@@ -269,7 +276,9 @@ def make_roi_relation_loss_evaluator(cfg):
         cfg.MODEL.ROI_ATTRIBUTE_HEAD.ATTRIBUTE_BGFG_RATIO,
         cfg.MODEL.ROI_RELATION_HEAD.LABEL_SMOOTHING_LOSS,
         cfg.MODEL.ROI_RELATION_HEAD.REL_PROP,
-        cfg.MODEL.DEVICE
+        cfg.MODEL.DEVICE,
+        cfg.OV_SETTING.DATA_OPTION,
+        cfg.OV_SETTING.TRAIN_PART,
     )
 
     return loss_evaluator

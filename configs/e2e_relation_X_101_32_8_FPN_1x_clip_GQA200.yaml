@@ -105,6 +105,10 @@ DATASETS:
   TRAIN: ("GQA_200_train",)
   VAL: ("GQA_200_val",)
   TEST: ("GQA_200_test",)
+OV_SETTING:
+  DATA_OPTION: "gqa"
+  PRDCS_BASE: ["above", "at", "behind", "carrying", "covered in", "covering", "holding", "in", "in front of", "near", "of", "on", "parked on", "riding", "sitting on", "standing on", "under", "walking on", "watching", "wearing", "with"]
+  PRDCS_NOVEL: ["attached to", "eating", "flying in", "growing on", "hanging from", "looking at", "lying on", "mounted on", "using", "walking in"]
 DATALOADER:
   SIZE_DIVISIBILITY: 32
 SOLVER:

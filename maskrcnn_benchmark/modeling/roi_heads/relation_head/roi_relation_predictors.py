@@ -233,13 +233,25 @@ class GQAClipPredictor(nn.Module):
 
         self.base=[0,31, 48, 30, 29, 22, 8, 23, 21, 1, 50, 40, 43, 38, 41, 11, 46, 6, 13, 35, 47, 12]
         self.novel=[0,26, 14, 25, 15, 19, 44, 45, 18, 28, 7]
+        self.relNames = [
+            '__background__', 'above', 'across', 'against', 'along', 'and', 'at',
+            'attached to', 'behind', 'belonging to', 'between', 'carrying',
+            'covered in', 'covering', 'eating', 'flying in', 'for', 'from',
+            'growing on', 'hanging from', 'has', 'holding', 'in', 'in front of',
+            'laying on', 'looking at', 'lying on', 'made of', 'mounted on', 'near',
+            'of', 'on', 'on back of', 'over', 'painted on', 'parked on', 'part of',
+            'playing', 'riding', 'says', 'sitting on', 'standing on', 'to', 'under',
+            'using', 'walking in', 'walking on', 'watching', 'wearing', 'wears', 'with',
+        ]
 
         mode="base"
 
         if mode=="base":
             self.description_relation = self.description_relation.iloc[self.base, 1:]
+            self.prompt = [self.relNames[index] for index in self.base]
         elif mode=="novel":
             self.description_relation = self.description_relation.iloc[self.novel, 1:]
+            self.prompt = [self.relNames[index] for index in self.novel]
 
         self.description_relation=self.description_relation.applymap(lambda x: [int(s) for s in x.split(',')])
         self.description_relation=np.array(self.description_relation)
@@ -264,15 +276,11 @@ class GQAClipPredictor(nn.Module):
             text_features4 = self.clip_model.encode_text(text4)
             self.text_features4=text_features4
 
-            self.texts5=[]
-
-            for obj in self.obj_names:
-                text5 = clip.tokenize(["a photo of " + tex for tex in list(self.prompt)]).to(
-                    self.device)
-                text_features5 = self.clip_model.encode_text(text5)
-                text_features5 = text_features5
-                self.texts5.append(text_features5.detach().cpu().numpy())
-            self.fixedTextFeatures5 = torch.Tensor(self.texts5[2]).to(self.device).half()
+            text5 = clip.tokenize(["a photo of " + text for text in self.prompt]).to(self.device)
+            text_features5 = self.clip_model.encode_text(text5)
+            text_features5_cpu = text_features5.detach().cpu().numpy()
+            self.texts5 = [text_features5_cpu] * len(self.obj_names)
+            self.fixedTextFeatures5 = text_features5.detach().half()
 
         b=time.time()
         print('init complete : '+str(b-a))
@@ -285,16 +293,7 @@ class GQAClipPredictor(nn.Module):
         self.mtmInferenceWeight = mtmConfig.INFERENCE_WEIGHT
         self.mtm_branch = None
         if self.mtmEnabled:
-            self.mtmRelNames = [
-                '__background__', 'above', 'across', 'against', 'along', 'and', 'at',
-                'attached to', 'behind', 'belonging to', 'between', 'carrying',
-                'covered in', 'covering', 'eating', 'flying in', 'for', 'from',
-                'growing on', 'hanging from', 'has', 'holding', 'in', 'in front of',
-                'laying on', 'looking at', 'lying on', 'made of', 'mounted on', 'near',
-                'of', 'on', 'on back of', 'over', 'painted on', 'parked on', 'part of',
-                'playing', 'riding', 'says', 'sitting on', 'standing on', 'to', 'under',
-                'using', 'walking in', 'walking on', 'watching', 'wearing', 'wears', 'with',
-            ]
+            self.mtmRelNames = self.relNames
             self.mtmTextFilter = pd.read_csv(curpath + "/filter_total.csv").iloc[:, 1:]
             self.mtmActiveIndices = list(self.base)
             self.mtmActiveRelNames = [self.mtmRelNames[index] for index in self.mtmActiveIndices]
@@ -327,8 +326,10 @@ class GQAClipPredictor(nn.Module):
             curpath+"/description_relation_loss.csv")
         if mode=="base":
             self.description_relation = self.description_relation.iloc[self.base, 1:]
+            self.prompt = [self.relNames[index] for index in self.base]
         elif mode=="novel":
             self.description_relation = self.description_relation.iloc[self.novel, 1:]
+            self.prompt = [self.relNames[index] for index in self.novel]
 
         self.description_relation=self.description_relation.applymap(lambda x: [int(s) for s in x.split(',')])
         self.description_relation=np.array(self.description_relation)
@@ -336,15 +337,11 @@ class GQAClipPredictor(nn.Module):
         self.description_relation=torch.Tensor(self.description_relation).to(self.device)
 
         with torch.no_grad():
-            self.texts5=[]
-
-            for obj in self.obj_names:
-                text5 = clip.tokenize(["a photo of " + tex for tex in list(self.prompt)]).to(
-                    self.device)
-                text_features5 = self.clip_model.encode_text(text5)
-                text_features5 = text_features5
-                self.texts5.append(text_features5.detach().cpu().numpy())
-            self.fixedTextFeatures5 = torch.Tensor(self.texts5[2]).to(self.device).half()
+            text5 = clip.tokenize(["a photo of " + text for text in self.prompt]).to(self.device)
+            text_features5 = self.clip_model.encode_text(text5)
+            text_features5_cpu = text_features5.detach().cpu().numpy()
+            self.texts5 = [text_features5_cpu] * len(self.obj_names)
+            self.fixedTextFeatures5 = text_features5.detach().half()
 
         if self.mtm_branch is not None:
             if mode == "base":

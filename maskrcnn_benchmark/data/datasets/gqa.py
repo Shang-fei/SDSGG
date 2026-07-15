@@ -142,7 +142,7 @@ class GQADataset(torch.utils.data.Dataset):
 
     def _filter_labels(self, obj_names, prdc_names, split):
         # class name and idx mapping
-        obj_names = set(obj_names + ['__background__'])
+        obj_names = set(list(obj_names) + ['__background__'])
         new_ind_to_classes = []
         obj_idx_map = {}
         for i in range(len(self.ind_to_classes)):
@@ -153,7 +153,7 @@ class GQADataset(torch.utils.data.Dataset):
             if name not in self.ind_to_classes:
                 new_ind_to_classes.append(name)
 
-        prdc_names = set(prdc_names + ['__background__'])
+        prdc_names = set(list(prdc_names) + ['__background__'])
         new_ind_to_predicates = []
         prdc_idx_map = {}
         for i in range(len(self.ind_to_predicates)):
@@ -218,10 +218,18 @@ class GQADataset(torch.utils.data.Dataset):
         self.categories = {i: self.ind_to_classes[i] for i in range(len(self.ind_to_classes))}
 
     def _set_base(self):
-        self._filter_labels(cfg.OV_SETTING.OBJS_BASE, cfg.OV_SETTING.PRDCS_BASE, self.split)
+        self._filter_labels(
+            list(cfg.OV_SETTING.OBJS_BASE) + ['obj'],
+            cfg.OV_SETTING.PRDCS_BASE,
+            self.split,
+        )
 
     def _set_novel(self):
-        self._filter_labels(cfg.OV_SETTING.OBJS_NOVEL, cfg.OV_SETTING.PRDCS_NOVEL, self.split)
+        self._filter_labels(
+            list(cfg.OV_SETTING.OBJS_NOVEL) + ['obj'],
+            cfg.OV_SETTING.PRDCS_NOVEL,
+            self.split,
+        )
 
     def _change_part(self):
         if self.split == 'train':
