@@ -243,6 +243,14 @@ class GQAClipPredictor(nn.Module):
             'playing', 'riding', 'says', 'sitting on', 'standing on', 'to', 'under',
             'using', 'walking in', 'walking on', 'watching', 'wearing', 'wears', 'with',
         ]
+        expected_base = {self.relNames[index] for index in self.base[1:]}
+        expected_novel = {self.relNames[index] for index in self.novel[1:]}
+        assert set(config.OV_SETTING.PRDCS_BASE) == expected_base, (
+            "GQA PRDCS_BASE must match the predictor's fixed 21-class split"
+        )
+        assert set(config.OV_SETTING.PRDCS_NOVEL) == expected_novel, (
+            "GQA PRDCS_NOVEL must match the predictor's fixed 10-class split"
+        )
 
         mode="base"
 

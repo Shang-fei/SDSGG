@@ -77,9 +77,6 @@ MODEL:
     #PREDICTOR: "VCTreePredictor"
     #PREDICTOR: "TransformerPredictor"
     PREDICTOR: "GQAClipPredictor"
-    MTM:
-      ENABLED: False
-      SHIP_LOW_RECALL_SAMPLING_ENABLED: False
     ################# Parameters for Motif Predictor ##################
     CONTEXT_OBJ_LAYER: 1
     CONTEXT_REL_LAYER: 1
