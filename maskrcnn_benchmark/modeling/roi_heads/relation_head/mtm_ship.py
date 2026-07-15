@@ -72,7 +72,12 @@ class TripletTextTeacher(nn.Module):
         chunk = []
         names = self.object_names[1:] if len(self.object_names) > 1 else self.object_names
         for subject in names:
-            for predicate in list(self.text_filter[subject]):
+            predicates = (
+                list(self.text_filter[subject])
+                if subject in self.text_filter.columns
+                else self.relation_names
+            )
+            for predicate in predicates:
                 if predicate == "__background__":
                     continue
                 for object_ in names:
@@ -145,7 +150,11 @@ class TripletTextTeacher(nn.Module):
             subject_labels.detach().cpu().tolist(), object_labels.detach().cpu().tolist()
         ):
             subject_name = self.object_names[int(subject)]
-            candidate_relations = tuple(inference_filter[subject_name])
+            candidate_relations = (
+                tuple(inference_filter[subject_name])
+                if subject_name in inference_filter.columns
+                else tuple(active_relations)
+            )
             key = (int(subject), int(object_), candidate_relations)
             if key not in self.filtered_cache:
                 object_name = self.object_names[key[1]]
@@ -434,9 +443,11 @@ class MTMShipBranch(nn.Module):
             object_name = self.teacher.object_names[int(object_)]
             compatible = self.novel_candidates.get(subject_name)
             if compatible is None:
-                compatible = [name for index, name in self.novel_relation_entries
-                              if index < len(self.teacher.text_filter)
-                              and str(self.teacher.text_filter.iloc[index][subject_name]) == name]
+                compatible = []
+                if subject_name in self.teacher.text_filter.columns:
+                    compatible = [name for index, name in self.novel_relation_entries
+                                  if index < len(self.teacher.text_filter)
+                                  and str(self.teacher.text_filter.iloc[index][subject_name]) == name]
                 compatible = compatible or self.novel_relations
                 self.novel_candidates[subject_name] = compatible
             sampling_pool = compatible

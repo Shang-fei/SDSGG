@@ -277,6 +277,50 @@ class GQAClipPredictor(nn.Module):
         print('init complete : '+str(b-a))
         self.linear1=nn.Linear(1024,512, bias=False).to(self.device).half()
 
+        mtmConfig = config.MODEL.ROI_RELATION_HEAD.MTM
+        self.mtmEnabled = mtmConfig.ENABLED
+        self.mtmTrainEnabled = mtmConfig.ENABLED and mtmConfig.TRAIN_ENABLED
+        self.mtmInferenceEnabled = mtmConfig.ENABLED and mtmConfig.INFERENCE_ENABLED
+        self.mtmInferenceWeight = mtmConfig.INFERENCE_WEIGHT
+        self.mtm_branch = None
+        if self.mtmEnabled:
+            self.mtmRelNames = [
+                '__background__', 'above', 'across', 'against', 'along', 'and', 'at',
+                'attached to', 'behind', 'belonging to', 'between', 'carrying',
+                'covered in', 'covering', 'eating', 'flying in', 'for', 'from',
+                'growing on', 'hanging from', 'has', 'holding', 'in', 'in front of',
+                'laying on', 'looking at', 'lying on', 'made of', 'mounted on', 'near',
+                'of', 'on', 'on back of', 'over', 'painted on', 'parked on', 'part of',
+                'playing', 'riding', 'says', 'sitting on', 'standing on', 'to', 'under',
+                'using', 'walking in', 'walking on', 'watching', 'wearing', 'wears', 'with',
+            ]
+            self.mtmTextFilter = pd.read_csv(curpath + "/filter_total.csv").iloc[:, 1:]
+            self.mtmActiveIndices = list(self.base)
+            self.mtmActiveRelNames = [self.mtmRelNames[index] for index in self.mtmActiveIndices]
+            self.mtmInferenceFilter = self.mtmTextFilter.iloc[self.mtmActiveIndices]
+            self._validate_mtm_relation_order()
+            for param in self.clip_model.parameters():
+                param.requires_grad_(False)
+            self.mtm_branch = MTMShipBranch(
+                mtmConfig,
+                self.clip_model,
+                self.obj_names,
+                self.mtmRelNames,
+                self.mtmActiveRelNames,
+                self.base,
+                self.novel,
+                self.mtmTextFilter,
+                self.mtmInferenceFilter,
+                self.device,
+                config.OUTPUT_DIR,
+            ).to(self.device)
+
+    def _validate_mtm_relation_order(self):
+        expected = [self.mtmRelNames[index] for index in self.mtmActiveIndices]
+        assert self.mtmActiveRelNames == expected
+        assert self.mtmInferenceFilter.index.tolist() == self.mtmActiveIndices
+        assert len(self.mtmActiveRelNames) == self.description_relation.size(0)
+
     def updata(self,mode):
         self.description_relation = pd.read_csv(
             curpath+"/description_relation_loss.csv")
@@ -300,6 +344,19 @@ class GQAClipPredictor(nn.Module):
                 text_features5 = text_features5
                 self.texts5.append(text_features5.detach().cpu().numpy())
 
+        if self.mtm_branch is not None:
+            if mode == "base":
+                active_indices = self.base
+            elif mode == "novel":
+                active_indices = self.novel
+            else:
+                raise ValueError("Unsupported GQA predicate evaluation mode: {}".format(mode))
+            self.mtmActiveIndices = list(active_indices)
+            self.mtmActiveRelNames = [self.mtmRelNames[index] for index in self.mtmActiveIndices]
+            self.mtmInferenceFilter = self.mtmTextFilter.iloc[self.mtmActiveIndices]
+            self._validate_mtm_relation_order()
+            self.mtm_branch.set_mode(self.mtmActiveRelNames, self.mtmInferenceFilter)
+
     def forward(self, proposals, rel_pair_idxs, rel_labels, rel_binarys, roi_features, union_features, logger=None,img=None):
         # Returns:
         #     obj_dists (list[Tensor]): logits of object label distribution
@@ -317,6 +374,21 @@ class GQAClipPredictor(nn.Module):
         num_objs = [len(b) for b in proposals]
         assert len(num_rels) == len(num_objs)
         obj_preds = obj_preds.split(num_objs, dim=0)
+
+        mtm_output = {"scores": [None] * len(num_rels), "losses": {}}
+        run_mtm = (
+            self.mtm_branch is not None
+            and ((self.training and self.mtmTrainEnabled)
+                 or (not self.training and self.mtmInferenceEnabled and self.mtmInferenceWeight != 0))
+        )
+        if run_mtm:
+            mtm_output = self.mtm_branch(
+                img,
+                proposals,
+                rel_pair_idxs,
+                rel_labels,
+                obj_preds,
+            )
 
         rel_dists=[]
         for i in range(len(num_rels)):
@@ -385,6 +457,16 @@ class GQAClipPredictor(nn.Module):
 
             rel_dist_per_batch=torch.cat(rel_dist_per_batch)
 
+            if not self.training and self.mtmInferenceEnabled and self.mtmInferenceWeight != 0:
+                mtm_scores = mtm_output["scores"][i]
+                if mtm_scores is not None:
+                    assert mtm_scores.size(1) == rel_dist_per_batch.size(1)
+                    assert mtm_scores.size(1) == len(self.mtmActiveRelNames)
+                    rel_dist_per_batch = rel_dist_per_batch + self.mtmInferenceWeight * mtm_scores.to(
+                        device=rel_dist_per_batch.device,
+                        dtype=rel_dist_per_batch.dtype,
+                    )
+
             rel_dists.append(rel_dist_per_batch)
 
 
@@ -393,6 +475,9 @@ class GQAClipPredictor(nn.Module):
         rel_dists = tuple(rel_dists)
 
         add_losses = {}
+
+        if self.training and self.mtmTrainEnabled:
+            add_losses.update(mtm_output["losses"])
 
 
         return obj_dists, rel_dists, add_losses

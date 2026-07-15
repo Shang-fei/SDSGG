@@ -336,7 +336,7 @@ _C.MODEL.ROI_RELATION_HEAD.CAUSAL.SPATIAL_FOR_VISION = False
 
 _C.MODEL.ROI_RELATION_HEAD.CAUSAL.EFFECT_TYPE = 'none' # 'TDE', 'TIE', 'TE'
 
-# Relation-preserving modality transfer auxiliary branch for ClipPredictor.
+# Relation-preserving modality transfer auxiliary branch shared by CLIP predictors.
 _C.MODEL.ROI_RELATION_HEAD.MTM = CN()
 # Core MTM
 _C.MODEL.ROI_RELATION_HEAD.MTM.ENABLED = True
