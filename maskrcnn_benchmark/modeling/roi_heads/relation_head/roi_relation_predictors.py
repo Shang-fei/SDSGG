@@ -299,6 +299,7 @@ class GQAClipPredictor(nn.Module):
         self.mtmTrainEnabled = mtmConfig.ENABLED and mtmConfig.TRAIN_ENABLED
         self.mtmInferenceEnabled = mtmConfig.ENABLED and mtmConfig.INFERENCE_ENABLED
         self.mtmInferenceWeight = mtmConfig.INFERENCE_WEIGHT
+        self.gqaDatasetRelNames = list(rel_classes)
         self.mtm_branch = None
         if self.mtmEnabled:
             self.mtmRelNames = self.relNames
@@ -328,6 +329,10 @@ class GQAClipPredictor(nn.Module):
         assert self.mtmActiveRelNames == expected
         assert self.mtmInferenceFilter.index.tolist() == self.mtmActiveIndices
         assert len(self.mtmActiveRelNames) == self.description_relation.size(0)
+        if self.mtmActiveIndices == list(self.base):
+            assert self.gqaDatasetRelNames == self.mtmActiveRelNames, (
+                "GQA training relation labels and MTM base score columns are not aligned"
+            )
 
     def updata(self,mode):
         self.description_relation = pd.read_csv(
