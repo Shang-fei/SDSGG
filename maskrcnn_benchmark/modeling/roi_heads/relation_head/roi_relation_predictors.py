@@ -272,6 +272,7 @@ class GQAClipPredictor(nn.Module):
                 text_features5 = self.clip_model.encode_text(text5)
                 text_features5 = text_features5
                 self.texts5.append(text_features5.detach().cpu().numpy())
+            self.fixedTextFeatures5 = torch.Tensor(self.texts5[2]).to(self.device).half()
 
         b=time.time()
         print('init complete : '+str(b-a))
@@ -343,6 +344,7 @@ class GQAClipPredictor(nn.Module):
                 text_features5 = self.clip_model.encode_text(text5)
                 text_features5 = text_features5
                 self.texts5.append(text_features5.detach().cpu().numpy())
+            self.fixedTextFeatures5 = torch.Tensor(self.texts5[2]).to(self.device).half()
 
         if self.mtm_branch is not None:
             if mode == "base":
@@ -405,57 +407,61 @@ class GQAClipPredictor(nn.Module):
                 image_features = torch.cat(image_features)
                 image_features = self.clip_model.encode_image(image_features)
 
-            for la_count,rel_index in enumerate(rel_pair_idxs[i]):
+            pair_idx = rel_pair_idxs[i].long()
+            if pair_idx.numel() == 0:
+                if self.adaper_clip1.training:
+                    rel_dist_per_batch = image_features.new_zeros((0, 2, self.text_features1.size(0)))
+                else:
+                    rel_dist_per_batch = image_features.new_zeros((0, self.description_relation.size(0)))
+            else:
+                sub_idx = pair_idx[:, 0]
+                obj_idx = pair_idx[:, 1]
+                obj_n1 = obj_preds[i].index_select(0, sub_idx).long()
+                obj_n2 = obj_preds[i].index_select(0, obj_idx).long()
 
-                obj_n1,obj_n2=obj_preds[i][rel_index[0]],obj_preds[i][rel_index[1]]
+                text_features1 = self.text_features1
+                text_features2 = self.text_features2
+                text1_norm = text_features1 / text_features1.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+                text2_norm = text_features2 / text_features2.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+                sub_features = image_features.index_select(0, sub_idx)
+                obj_features = image_features.index_select(0, obj_idx)
+                text_sub = self.text_features3.index_select(0, obj_n1)
+                text_obj = self.text_features4.index_select(0, obj_n2)
 
-                text_features1=self.text_features1
-                text_features2=self.text_features2
-
-                text_sub=self.text_features3[obj_n1]
-                text_obj=self.text_features4[obj_n2]
-                cross_output1=self.adaper_clip1(image_features[rel_index[0]].unsqueeze(0),image_features[rel_index[1]].unsqueeze(0),text_sub)
-                cross_output2=self.adaper_clip2(image_features[rel_index[1]].unsqueeze(0),image_features[rel_index[0]].unsqueeze(0),text_obj)
-
-                cross_output=(cross_output1+cross_output2)/2
-
-                similarity1 = ((cross_output/ cross_output.norm(dim=-1, keepdim=True)) @ (text_features1/text_features1.norm(dim=-1, keepdim=True)).T)
-
-                similarity2 = ((cross_output/ cross_output.norm(dim=-1, keepdim=True)) @ (text_features2/text_features2.norm(dim=-1, keepdim=True)).T)
-
+                cross_output1 = self.adaper_clip1(sub_features, obj_features, text_sub)
+                cross_output2 = self.adaper_clip2(obj_features, sub_features, text_obj)
+                cross_output = (cross_output1 + cross_output2) / 2
+                cross_norm = cross_output / cross_output.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+                similarity1 = cross_norm @ text1_norm.t()
+                similarity2 = cross_norm @ text2_norm.t()
 
                 if self.adaper_clip1.training:
-
-                    probs=(similarity1-similarity2)/0.05
-                    image_features_clip=(image_features[rel_index[0]][0].unsqueeze(0)+image_features[rel_index[1]][0].unsqueeze(0))/2
-                    similarit_origin_1=((image_features_clip/image_features_clip.norm(dim=-1, keepdim=True)) @
-                                 (text_features1/text_features1.norm(dim=-1, keepdim=True)).T)
-
-                    similarit_origin_2 = ((image_features_clip / image_features_clip.norm(dim=-1, keepdim=True)) @
-                                   (text_features2 / text_features2.norm(dim=-1, keepdim=True)).T)
-                    similarit_origin=(similarit_origin_1-similarit_origin_2)/0.05
-
-                    probs=torch.cat([probs,similarit_origin]).unsqueeze(0)
-
-
+                    probs = (similarity1 - similarity2) / 0.05
+                    image_features_clip = (sub_features[:, 0, :] + obj_features[:, 0, :]) / 2
+                    image_features_clip = image_features_clip / image_features_clip.norm(
+                        dim=-1, keepdim=True
+                    ).clamp(min=1e-6)
+                    similarit_origin_1 = image_features_clip @ text1_norm.t()
+                    similarit_origin_2 = image_features_clip @ text2_norm.t()
+                    similarit_origin = (similarit_origin_1 - similarit_origin_2) / 0.05
+                    rel_dist_per_batch = torch.stack([probs, similarit_origin], dim=1)
                 else:
-                    similarity_delta=(similarity1-similarity2)/0.05
+                    similarity_delta = (similarity1 - similarity2) / 0.05
+                    description_relation = self.description_relation[:, 2].unsqueeze(0)
+                    description_scores = (
+                        description_relation * similarity_delta.unsqueeze(1)
+                    ).sum(-1)
 
-                    probs=self.description_relation[:,2]*(similarity_delta)
-
-                    probs = (probs.sum(-1) ).unsqueeze(0)
-
-                    text_features5 = torch.Tensor(self.texts5[2]).to(self.device).half()
-                    similarity31 = ((image_features[rel_index[0]][0].unsqueeze(0)/image_features[rel_index[0]][0].unsqueeze(0).norm(dim=-1, keepdim=True)) @ (text_features5/text_features5.norm(dim=-1, keepdim=True)).T/0.05)
-                    similarity32 = ((image_features[rel_index[1]][0].unsqueeze(0)/image_features[rel_index[1]][0].unsqueeze(0).norm(dim=-1, keepdim=True)) @ (text_features5/text_features5.norm(dim=-1, keepdim=True)).T/0.05)
-                    similarity3=(similarity31+similarity32)/2
-
-                    probs=probs*0.2+similarity3*0.8
-
-
-                rel_dist_per_batch.append(probs)
-
-            rel_dist_per_batch=torch.cat(rel_dist_per_batch)
+                    text_features5 = self.fixedTextFeatures5
+                    text5_norm = text_features5 / text_features5.norm(
+                        dim=-1, keepdim=True
+                    ).clamp(min=1e-6)
+                    sub_cls = sub_features[:, 0, :]
+                    obj_cls = obj_features[:, 0, :]
+                    sub_cls = sub_cls / sub_cls.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+                    obj_cls = obj_cls / obj_cls.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+                    similarity3 = ((sub_cls @ text5_norm.t()) + (obj_cls @ text5_norm.t())) / 2 / 0.05
+                    rel_dist_per_batch = description_scores * 0.2 + similarity3 * 0.8
 
             if not self.training and self.mtmInferenceEnabled and self.mtmInferenceWeight != 0:
                 mtm_scores = mtm_output["scores"][i]
