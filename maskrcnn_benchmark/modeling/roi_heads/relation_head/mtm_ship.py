@@ -303,31 +303,71 @@ class MTMDebugWriter:
     def _format_stats(features):
         return "/".join("{:.4f}".format(value) for value in MTMDebugWriter._stats(features))
 
-    def write(self, step, base, novel=None):
+    @staticmethod
+    def _format_sampling(names, counts, difficulty=None, topk=5):
+        counts = counts.detach().cpu()
+        total = int(counts.sum().item())
+        coverage = int((counts > 0).sum().item())
+        count = min(int(topk), len(names))
+        if total > 0 and count > 0:
+            values, indices = torch.topk(counts, count)
+            top = ",".join(
+                "{}:{}".format(names[int(index)], int(value))
+                for value, index in zip(values.tolist(), indices.tolist())
+                if value > 0
+            )
+        else:
+            top = "-"
+        result = "total={}/seen={}/{}/top={}".format(total, coverage, len(names), top)
+        if difficulty is not None and count > 0:
+            difficulty = difficulty.detach().cpu()
+            values, indices = torch.topk(difficulty, count)
+            hard = ",".join(
+                "{}:{:.3f}".format(names[int(index)], float(value))
+                for value, index in zip(values.tolist(), indices.tolist())
+            )
+            result += "/hard={}".format(hard)
+        return result
+
+    def write(self, step, base, novel=None, sampling=None):
         if not self.enabled or get_rank() != 0 or step % self.interval != 0:
             return
+        sampling = sampling or {}
+        base_sampling = self._format_sampling(
+            sampling.get("base_names", []),
+            sampling.get("base_counts", torch.zeros(0)),
+            sampling.get("base_difficulty"),
+        )
         lines = [
             "i={} base raw={} h={} q={} t={} align(pos/neg)={:.4f}/{:.4f} "
-            "err(v/t)={:.4f}/{:.4f} recon={:.4f} kl={:.4f} norm(raw/h)={:.3f}/{:.3f}".format(
+            "err(v/t)={:.4f}/{:.4f} recon={:.4f} kl={:.4f} norm(raw/h)={:.3f}/{:.3f} "
+            "sample_global({})".format(
                 step, self._format_stats(base["raw"]), self._format_stats(base["h"]),
                 self._format_stats(base["q"]), self._format_stats(base["t"]),
                 base["align_pos"], base["align_neg"], base["visual_error"], base["text_error"],
                 base["recon"], base["kl"], base["raw"].norm(dim=-1).mean().item(),
-                base["h"].norm(dim=-1).mean().item(),
+                base["h"].norm(dim=-1).mean().item(), base_sampling,
             )
         ]
+        novel_sampling = self._format_sampling(
+            sampling.get("novel_names", []),
+            sampling.get("novel_counts", torch.zeros(0)),
+        )
         if novel is not None and novel["raw"].size(0) > 0:
             nearest = (F.normalize(novel["raw"], dim=-1) @ F.normalize(base["raw"], dim=-1).t()).max(dim=1)[0].mean().item()
             lines.append(
                 "i={} novel raw={} h={} q={} t={} align={:.4f} nearest_base={:.4f} "
-                "err(v/t)={:.4f}/{:.4f} ramp={:.3f} n={} norm(raw/h)={:.3f}/{:.3f}".format(
+                "err(v/t)={:.4f}/{:.4f} ramp={:.3f} n={} norm(raw/h)={:.3f}/{:.3f} "
+                "sample_global({})".format(
                     step, self._format_stats(novel["raw"]), self._format_stats(novel["h"]),
                     self._format_stats(novel["q"]), self._format_stats(novel["t"]), novel["align"],
                     nearest, novel["visual_error"], novel["text_error"], novel["ramp"],
                     novel["raw"].size(0), novel["raw"].norm(dim=-1).mean().item(),
-                    novel["h"].norm(dim=-1).mean().item(),
+                    novel["h"].norm(dim=-1).mean().item(), novel_sampling,
                 )
             )
+        else:
+            lines.append("i={} novel sample_global({})".format(step, novel_sampling))
         directory = os.path.dirname(self.path)
         if directory:
             os.makedirs(directory, exist_ok=True)
@@ -346,10 +386,21 @@ class MTMShipBranch(nn.Module):
         self.active_relations = active_relations
         self.base_indices = base_indices
         self.novel_indices = novel_indices
+        self.base_relation_entries = [
+            (index, relation_names[index]) for index in base_indices if index != 0
+        ]
+        self.base_relations = [name for _, name in self.base_relation_entries]
+        self.base_relation_to_slot = {
+            name: slot for slot, name in enumerate(self.base_relations)
+        }
+        self.base_candidates = {}
         self.novel_relation_entries = [
             (index, relation_names[index]) for index in novel_indices if index != 0
         ]
         self.novel_relations = [name for _, name in self.novel_relation_entries]
+        self.novel_relation_to_slot = {
+            name: slot for slot, name in enumerate(self.novel_relations)
+        }
         self.novel_candidates = {}
         self.inference_filter = inference_filter
         self.teacher = TripletTextTeacher(
@@ -365,6 +416,24 @@ class MTMShipBranch(nn.Module):
         )
         self.debug = MTMDebugWriter(cfg.DEBUG_ENABLED, cfg.DEBUG_INTERVAL, output_dir, cfg.DEBUG_FILE)
         self.register_buffer("training_step", torch.zeros((), dtype=torch.long))
+        self.register_buffer(
+            "base_difficulty_ema", torch.zeros(len(self.base_relations), dtype=torch.float32)
+        )
+        self.register_buffer(
+            "base_difficulty_updates", torch.zeros(len(self.base_relations), dtype=torch.long)
+        )
+        self.register_buffer(
+            "base_sample_counts", torch.zeros(len(self.base_relations), dtype=torch.long)
+        )
+        self.register_buffer(
+            "novel_sample_counts", torch.zeros(len(self.novel_relations), dtype=torch.long)
+        )
+        if not 0.0 <= float(cfg.SHIP_BASE_DIFFICULTY_MIX) <= 1.0:
+            raise ValueError("SHIP_BASE_DIFFICULTY_MIX must be in [0, 1]")
+        if not 0.0 <= float(cfg.SHIP_BASE_DIFFICULTY_EMA) < 1.0:
+            raise ValueError("SHIP_BASE_DIFFICULTY_EMA must be in [0, 1)")
+        if float(cfg.SHIP_BASE_DIFFICULTY_TEMPERATURE) <= 0.0:
+            raise ValueError("SHIP_BASE_DIFFICULTY_TEMPERATURE must be positive")
 
     def set_mode(self, active_relations, inference_filter):
         self.active_relations = active_relations
@@ -431,6 +500,92 @@ class MTMShipBranch(nn.Module):
         negative = F.relu(similarities[mask] - float(self.cfg.ALIGN_NEG_MARGIN)).mean()
         return positive + float(self.cfg.ALIGN_NEG_WEIGHT) * negative, positive, negative
 
+    @torch.no_grad()
+    def _update_base_difficulty(self, predicates, errors):
+        if not self.base_relations or errors.numel() == 0:
+            return
+        slots = torch.tensor(
+            [self.base_relation_to_slot.get(predicate, -1) for predicate in predicates],
+            device=errors.device,
+            dtype=torch.long,
+        )
+        valid = slots >= 0
+        if not valid.any():
+            return
+        slots = slots[valid]
+        errors = errors.detach().float()[valid]
+        sums = errors.new_zeros(len(self.base_relations))
+        counts = errors.new_zeros(len(self.base_relations))
+        sums.scatter_add_(0, slots, errors)
+        counts.scatter_add_(0, slots, torch.ones_like(errors))
+        observed = counts > 0
+        means = sums[observed] / counts[observed]
+        previous = self.base_difficulty_ema[observed]
+        first_update = self.base_difficulty_updates[observed] == 0
+        decay = float(self.cfg.SHIP_BASE_DIFFICULTY_EMA)
+        updated = decay * previous + (1.0 - decay) * means
+        self.base_difficulty_ema[observed] = torch.where(first_update, means, updated)
+        self.base_difficulty_updates[observed] += counts[observed].long()
+
+    def _base_sampling_probabilities(self):
+        if not self.base_relations:
+            return self.base_difficulty_ema
+        uniform = torch.full_like(
+            self.base_difficulty_ema, 1.0 / float(len(self.base_relations))
+        )
+        observed = self.base_difficulty_updates > 0
+        if not observed.any():
+            return uniform
+        difficulty = self.base_difficulty_ema.clone()
+        difficulty[~observed] = difficulty[observed].mean()
+        temperature = float(self.cfg.SHIP_BASE_DIFFICULTY_TEMPERATURE)
+        difficulty = torch.softmax(difficulty / temperature, dim=0)
+        mix = float(self.cfg.SHIP_BASE_DIFFICULTY_MIX)
+        return (1.0 - mix) * uniform + mix * difficulty
+
+    def _sample_base(self, subjects, objects, count):
+        if count <= 0 or not self.base_relations:
+            return [], None, None, []
+        pair_indices = torch.randint(subjects.numel(), (count,), device=subjects.device)
+        sampled_subjects = subjects.index_select(0, pair_indices)
+        sampled_objects = objects.index_select(0, pair_indices)
+        probabilities = self._base_sampling_probabilities()
+        texts, predicates, sampled_slots = [], [], []
+        for subject, object_ in zip(
+            sampled_subjects.detach().cpu().tolist(),
+            sampled_objects.detach().cpu().tolist(),
+        ):
+            subject_name = self.teacher.object_names[int(subject)]
+            object_name = self.teacher.object_names[int(object_)]
+            compatible_slots = self.base_candidates.get(subject_name)
+            if compatible_slots is None:
+                compatible_slots = []
+                if subject_name in self.teacher.text_filter.columns:
+                    compatible_slots = [
+                        slot for slot, (index, name) in enumerate(self.base_relation_entries)
+                        if index < len(self.teacher.text_filter)
+                        and str(self.teacher.text_filter.iloc[index][subject_name]) == name
+                    ]
+                compatible_slots = compatible_slots or list(range(len(self.base_relations)))
+                self.base_candidates[subject_name] = compatible_slots
+            compatible = torch.tensor(
+                compatible_slots, device=probabilities.device, dtype=torch.long
+            )
+            conditional = probabilities.index_select(0, compatible)
+            conditional = conditional / conditional.sum().clamp(min=1e-12)
+            slot = int(compatible[torch.multinomial(conditional, 1)].item())
+            predicate = self.base_relations[slot]
+            sampled_slots.append(slot)
+            predicates.append(predicate)
+            texts.append(self.teacher.format_triplet(subject_name, predicate, object_name))
+        sampled_slots = torch.tensor(
+            sampled_slots, device=self.base_sample_counts.device, dtype=torch.long
+        )
+        self.base_sample_counts.add_(
+            torch.bincount(sampled_slots, minlength=len(self.base_relations))
+        )
+        return texts, sampled_subjects, sampled_objects, predicates
+
     def _sample_novel(self, subjects, objects, count):
         if count <= 0 or not self.novel_relations:
             return [], None, None, []
@@ -461,6 +616,14 @@ class MTMShipBranch(nn.Module):
             predicate = sampling_pool[int(torch.randint(len(sampling_pool), (1,)).item())]
             predicates.append(predicate)
             texts.append(self.teacher.format_triplet(subject_name, predicate, object_name))
+        sampled_slots = torch.tensor(
+            [self.novel_relation_to_slot[predicate] for predicate in predicates],
+            device=self.novel_sample_counts.device,
+            dtype=torch.long,
+        )
+        self.novel_sample_counts.add_(
+            torch.bincount(sampled_slots, minlength=len(self.novel_relations))
+        )
         return texts, sampled_subjects, sampled_objects, predicates
 
     def compute_losses(self, raw, subjects, objects, relations):
@@ -480,11 +643,28 @@ class MTMShipBranch(nn.Module):
         reconstruction_loss = kl_loss = zero
         ship_ramp = min(max((step - self.cfg.SHIP_WARMUP_ITERS) / float(self.cfg.SHIP_RAMP_ITERS), 0.0), 1.0)
 
+        replay_raw = replay_targets = None
+        replay_subjects = replay_objects = None
+        replay_predicates = []
         novel_raw = None
         if self.generator is not None:
             reconstructed, mean, logvar = self.generator.reconstruct(base_texts, base_raw_normalized)
             reconstruction_loss = (reconstructed - base_raw_normalized.detach()).pow(2).sum(dim=-1).mean()
             kl_loss = (-0.5 * (1 + logvar - mean.pow(2) - logvar.exp()).sum(dim=-1)).mean()
+            if self.cfg.SHIP_BASE_REPLAY_ENABLED:
+                replay_count = round(
+                    raw.size(0) * float(self.cfg.SHIP_BASE_PSEUDO_RATIO) * ship_ramp
+                )
+                replay_texts, replay_subjects, replay_objects, replay_predicates = self._sample_base(
+                    subjects, objects, replay_count
+                )
+                if replay_texts:
+                    replay_targets = self.teacher.encode(replay_texts).detach().to(raw.device)
+                    replay_raw = self.generator.generate(replay_texts, raw.device)
+                    replay_raw = (
+                        replay_raw
+                        * raw.detach().float().norm(dim=-1).mean().clamp(min=1e-6)
+                    )
             novel_count = round(raw.size(0) * float(self.cfg.SHIP_PSEUDO_RATIO) * ship_ramp)
             novel_texts, novel_subjects, novel_objects, novel_predicates = self._sample_novel(subjects, objects, novel_count)
             if novel_texts:
@@ -507,12 +687,39 @@ class MTMShipBranch(nn.Module):
         align, align_pos, align_neg = self._alignment(
             projected_normalized, all_targets, all_subjects, all_objects, all_predicates
         )
+        main_count = projected_normalized.size(0)
+        if replay_raw is not None:
+            _, replay_projected = self.projector(
+                replay_raw, self.cfg.VISUAL_ADAPTER_ENABLED
+            )
+            replay_projected = F.normalize(replay_projected.float(), dim=-1)
+            _, replay_align_pos, replay_align_neg = self._alignment(
+                replay_projected,
+                replay_targets,
+                replay_subjects,
+                replay_objects,
+                replay_predicates,
+            )
+            replay_count = replay_projected.size(0)
+            total_count = main_count + replay_count
+            align_pos = (
+                align_pos * main_count + replay_align_pos * replay_count
+            ) / float(total_count)
+            align_neg = (
+                align_neg * main_count + replay_align_neg * replay_count
+            ) / float(total_count)
+            align = align_pos + float(self.cfg.ALIGN_NEG_WEIGHT) * align_neg
         visual_structure, text_structure = self._structure(
             visual_normalized, projected_normalized, all_targets
         )
         structure_ramp = min(max((step - self.cfg.STRUCTURE_WARMUP_ITERS) / float(self.cfg.STRUCTURE_RAMP_ITERS), 0.0), 1.0)
 
         base_count = raw.size(0)
+        with torch.no_grad():
+            base_errors = 1.0 - (
+                projected_normalized[:base_count] * base_targets
+            ).sum(dim=-1)
+            self._update_base_difficulty(base_predicates, base_errors)
         base_visual_error, base_text_error = self._structure(
             visual_normalized[:base_count], projected_normalized[:base_count], base_targets
         )
@@ -534,7 +741,18 @@ class MTMShipBranch(nn.Module):
                 "visual_error": novel_visual_error.item(), "text_error": novel_text_error.item(), "ramp": ship_ramp,
             }
         with torch.no_grad():
-            self.debug.write(step, base_debug, novel_debug)
+            self.debug.write(
+                step,
+                base_debug,
+                novel_debug,
+                {
+                    "base_names": self.base_relations,
+                    "base_counts": self.base_sample_counts,
+                    "base_difficulty": self.base_difficulty_ema,
+                    "novel_names": self.novel_relations,
+                    "novel_counts": self.novel_sample_counts,
+                },
+            )
 
         return {
             "loss_mtm_align": float(self.cfg.ALIGN_WEIGHT) * align,
