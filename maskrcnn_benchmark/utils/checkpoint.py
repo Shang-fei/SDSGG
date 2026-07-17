@@ -108,6 +108,13 @@ class Checkpointer(object):
 
 
 class DetectronCheckpointer(Checkpointer):
+    _PREDCLS_BOX_PREDICTOR_KEYS = (
+        "roi_heads.box.predictor.cls_score.weight",
+        "roi_heads.box.predictor.cls_score.bias",
+        "roi_heads.box.predictor.bbox_pred.weight",
+        "roi_heads.box.predictor.bbox_pred.bias",
+    )
+
     def __init__(
         self,
         cfg,
@@ -123,6 +130,35 @@ class DetectronCheckpointer(Checkpointer):
             model, optimizer, scheduler, save_dir, save_to_disk, logger, custom_scheduler
         )
         self.cfg = cfg.clone()
+
+    def _load_model(self, checkpoint, load_mapping):
+        if (
+            self.cfg.MODEL.ROI_RELATION_HEAD.USE_GT_BOX
+            and self.cfg.MODEL.ROI_RELATION_HEAD.USE_GT_OBJECT_LABEL
+        ):
+            loaded_state = checkpoint.get("model", {})
+            model_state = self.model.state_dict()
+            for loaded_key in list(loaded_state.keys()):
+                normalized_key = (
+                    loaded_key[7:] if loaded_key.startswith("module.") else loaded_key
+                )
+                if normalized_key not in self._PREDCLS_BOX_PREDICTOR_KEYS:
+                    continue
+                current_key = next(
+                    (key for key in model_state if key.endswith(normalized_key)), None
+                )
+                if (
+                    current_key is not None
+                    and model_state[current_key].shape != loaded_state[loaded_key].shape
+                ):
+                    self.logger.warning(
+                        "PredCls: skip incompatible detector parameter %s: %s -> %s",
+                        loaded_key,
+                        tuple(loaded_state[loaded_key].shape),
+                        tuple(model_state[current_key].shape),
+                    )
+                    del loaded_state[loaded_key]
+        super(DetectronCheckpointer, self)._load_model(checkpoint, load_mapping)
 
     def _load_file(self, f):
         # catalog lookup
