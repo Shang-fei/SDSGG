@@ -45,6 +45,7 @@ class MTMPluginStructureTest(unittest.TestCase):
             "MTM.PROJECTOR.INPUT_DIM",
             "MTM.TEXT_TEACHER.SVD_ENABLED",
             "MTM.LOSS.ALIGNMENT_WEIGHT",
+            'MTM.LOSS.STRUCTURE_DISTANCE = "l1"',
             "MTM.SHIP.PSEUDO_NOVEL_RATIO",
             "MTM.SHIP.TEXT_ADAPTER.ENABLED",
             "MTM.SHIP.BASE_REPLAY.ENABLED",
@@ -100,6 +101,12 @@ class MTMPluginStructureTest(unittest.TestCase):
         source = (MTM_PACKAGE / "losses.py").read_text()
         for key in expected:
             self.assertIn(key, source)
+
+    def test_structure_distance_supports_l1_and_l2(self):
+        source = (MTM_PACKAGE / "losses.py").read_text()
+        self.assertIn('distance == "l1"', source)
+        self.assertIn('distance == "l2"', source)
+        self.assertIn("difference.pow(2).mean()", source)
 
 
 if __name__ == "__main__":

@@ -18,7 +18,18 @@ def linear_ramp(step, warmup_steps, ramp_steps):
     )
 
 
-def structure_losses(visual_features, projected_features, text_features):
+def _structure_distance(left, right, mask, distance):
+    difference = (left - right)[mask]
+    if distance == "l1":
+        return difference.abs().mean()
+    if distance == "l2":
+        return difference.pow(2).mean()
+    raise ValueError("Unsupported MTM structure distance: {}".format(distance))
+
+
+def structure_losses(
+    visual_features, projected_features, text_features, distance="l1"
+):
     if projected_features.size(0) < 2:
         zero = projected_features.sum() * 0.0
         return zero, zero
@@ -31,8 +42,12 @@ def structure_losses(visual_features, projected_features, text_features):
     projected_similarity = projected_features @ projected_features.t()
     text_similarity = text_features @ text_features.t()
     return (
-        (visual_similarity - projected_similarity).abs()[mask].mean(),
-        (projected_similarity - text_similarity).abs()[mask].mean(),
+        _structure_distance(
+            visual_similarity, projected_similarity, mask, distance
+        ),
+        _structure_distance(
+            projected_similarity, text_similarity, mask, distance
+        ),
     )
 
 
@@ -40,6 +55,12 @@ class MTMLossComputer:
     def __init__(self, config, teacher):
         self.config = config
         self.teacher = teacher
+        if config.STRUCTURE_DISTANCE not in ("l1", "l2"):
+            raise ValueError(
+                "MTM.LOSS.STRUCTURE_DISTANCE must be 'l1' or 'l2', got '{}'".format(
+                    config.STRUCTURE_DISTANCE
+                )
+            )
 
     def empty(self, reference):
         zero = reference.sum() * 0.0

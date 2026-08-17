@@ -287,10 +287,14 @@ class MTMPlugin(nn.Module):
                 self.config.LOSS.NEGATIVE_ALIGNMENT_WEIGHT
             ) * align_neg
 
-        visual_structure, text_structure = structure_losses(
-            normalized_visual, normalized_projected, all_targets
-        )
         loss_config = self.config.LOSS
+        structure_distance = loss_config.STRUCTURE_DISTANCE
+        visual_structure, text_structure = structure_losses(
+            normalized_visual,
+            normalized_projected,
+            all_targets,
+            structure_distance,
+        )
         structure_ramp = linear_ramp(
             step,
             loss_config.STRUCTURE_WARMUP_STEPS,
@@ -307,6 +311,7 @@ class MTMPlugin(nn.Module):
             normalized_visual[:base_count],
             normalized_projected[:base_count],
             base_targets,
+            structure_distance,
         )
         base_debug = {
             "raw": raw,
@@ -330,6 +335,7 @@ class MTMPlugin(nn.Module):
                 normalized_visual[base_count:],
                 normalized_projected[base_count:],
                 novel_targets,
+                structure_distance,
             )
             novel_debug = {
                 "raw": novel_raw,
