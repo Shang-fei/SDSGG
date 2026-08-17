@@ -17,7 +17,7 @@ from .utils_motifs import obj_edge_vectors
 from .model_motifs_with_attribute import AttributeLSTMContext
 from .model_transformer import TransformerContext
 from .utils_relation import layer_init, get_box_info, get_box_pair_info
-from .mtm_ship import MTMShipBranch
+from .mtm import MTMPredicateSpec, build_mtm_plugin
 from maskrcnn_benchmark.data import get_dataset_statistics
 from CLIP import clip
 import time
@@ -294,44 +294,21 @@ class GQAClipPredictor(nn.Module):
         print('init complete : '+str(b-a))
         self.linear1=nn.Linear(1024,512, bias=False).to(self.device).half()
 
-        mtmConfig = config.MODEL.ROI_RELATION_HEAD.MTM
-        self.mtmEnabled = mtmConfig.ENABLED
-        self.mtmTrainEnabled = mtmConfig.ENABLED and mtmConfig.TRAIN_ENABLED
-        self.mtmInferenceEnabled = mtmConfig.ENABLED and mtmConfig.INFERENCE_ENABLED
-        self.mtmInferenceWeight = mtmConfig.INFERENCE_WEIGHT
         self.gqaDatasetRelNames = list(rel_classes)
-        self.mtm_branch = None
-        if self.mtmEnabled:
-            self.mtmRelNames = self.relNames
-            self.mtmTextFilter = pd.read_csv(curpath + "/filter_total.csv").iloc[:, 1:]
-            self.mtmActiveIndices = list(self.base)
-            self.mtmActiveRelNames = [self.mtmRelNames[index] for index in self.mtmActiveIndices]
-            self.mtmInferenceFilter = self.mtmTextFilter.iloc[self.mtmActiveIndices]
-            self._validate_mtm_relation_order()
-            for param in self.clip_model.parameters():
-                param.requires_grad_(False)
-            self.mtm_branch = MTMShipBranch(
-                mtmConfig,
+        self.mtm = None
+        if config.MODEL.ROI_RELATION_HEAD.MTM.ENABLED:
+            predicate_spec = MTMPredicateSpec(
+                self.relNames,
+                {"base": self.base, "novel": self.novel},
+                pd.read_csv(curpath + "/filter_total.csv").iloc[:, 1:],
+            )
+            predicate_spec.validate_names("base", self.gqaDatasetRelNames)
+            self.mtm = build_mtm_plugin(
+                config,
                 self.clip_model,
                 self.obj_names,
-                self.mtmRelNames,
-                self.mtmActiveRelNames,
-                self.base,
-                self.novel,
-                self.mtmTextFilter,
-                self.mtmInferenceFilter,
-                self.device,
+                predicate_spec,
                 config.OUTPUT_DIR,
-            ).to(self.device)
-
-    def _validate_mtm_relation_order(self):
-        expected = [self.mtmRelNames[index] for index in self.mtmActiveIndices]
-        assert self.mtmActiveRelNames == expected
-        assert self.mtmInferenceFilter.index.tolist() == self.mtmActiveIndices
-        assert len(self.mtmActiveRelNames) == self.description_relation.size(0)
-        if self.mtmActiveIndices == list(self.base):
-            assert self.gqaDatasetRelNames == self.mtmActiveRelNames, (
-                "GQA training relation labels and MTM base score columns are not aligned"
             )
 
     def updata(self,mode):
@@ -356,18 +333,8 @@ class GQAClipPredictor(nn.Module):
             self.texts5 = [text_features5_cpu] * len(self.obj_names)
             self.fixedTextFeatures5 = text_features5.detach().half()
 
-        if self.mtm_branch is not None:
-            if mode == "base":
-                active_indices = self.base
-            elif mode == "novel":
-                active_indices = self.novel
-            else:
-                raise ValueError("Unsupported GQA predicate evaluation mode: {}".format(mode))
-            self.mtmActiveIndices = list(active_indices)
-            self.mtmActiveRelNames = [self.mtmRelNames[index] for index in self.mtmActiveIndices]
-            self.mtmInferenceFilter = self.mtmTextFilter.iloc[self.mtmActiveIndices]
-            self._validate_mtm_relation_order()
-            self.mtm_branch.set_mode(self.mtmActiveRelNames, self.mtmInferenceFilter)
+        if self.mtm is not None:
+            self.mtm.set_mode(mode)
 
     def forward(self, proposals, rel_pair_idxs, rel_labels, rel_binarys, roi_features, union_features, logger=None,img=None):
         # Returns:
@@ -387,20 +354,13 @@ class GQAClipPredictor(nn.Module):
         assert len(num_rels) == len(num_objs)
         obj_preds = obj_preds.split(num_objs, dim=0)
 
-        mtm_output = {"scores": [None] * len(num_rels), "losses": {}}
-        run_mtm = (
-            self.mtm_branch is not None
-            and ((self.training and self.mtmTrainEnabled)
-                 or (not self.training and self.mtmInferenceEnabled and self.mtmInferenceWeight != 0))
-        )
-        if run_mtm:
-            mtm_output = self.mtm_branch(
-                img,
-                proposals,
-                rel_pair_idxs,
-                rel_labels,
-                obj_preds,
-            )
+        mtm_output = self.mtm(
+            images=img,
+            proposals=proposals,
+            pair_indices=rel_pair_idxs,
+            relation_labels=rel_labels,
+            object_labels=obj_preds,
+        ) if self.mtm is not None else None
 
         rel_dists=[]
         for i in range(len(num_rels)):
@@ -473,27 +433,19 @@ class GQAClipPredictor(nn.Module):
                     similarity3 = ((sub_cls @ text5_norm.t()) + (obj_cls @ text5_norm.t())) / 2 / 0.05
                     rel_dist_per_batch = description_scores * 0.2 + similarity3 * 0.8
 
-            if not self.training and self.mtmInferenceEnabled and self.mtmInferenceWeight != 0:
-                mtm_scores = mtm_output["scores"][i]
-                if mtm_scores is not None:
-                    assert mtm_scores.size(1) == rel_dist_per_batch.size(1)
-                    assert mtm_scores.size(1) == len(self.mtmActiveRelNames)
-                    rel_dist_per_batch = rel_dist_per_batch + self.mtmInferenceWeight * mtm_scores.to(
-                        device=rel_dist_per_batch.device,
-                        dtype=rel_dist_per_batch.dtype,
-                    )
-
             rel_dists.append(rel_dist_per_batch)
 
 
 
         obj_dists = obj_dists.split(num_objs, dim=0)
+        if mtm_output is not None:
+            rel_dists = mtm_output.fuse(rel_dists)
         rel_dists = tuple(rel_dists)
 
         add_losses = {}
 
-        if self.training and self.mtmTrainEnabled:
-            add_losses.update(mtm_output["losses"])
+        if mtm_output is not None:
+            add_losses.update(mtm_output.losses)
 
 
         return obj_dists, rel_dists, add_losses
@@ -646,10 +598,6 @@ class ClipPredictor(nn.Module):
         self.linear1=nn.Linear(1024,512, bias=False).to(self.device).half()
         mtmConfig = config.MODEL.ROI_RELATION_HEAD.MTM
         relationnessConfig = config.MODEL.ROI_RELATION_HEAD.RELATIONNESS
-        self.mtmEnabled = mtmConfig.ENABLED
-        self.mtmTrainEnabled = mtmConfig.ENABLED and mtmConfig.TRAIN_ENABLED
-        self.mtmInferenceEnabled = mtmConfig.ENABLED and mtmConfig.INFERENCE_ENABLED
-        self.mtmInferenceWeight = mtmConfig.INFERENCE_WEIGHT
         self.relationnessEnabled = relationnessConfig.ENABLED
         self.relationnessLossEnabled = relationnessConfig.ENABLED and relationnessConfig.LOSS_ENABLED
         self.relationnessLossWeight = relationnessConfig.LOSS_WEIGHT
@@ -662,25 +610,36 @@ class ClipPredictor(nn.Module):
         for param in self.clip_model.parameters():
             param.requires_grad_(False)
         self.relationnessHead = RelationnessHead(
-            relationDim=mtmConfig.EMBED_DIM,
-            hiddenDim=mtmConfig.EMBED_DIM // 2,
-            dropout=mtmConfig.DROPOUT,
+            relationDim=mtmConfig.PROJECTOR.EMBED_DIM,
+            hiddenDim=mtmConfig.PROJECTOR.EMBED_DIM // 2,
+            dropout=mtmConfig.PROJECTOR.DROPOUT,
         ).to(self.device)
         self.activeRelNames = activeRelNames
-        self.mtm_branch = MTMShipBranch(
-            mtmConfig,
-            self.clip_model,
-            self.obj_names,
-            self.relNames,
-            self.activeRelNames,
-            self.base,
-            self.novel,
-            self.mtmTextSvdFilter,
-            self.sub_filter_novel,
-            self.device,
-            config.OUTPUT_DIR,
-        ).to(self.device) if self.mtmEnabled else None
-        self.textEncodeChunkSize = max(int(mtmConfig.TEXT_ENCODE_CHUNK_SIZE), 1)
+        self.mtm = None
+        if mtmConfig.ENABLED:
+            predicate_spec = MTMPredicateSpec(
+                self.relNames,
+                {
+                    "base": self.base,
+                    "novel": self.novel,
+                    "total": tuple(range(len(self.relNames))),
+                    "semantic": self.semantic,
+                },
+                self.mtmTextSvdFilter,
+            )
+            self.mtm = build_mtm_plugin(
+                config,
+                self.clip_model,
+                self.obj_names,
+                predicate_spec,
+                config.OUTPUT_DIR,
+            )
+        self.clipCropBatchSize = max(
+            int(mtmConfig.INFERENCE.UNION_CROP_BATCH_SIZE), 1
+        )
+        self.textEncodeChunkSize = max(
+            int(mtmConfig.TEXT_TEACHER.ENCODE_BATCH_SIZE), 1
+        )
         self.mtmModeStateCache = {
             mode: {
                 "description_relation": self.description_relation,
@@ -690,43 +649,6 @@ class ClipPredictor(nn.Module):
                 "texts5Tensor": self.texts5Tensor,
             }
         }
-
-    def _load_from_state_dict(
-        self, state_dict, prefix, local_metadata, strict,
-        missing_keys, unexpected_keys, error_msgs,
-    ):
-        # Keep learned MTM/SHIP weights loadable after moving them into mtm_branch.
-        keyMappings = (
-            ("relationMtm.adapter.inputProj", "mtm_branch.projector.visual_adapter.input_proj"),
-            ("relationMtm.adapter.inputNorm", "mtm_branch.projector.visual_adapter.norm"),
-            ("relationMtm.adapter.downProj", "mtm_branch.projector.visual_adapter.down"),
-            ("relationMtm.adapter.upProj", "mtm_branch.projector.visual_adapter.up"),
-            ("relationMtm.adapter.gate", "mtm_branch.projector.visual_adapter.gate"),
-            ("relationMtm.fc", "mtm_branch.projector.fc"),
-            ("relationMtm.selfAttention", "mtm_branch.projector.self_attention"),
-            ("relationMtm.norm", "mtm_branch.projector.norm"),
-            ("shipFeatureGenerator.ctx", "mtm_branch.generator.ctx"),
-            ("shipFeatureGenerator.visualEncoder.featureEncoder", "mtm_branch.generator.encoder.body"),
-            ("shipFeatureGenerator.visualEncoder.mean", "mtm_branch.generator.encoder.mean"),
-            ("shipFeatureGenerator.visualEncoder.logvar", "mtm_branch.generator.encoder.logvar"),
-            ("shipFeatureGenerator.latentGenerator.net", "mtm_branch.generator.generator"),
-            ("shipFeatureGenerator.textVisualAdapter.norm", "mtm_branch.generator.text_adapter.norm"),
-            ("shipFeatureGenerator.textVisualAdapter.net", "mtm_branch.generator.text_adapter.body"),
-            ("shipTrainingStep", "mtm_branch.training_step"),
-        )
-        for oldName, newName in keyMappings:
-            oldPrefix = prefix + oldName
-            newPrefix = prefix + newName
-            for key in [key for key in state_dict if key == oldPrefix or key.startswith(oldPrefix + ".")]:
-                mappedKey = newPrefix + key[len(oldPrefix):]
-                if mappedKey not in state_dict:
-                    state_dict[mappedKey] = state_dict[key]
-                del state_dict[key]
-        state_dict.pop(prefix + "mtmDebugIteration", None)
-        super()._load_from_state_dict(
-            state_dict, prefix, local_metadata, strict,
-            missing_keys, unexpected_keys, error_msgs,
-        )
 
     def encodeSubjectFilterTextFeatures(self, subjectFilter):
         allTexts = []
@@ -757,7 +679,7 @@ class ClipPredictor(nn.Module):
             return image.new_zeros(featureShape).float()
 
         encodedChunks = []
-        chunkSize = max(int(self.mtm_branch.cfg.UNION_CROP_CHUNK_SIZE), 1) if self.mtm_branch else 128
+        chunkSize = self.clipCropBatchSize
         for offset in range(0, boxes.size(0), chunkSize):
             cropChunk = []
             for box in boxes[offset : offset + chunkSize]:
@@ -830,8 +752,8 @@ class ClipPredictor(nn.Module):
             self.activeRelNames = cachedState["activeRelNames"]
             self.texts5 = cachedState["texts5"]
             self.texts5Tensor = cachedState["texts5Tensor"]
-            if self.mtm_branch is not None:
-                self.mtm_branch.set_mode(self.activeRelNames, self.sub_filter_novel)
+            if self.mtm is not None:
+                self.mtm.set_mode(mode)
             return
 
         self.description_relation = pd.read_csv(
@@ -870,8 +792,8 @@ class ClipPredictor(nn.Module):
         self.description_relation = np.array([[np.array(item) for item in inner_list] for inner_list in self.description_relation])
         self.description_relation=torch.Tensor(self.description_relation).to(self.device)
         self.activeRelNames = activeRelNames
-        if self.mtm_branch is not None:
-            self.mtm_branch.set_mode(self.activeRelNames, self.sub_filter_novel)
+        if self.mtm is not None:
+            self.mtm.set_mode(mode)
 
         self.texts5 = self.encodeSubjectFilterTextFeatures(self.sub_filter_novel)
         self.texts5Tensor = F.normalize(torch.stack(self.texts5, dim=0), dim=-1)
@@ -902,20 +824,13 @@ class ClipPredictor(nn.Module):
         assert len(num_rels) == len(num_objs)
         obj_preds = obj_preds.split(num_objs, dim=0)
 
-        mtm_output = {"scores": [None] * len(num_rels), "losses": {}}
-        run_mtm = (
-            self.mtm_branch is not None
-            and ((self.training and self.mtmTrainEnabled)
-                 or (not self.training and self.mtmInferenceEnabled and self.mtmInferenceWeight != 0))
-        )
-        if run_mtm:
-            mtm_output = self.mtm_branch(
-                img,
-                proposals,
-                rel_pair_idxs,
-                rel_labels,
-                obj_preds,
-            )
+        mtm_output = self.mtm(
+            images=img,
+            proposals=proposals,
+            pair_indices=rel_pair_idxs,
+            relation_labels=rel_labels,
+            object_labels=obj_preds,
+        ) if self.mtm is not None else None
 
         rel_dists=[]
         relationnessLogitsForLoss = []
@@ -998,13 +913,6 @@ class ClipPredictor(nn.Module):
                     description_scores.size(1),
                 ).to(dtype=description_scores.dtype)
                 rel_dist_per_batch = description_scores * 0.2 + filter_scores * 0.8
-                if self.mtmInferenceEnabled and self.mtmInferenceWeight != 0:
-                    mtm_scores = mtm_output["scores"][i]
-                    if mtm_scores is not None:
-                        rel_dist_per_batch = rel_dist_per_batch + self.mtmInferenceWeight * mtm_scores.to(
-                            device=rel_dist_per_batch.device,
-                            dtype=rel_dist_per_batch.dtype,
-                        )
                 if self.useRelationnessInference:
                     proposals[i].add_field(
                         "relationness_scores",
@@ -1015,11 +923,13 @@ class ClipPredictor(nn.Module):
 
 
         obj_dists = obj_dists.split(num_objs, dim=0)
+        if mtm_output is not None:
+            rel_dists = mtm_output.fuse(rel_dists)
         rel_dists = tuple(rel_dists)
 
         add_losses = {}
-        if self.training and self.mtmTrainEnabled:
-            add_losses.update(mtm_output["losses"])
+        if mtm_output is not None:
+            add_losses.update(mtm_output.losses)
         if self.training and self.relationnessLossEnabled:
             add_losses.update(
                 self.computeRelationnessLoss(

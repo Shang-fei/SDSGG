@@ -4,13 +4,28 @@ import torch
 from .lr_scheduler import WarmupMultiStepLR, WarmupReduceLROnPlateau
 
 
+def _collect_ship_parameters(model):
+    parameters = []
+    parameter_ids = set()
+    for module in model.modules():
+        provider = getattr(module, "ship_parameters", None)
+        if not callable(provider):
+            continue
+        for parameter in provider():
+            if parameter.requires_grad and id(parameter) not in parameter_ids:
+                parameters.append(parameter)
+                parameter_ids.add(id(parameter))
+    return parameters, parameter_ids
+
+
 def make_optimizer(cfg, model, logger, slow_heads=None, slow_ratio=5.0, rl_factor=1.0):
     params = []
     total=0
+    _, ship_parameter_ids = _collect_ship_parameters(model)
     for key, value in model.named_parameters():
         if not value.requires_grad:
             continue
-        if "mtm_branch.generator" in key:
+        if id(value) in ship_parameter_ids:
             continue
         lr = cfg.SOLVER.BASE_LR
         weight_decay = cfg.SOLVER.WEIGHT_DECAY
@@ -35,23 +50,49 @@ def make_optimizer(cfg, model, logger, slow_heads=None, slow_ratio=5.0, rl_facto
     return optimizer
 
 
-def make_ship_optimizer(cfg, model):
+def make_mtm_ship_optimizer(cfg, model):
     mtm_cfg = cfg.MODEL.ROI_RELATION_HEAD.MTM
-    if not (mtm_cfg.ENABLED and mtm_cfg.TRAIN_ENABLED and mtm_cfg.SHIP_ENABLED):
+    if not (
+        mtm_cfg.ENABLED
+        and mtm_cfg.TRAINING_ENABLED
+        and mtm_cfg.SHIP.ENABLED
+    ):
         return None
-    parameters = [
-        value
-        for key, value in model.named_parameters()
-        if value.requires_grad and "mtm_branch.generator" in key
-    ]
+    parameters, _ = _collect_ship_parameters(model)
     if len(parameters) == 0:
         return None
+    optimizer_config = mtm_cfg.SHIP.OPTIMIZER
     return torch.optim.AdamW(
         parameters,
-        lr=mtm_cfg.SHIP_LR,
-        weight_decay=mtm_cfg.SHIP_WEIGHT_DECAY,
+        lr=optimizer_config.LR,
+        weight_decay=optimizer_config.WEIGHT_DECAY,
         betas=(0.9, 0.999),
     )
+
+
+def validate_optimizer_parameters(model, *optimizers):
+    expected = {
+        id(parameter) for parameter in model.parameters() if parameter.requires_grad
+    }
+    assigned = []
+    for optimizer in optimizers:
+        if optimizer is None:
+            continue
+        assigned.extend(
+            id(parameter)
+            for group in optimizer.param_groups
+            for parameter in group["params"]
+        )
+    if len(assigned) != len(set(assigned)):
+        raise RuntimeError("A trainable parameter belongs to multiple optimizers")
+    if set(assigned) != expected:
+        missing = len(expected - set(assigned))
+        unexpected = len(set(assigned) - expected)
+        raise RuntimeError(
+            "Optimizer parameter coverage mismatch: missing={}, unexpected={}".format(
+                missing, unexpected
+            )
+        )
 
 
 def make_lr_scheduler(cfg, optimizer, logger=None):
