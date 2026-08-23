@@ -1,87 +1,51 @@
 \section{Introduction}
 \label{sec:intro}
 
-Scene graph generation (SGG) represents an image as a graph whose nodes denote
-objects and whose directed edges describe pairwise relationships
-\cite{xu2017scenegraph}. It thereby provides a structured interface between
-visual perception and downstream reasoning. Conventional SGG, however,
-predicts from a predefined predicate vocabulary and cannot describe
-relationships absent from its training annotations. Open-vocabulary SGG
-(OVSGG) addresses this limitation by transferring semantic knowledge from
-pretrained vision--language models to novel predicates. Such transfer is
-particularly difficult for relations: predicates exhibit substantial visual
-variation, depend strongly on subject--object context, and often differ through
-subtle interaction cues. We study this problem under Predicate Classification
-(PredCls), where ground-truth object boxes and labels are provided, thereby
-isolating open-vocabulary relation recognition from object-detection errors.
+Scene graph generation (SGG) converts an image into objects and their directed
+relationships, providing structured input for visual reasoning
+\cite{xu2017scenegraph}. Conventional SGG recognizes predicates from a closed
+training vocabulary, whereas open-vocabulary SGG (OVSGG) must also identify
+unseen relationships. This is difficult because predicates depend jointly on
+subject, object, and interaction context, and visually similar pairs can express
+fine-grained yet different relations. We focus on Predicate Classification
+(PredCls), where ground-truth boxes and object labels are given, to isolate
+open-vocabulary relation recognition from detection errors.
 
-Recent OVSGG methods have primarily strengthened the semantic classifier used
-for this transfer. Epic introduces entangled cross-modal prompts for unseen
-predicates \cite{yu2023epic}, whereas RECODE composes language-derived visual
-cues for zero-shot relation detection \cite{li2023recode}. More recent methods
-enrich text representations with subject--object, region, or scene context:
-RAHP constructs relation-aware hierarchical prompts \cite{liu2025rahp}, SDSGG
-generates scene-specific descriptions and reweights them according to the input
-\cite{chen2024sdsgg}, and APT converts frozen semantic features into adaptive,
-context-aware prompts \cite{luo2026apt}. These approaches substantially improve
-the content and adaptivity of textual relation representations. Nevertheless,
-adapting the semantic target alone does not control how visual relation
-instances are transported into that space. Pointwise visual--text alignment can
-bring each sample closer to its target while altering the relative geometry
-among visual instances, potentially discarding distinctions needed for
-fine-grained and unseen predicates. ACC recently preserves inter-pair
-consistency between teacher and student models for end-to-end OVSGG
-\cite{li2025acc}; our focus is complementary: preserving source visual-relation
-geometry across an explicit visual-to-text projection in PredCls.
+Recent OVSGG methods improve semantic matching through richer prompts and
+descriptions. Epic and RECODE construct fine-grained cross-modal or composite
+cues \cite{yu2023epic,li2023recode}; RAHP, SDSGG, and APT further condition
+text representations on entities, regions, scenes, or visual context
+\cite{liu2025rahp,chen2024sdsgg,luo2026apt}. These advances strengthen the
+semantic target, but they leave the visual-to-text transport itself weakly
+constrained. Pointwise alignment can move each visual relation toward its text
+target while changing relative similarities among visual instances, thereby
+losing distinctions useful for unseen predicates. Moreover, novel predicates
+provide no annotated visual instances with which to learn this transport.
 
-This observation exposes two coupled obstacles. First, a modality-transfer
-function must acquire triplet-level semantics without erasing the relational
-organization already encoded by visual features; a purely pointwise objective
-does not constrain this organization. Second, novel predicates have no
-annotated visual instances, leaving a text-derived classifier without direct
-support for their possible visual distributions. We therefore posit that
-open-vocabulary predicate transfer should preserve the geometry of observed
-visual relations while using relation-conditioned synthesis to populate the
-missing novel side of the visual space.
+Our central hypothesis is that effective open-vocabulary relation transfer
+requires both geometry preservation and novel visual support. The first
+retains relational organization already present in visual features rather than
+forcing it to imitate text geometry. The second populates unseen predicates in
+the transfer space without using their visual annotations. Together, these
+principles address complementary failure modes of alignment-only transfer.
 
-Based on this hypothesis, we introduce a relation-preserving modality-transfer
-framework on top of SDSGG. A frozen CLIP teacher \cite{radford2021clip} first
-encodes subject--predicate--object sentences and removes the dominant shared
-direction of the triplet-text bank. A learnable projector then maps CLIP
-union-region features into this triplet space using pointwise cosine alignment.
-Crucially, a visual structure-preservation loss matches pairwise cosine
-similarities before and after projection, regularizing the transfer without a
-text-structure loss. To provide visual support for unseen predicates, we
-further adapt SHIP \cite{wang2023ship} into a relation-conditioned generator
-that reconstructs base relation features and synthesizes pseudo visual features
-from novel triplet semantics. At inference, the resulting triplet-matching
-scores complement the original SDSGG predicate logits.
+We realize this hypothesis as a relation-preserving modality-transfer branch
+on top of SDSGG. A frozen CLIP triplet teacher \cite{radford2021clip} removes
+the dominant shared direction from subject--predicate--object embeddings. A
+learnable projector combines pointwise triplet alignment with visual structure
+preservation (VSP), which matches pairwise cosine similarities before and after
+projection. We further adapt synthesized prompting \cite{wang2023ship} to
+generate relation-conditioned pseudo visual features for novel predicates.
+At inference, triplet-matching scores complement the original SDSGG logits.
 
-Experiments follow the SDSGG PredCls protocol on Visual Genome
-\cite{krishna2017visualgenome} and GQA \cite{hudson2019gqa}, evaluating base,
-novel, and, where available, semantic predicate partitions with both Recall and
-mean Recall. Across the 30 currently reported Ours-versus-SDSGG metric entries,
-our full model improves SDSGG by 2.06 percentage points on average. On the
-matched Visual Genome base and novel splits, it also exceeds the official APT
-results on all 12 reported metrics. Removing visual structure preservation
-degrades every corresponding base/novel metric, whereas novel feature
-generation consistently improves novel performance while exposing a
-base--novel trade-off. These results support geometry-aware modality transfer
-without assuming evidence from SGCls, SGDet, or transplantation to other
-baselines.
-
-Our contributions are threefold:
-\begin{itemize}
-    \item We target potential geometric distortion during visual-to-text
-    relation transfer and the absence of visual support for novel predicates
-    as two complementary limitations in open-vocabulary predicate
-    classification.
-    \item We develop an SDSGG-based modality-transfer framework combining a
-    dominant-component-refined triplet teacher, pointwise semantic alignment,
-    preservation of source visual-relation geometry, and relation-conditioned
-    synthesized support for novel predicates.
-    \item Within a strictly PredCls scope, we demonstrate consistent gains over
-    SDSGG on Visual Genome and GQA and over APT on the matched Visual Genome
-    protocol, while exposing the distinct effects of geometry preservation and
-    novel feature generation.
-\end{itemize}
+Experiments on Visual Genome and GQA show consistent improvements within this
+strict PredCls scope. Across 30 matched Recall and mean-Recall entries, the
+full model improves SDSGG by 2.06 percentage points on average and exceeds APT
+on all 12 official matched Visual Genome entries. Removing VSP degrades every
+completed base/novel metric; novel synthesis improves every novel metric while
+revealing a base--novel trade-off. Our contributions are therefore threefold:
+(1) we formulate potential geometry distortion and missing novel support as coupled
+limitations of relation-level modality transfer; (2) we introduce a unified
+framework combining dominant-component-refined triplet semantics, VSP, and
+relation-conditioned synthesis; and (3) we establish consistent gains on two
+datasets without assuming SGCls, SGDet, or cross-baseline transferability.
