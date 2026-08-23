@@ -4,138 +4,59 @@
 \subsection{Experimental Setup}
 \label{sec:exp_setup}
 
-\paragraph{Datasets and protocol.}
-We evaluate on Visual Genome (VG) \cite{krishna2017visualgenome} and GQA
-\cite{hudson2019gqa} under the PredCls protocol used by SDSGG
-\cite{chen2024sdsgg}: ground-truth object boxes and labels are given, and the
-model predicts only their pairwise predicates. VG contains 35 base predicates
-used for training and 15 disjoint novel predicates held out from training. We
-also evaluate the base-trained checkpoint on the 24-predicate VG semantic
-subset. The SDSGG-compatible GQA setting contains 21 base and 10 novel
-predicates selected from categories shared with VG. All training annotations
-whose predicate belongs to the target novel split are removed to prevent label
-leakage.
+\textbf{Datasets and metrics.}
+We follow the SDSGG PredCls protocol \cite{chen2024sdsgg} on Visual Genome
+(VG) \cite{krishna2017visualgenome} and GQA \cite{hudson2019gqa}. Ground-truth
+boxes and object labels are supplied, and annotations for target novel
+predicates are excluded from training. VG uses 35 base and 15 novel predicates;
+we additionally apply the base checkpoint to its 24-predicate semantic subset.
+The compatible GQA split contains 21 base and 10 novel predicates. We report
+Recall (R@K) and class-averaged mean Recall (mR@K) for
+$K\in\{20,50,100\}$.
 
-\paragraph{Metrics and competitors.}
-We report Recall at $K$ ($\mathrm{R}@K$) and class-averaged mean Recall at $K$
-($\mathrm{mR}@K$) for $K\in\{20,50,100\}$. The former measures overall triplet
-retrieval, whereas the latter gives equal weight to every predicate and is less
-dominated by frequent relations. We compare with the category-name CLIP
-classifier (CLS) \cite{radford2021clip}, Epic \cite{yu2023epic}, RECODE
-\cite{li2023recode}, the direct SDSGG baseline, and APT \cite{luo2026apt} when
-their published results use the same split and protocol. A dash in a table
-means that the cited method did not report the metric; an empty cell reserves a
-required experiment whose value is not yet available.
+\textbf{Implementation.}
+We retain SDSGG and its CLIP ViT-B/32 encoder. The 512-D transfer branch uses a
+three-layer MLP and a three-layer, eight-head Transformer, sampling at most 256
+positive pairs per step. We remove one teacher component and set alignment and
+VSP weights to 1.0 with $\ell_1$ structure distance; text-structure weight is
+0. Novel synthesis uses a 0.25 pseudo-novel ratio, low-recall sampling,
+reconstruction/KL weights of 1.0/0.01, and 2k/6k warm-up/ramp. The fusion
+weight $\alpha$ is 1.0.
 
-\paragraph{Implementation details.}
-We retain the SDSGG data pipeline and its CLIP ViT-B/32 encoder. The
-modality-transfer branch operates on 512-dimensional union-region features and
-uses a three-layer MLP followed by a three-layer, eight-head Transformer; at
-most 256 positive relation pairs are sampled per training step. The triplet
-teacher removes one dominant component. Pointwise alignment and VSP both use
-weight 1.0, VSP uses an $\ell_1$ distance, and text-structure loss is fixed to
-zero. Novel synthesis uses a pseudo-novel ratio of 0.25 with low-recall
-sampling; its reconstruction and KL weights are 1.0 and 0.01, with 2,000-step
-warm-up and 6,000-step ramp schedules. The transfer score is fused with SDSGG
-logits using weight 1.0. The final submission will report mean and standard
-deviation from three seeds together with common-hardware runtime measurements;
-the tables retain empty cells where those measurements are pending.
-
-\subsection{Comparison with State of the Art}
+\subsection{Comparison Results}
 \label{sec:exp_comparison}
 
-\input{tables/vg_base_novel}
+\input{tables/main_comparison}
 
-\paragraph{Visual Genome base and novel splits.}
-The full method consistently improves both the direct SDSGG baseline and the
-recent APT comparator under the matched Visual Genome protocol. As shown in
-Table~\ref{tab:vg_base_novel}, it outperforms SDSGG on every base and novel
-$\mathrm{R}@K$ and $\mathrm{mR}@K$ entry, giving average absolute gains of 1.85
-and 2.57 percentage points on the two splits, respectively. It also exceeds APT
-on all 12 reported entries, with particularly clear novel-predicate gains of
-1.8 points at $\mathrm{mR}@20$ and 1.6 points at $\mathrm{mR}@100$. These
-matched comparisons support the effectiveness of the proposed transfer branch
-without requiring a change to the SDSGG evaluation protocol.
+\textbf{Visual Genome.}
+Table~\ref{tab:main_comparison} shows that our model improves every matched
+SDSGG and APT entry. Relative to SDSGG, average absolute gains are 1.85 points
+on base and 2.57 on novel predicates. Against APT, the largest gain is 1.8
+points at novel mR@20, while novel mR@100 rises from 32.3 to 33.9. The result
+supports the added transfer branch under an unchanged SDSGG protocol.
 
-\input{tables/vg_semantic}
+\input{tables/transfer_analysis}
 
-\paragraph{Visual Genome semantic subset.}
-The improvement extends to predicates selected for richer semantic content.
-Table~\ref{tab:vg_semantic} shows that our method raises SDSGG by
-2.8/2.4/1.6 points in $\mathrm{R}@20/50/100$ and by 1.8/1.8/0.7 points in
-$\mathrm{mR}@20/50/100$. Because the same base-trained checkpoint is evaluated
-on this subset, the result provides a harder test of semantic transfer rather
-than additional supervised fitting to the 24 target predicates.
+\textbf{Harder transfer settings.}
+The same base-trained checkpoint improves SDSGG on all six VG semantic metrics
+(Table~\ref{tab:transfer_analysis}), including +2.8 R@20 and +1.8 mR@20.
+On GQA, all 12 base/novel entries also improve; novel R@20/50/100 gains are
+4.2/4.6/2.7 points. We reserve APT's GQA row rather than mix its published
+numbers with this table because its SDSGG reference values indicate a different
+protocol.
 
-\input{tables/gqa_base_novel}
-
-\paragraph{GQA base and novel splits.}
-The gain also transfers to the SDSGG-compatible GQA split. Relative to SDSGG,
-Table~\ref{tab:gqa_base_novel} reports positive gains on all 12 base/novel
-entries, with larger improvements on novel Recall---4.2, 4.6, and 2.7 points at
-$K=20,50,100$. We leave APT's matched-protocol row empty rather than combining
-its published GQA results with this table, because those results use different
-SDSGG reference values and therefore do not establish a controlled numerical
-comparison.
-
-\subsection{Ablation Studies}
+\subsection{Ablation and Scope}
 \label{sec:exp_ablation}
 
 \input{tables/core_ablation}
 
-\paragraph{Visual structure preservation.}
-Visual structure preservation improves every completed base and novel entry in
-Table~\ref{tab:core_ablation}. Compared with the variant without VSP, the full
-model gains 0.1--1.7 points on the base split and 0.3--3.5 points on the novel
-split, averaging 1.28 points across all 12 entries. The larger gains in novel
-mean Recall suggest that constraining the pre/post-projection similarity
-geometry is especially useful when direct predicate supervision is absent.
-
-\paragraph{Novel synthesis.}
-Novel synthesis produces a consistent but non-uniform base--novel trade-off.
-Relative to the variant without NS, the full model improves all six novel
-entries, including gains of 1.0/1.1/1.6 points in
-$\mathrm{mR}@20/50/100$, while decreasing all six base entries by
-0.1--1.3 points. We therefore interpret NS as redistributing support toward
-unseen predicates rather than uniformly improving every partition; balanced
-$\mathrm{F}@K$ reporting in Table~\ref{tab:balanced_metrics} is reserved to
-quantify this trade-off consistently.
-
-\input{tables/focused_ablations}
-
-\paragraph{Focused design choices.}
-Table~\ref{tab:focused_ablations} predeclares the controlled experiments needed
-to isolate dominant-component removal and assess sensitivity to VSP, novel
-synthesis, and score fusion. Until those empty cells are measured, the current
-evidence supports the complete transfer branch and the two available removal
-studies, but not an independent performance claim for DCR or hyperparameter
-robustness. Table~\ref{tab:efficiency} similarly reserves a common-hardware
-comparison because APT explicitly emphasizes parameter and training
-efficiency, making resource cost part of a fair practical evaluation.
-
-\subsection{Challenging Evaluation and Analysis}
-\label{sec:exp_challenging}
-
-\paragraph{Current challenging settings.}
-The VG semantic subset and GQA novel split provide the current tests beyond the
-standard VG base/novel comparison. The semantic subset concentrates relations
-with richer meanings and is evaluated without retraining, while GQA changes the
-image and annotation distribution and withholds its novel predicates from
-training. The positive results in Tables~\ref{tab:vg_semantic} and
-\ref{tab:gqa_base_novel} therefore show that the observed gain is not confined
-to the standard VG partition, while remaining within the paper's PredCls
-scope.
-
-\paragraph{Planned stress tests and diagnostics.}
-Three analyses are reserved to characterize where the method reaches its limit:
-performance stratified by base-predicate frequency, confusion matrices for
-near-synonymous predicates, and the correlation between pairwise cosine
-similarities before and after modality transfer. The first two test whether
-improvements extend to rare and fine-grained relations; the third directly
-tests whether VSP preserves the source visual geometry it is designed to
-retain. Figure~\ref{fig:challenging_cases} reserves a qualitative comparison of
-SDSGG, the two completed removal variants, and the full method; examples will be
-sampled uniformly across novel predicates, with a separate panel for the
-highest-confidence failure cases.
-
-\input{figures/challenging_cases_placeholder}
+\textbf{Component effects.}
+VSP improves all 12 completed base/novel metrics over its removal, by 1.28
+points on average, with larger gains on novel mean Recall. Novel synthesis
+improves all six novel entries over ``w/o NS,'' including +1.0/+1.1/+1.6
+mR@20/50/100, but decreases base metrics by 0.1--1.3 points. This exposes a
+base--novel trade-off rather than a uniform gain. The independent DCR result,
+three-seed variability, sensitivity, and common-hardware efficiency remain
+empty in Table~\ref{tab:core_ablation}; no claim relies on these pending
+measurements. Evaluation is deliberately limited to PredCls and does not imply
+SGCls, SGDet, or transfer to other baselines.

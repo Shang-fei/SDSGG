@@ -1,0 +1,22 @@
+\begin{table*}[t]
+\centering
+\caption{Visual Genome PredCls results (\%) under the SDSGG base/novel
+protocol. R@K and mR@K are Recall and mean Recall among the top-$K$
+predictions. Best results are bold.}
+\label{tab:main_comparison}
+\small
+\setlength{\tabcolsep}{5.2pt}
+\begin{tabular}{llrrrrrr}
+\toprule
+Method & Split & R@20$\uparrow$ & R@50$\uparrow$ & R@100$\uparrow$ & mR@20$\uparrow$ & mR@50$\uparrow$ & mR@100$\uparrow$ \\
+\midrule
+SDSGG \cite{chen2024sdsgg} & Base & 18.7 & 26.5 & 31.6 & 9.2 & 12.4 & 14.8 \\
+APT \cite{luo2026apt} & Base & 19.5 & 27.3 & 32.2 & 10.1 & 13.2 & 15.6 \\
+\rowcolor{blue!6}\textbf{Ours} & Base & \textbf{21.1} & \textbf{29.1} & \textbf{34.2} & \textbf{10.4} & \textbf{13.7} & \textbf{15.8} \\
+\midrule
+SDSGG \cite{chen2024sdsgg} & Novel & 18.4 & 25.4 & 29.6 & 17.1 & 25.2 & 31.2 \\
+APT \cite{luo2026apt} & Novel & 19.4 & 26.6 & 31.1 & 18.6 & 26.7 & 32.3 \\
+\rowcolor{blue!6}\textbf{Ours} & Novel & \textbf{21.3} & \textbf{27.5} & \textbf{31.3} & \textbf{20.4} & \textbf{27.9} & \textbf{33.9} \\
+\bottomrule
+\end{tabular}
+\end{table*}
