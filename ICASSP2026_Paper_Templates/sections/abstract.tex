@@ -1,18 +1,17 @@
 \begin{abstract}
-Open-vocabulary scene graph generation must recognize relationships whose
-predicate labels are absent from training. However, mapping visual relation
-instances to language semantics may distort their fine-grained geometry and
-provides no visual support for unseen predicates. We study this problem under
-Predicate Classification and propose a relation-preserving modality-transfer
-framework built on SDSGG. A frozen triplet-text teacher removes a dominant
-shared semantic direction, while a learnable projector combines pointwise
-visual--text alignment with preservation of pairwise similarities among source
-visual relation features. We further adapt synthesized prompting to generate
-relation-conditioned visual features for novel predicates. Experiments under
-the SDSGG protocol on Visual Genome and GQA improve the baseline by 2.06
-percentage points on average across 30 Recall and mean-Recall entries. On the
-matched Visual Genome base and novel splits, our method also outperforms APT on
-all 12 reported metrics.
+Open-vocabulary scene graph generation must recognize predicates absent from
+training. Existing language-guided methods strengthen semantic targets, but
+pointwise visual--text transfer may alter visual relation geometry, while novel
+predicates lack annotated visual support. We address both limitations under
+Predicate Classification with a relation-preserving modality-transfer branch
+for SDSGG. A dominant-component-refined triplet teacher supervises a projector
+that combines pointwise alignment with preservation of pairwise visual
+similarities. A relation-conditioned generator further supplies pseudo visual
+features for unseen predicates. On Visual Genome and GQA, our method improves
+SDSGG by 2.06 percentage points on average across 30 Recall and mean-Recall
+entries. It also exceeds APT on all 12 matched Visual Genome metrics. Ablations
+show consistent benefits from visual structure preservation and novel gains
+from feature synthesis, with an explicit base--novel trade-off.
 \end{abstract}
 
 \begin{keywords}
