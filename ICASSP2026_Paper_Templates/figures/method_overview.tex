@@ -1,0 +1,22 @@
+\begin{figure}[t]
+\centering
+\setlength{\fboxsep}{3pt}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{ccccc}
+\fbox{\shortstack{Union crop\\$\mathbf x_i$}}
+& $\xrightarrow{A,P}$ &
+\fbox{\shortstack{Projection\\$\mathbf q_i$}}
+& $\xrightarrow{\ \cos\ }$ &
+\fbox{\shortstack{Triplet targets\\DCR teacher}} \\
+& $\substack{\mathcal L_{\rm vsp}:\\
+S(\bar{\mathbf h})\leftrightarrow S(\mathbf q)}$ &
+$\uparrow$ &
+\multicolumn{2}{c}{\shortstack{Novel synthesis $G(s,p,o,\mathbf r)$\\
+$\mathbf r\sim\mathcal N(0,\mathbf I)$}} \\
+\multicolumn{5}{c}{$\mathbf z_i=\mathbf z_i^{\rm S}+\alpha\mathbf a_i$}
+\end{tabular}}
+\caption{Overview of relation-preserving modality transfer. DCR removes the
+dominant triplet-text direction; VSP preserves pairwise visual similarities;
+the generator supplies pseudo visual features for novel predicates.}
+\label{fig:method}
+\end{figure}

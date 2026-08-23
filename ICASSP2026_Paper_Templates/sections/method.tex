@@ -1,3 +1,88 @@
 \section{Method}
 \label{sec:method}
-% This section will formalize the implemented modality-transfer framework.
+
+\subsection{Overview and Triplet Teacher}
+\label{sec:method_overview}
+
+We augment a frozen SDSGG predictor with a trainable modality-transfer branch
+that preserves visual relation geometry and supplies training support for novel
+predicates. Under PredCls, an object pair $i=(s_i,o_i)$ has known boxes and
+labels, and SDSGG produces predicate logits $\mathbf z_i^{\rm S}$. We crop the
+union box and encode it with frozen CLIP to obtain
+$\mathbf x_i\in\mathbb R^d$. As summarized in Fig.~\ref{fig:method}, our
+branch refines triplet semantics, projects $\mathbf x_i$ into that space, and
+adds a triplet-matching score to $\mathbf z_i^{\rm S}$.
+
+\input{figures/method_overview}
+
+The triplet teacher represents a predicate in its object context rather than
+by its category name alone. For subject $s$, predicate $p$, and object $o$,
+the frozen CLIP text encoder $E_T$ embeds the prompt ``a photo of a $s$ $p$ a
+$o$'' as a unit vector $\mathbf e_{s,p,o}$. A shared direction can dominate
+this triplet bank and blur predicate-specific variation. We therefore form
+$\mathbf C=N^{-1}\sum_{n=1}^{N}\mathbf e_n\mathbf e_n^\top$, take its leading
+eigenvector $\mathbf u_1$, and define the dominant-component-refined target
+\begin{equation}
+ \mathbf t_{s,p,o}=\operatorname{norm}\!\left[
+ \mathbf e_{s,p,o}-\mathbf u_1\mathbf u_1^\top\mathbf e_{s,p,o}\right].
+ \label{eq:dcr}
+\end{equation}
+The teacher and $\mathbf u_1$ remain frozen during training.
+
+\subsection{Relation-Preserving Modality Transfer}
+\label{sec:relation_transfer}
+
+Pointwise supervision provides semantic alignment but does not constrain how
+relation instances are arranged after projection. We first obtain a visual
+representation $\mathbf h_i=A(\mathbf x_i)$ with a gated residual adapter,
+then use an MLP--Transformer projector $P$ to produce
+$\mathbf q_i=\operatorname{norm}[P(\mathbf h_i)]$. For a labeled base
+predicate $y_i$, pointwise transfer minimizes
+\begin{equation}
+ \mathcal L_{\rm align}=\frac{1}{B}\sum_{i=1}^{B}
+ \left(1-\mathbf q_i^\top\mathbf t_{s_i,y_i,o_i}\right).
+ \label{eq:align}
+\end{equation}
+
+Visual structure preservation (VSP) additionally retains pairwise relation
+geometry across the transfer. Let $\bar{\mathbf h}_i$ denote the normalized
+adapter feature and let $\Omega=\{(i,j):i\ne j\}$. We match the corresponding
+cosine-similarity matrices through
+\begin{equation}
+ \mathcal L_{\rm vsp}=\frac{1}{|\Omega|}\sum_{(i,j)\in\Omega}
+ \left|\bar{\mathbf h}_i^\top\bar{\mathbf h}_j-
+ \mathbf q_i^\top\mathbf q_j\right|.
+ \label{eq:vsp}
+\end{equation}
+Unlike a text-geometry constraint, Eq.~\eqref{eq:vsp} treats the source visual
+organization as the structure to retain; text-structure loss is disabled in
+all reported models.
+
+\subsection{Novel Synthesis and Optimization}
+\label{sec:novel_synthesis}
+
+Novel predicates have no annotated visual features, so alignment alone leaves
+their side of the transfer space unsupported. We adapt a SHIP-style
+conditional variational generator $G$ using base examples. Its encoder
+parameterizes $q_\phi(\mathbf r\mid\bar{\mathbf x})$, while learnable context
+tokens inject the sampled residual $\mathbf r$ into the triplet prompt and
+produce $\tilde{\mathbf x}=G(s,p,o,\mathbf r)$. Training uses
+\begin{equation}
+ \mathcal L_{\rm gen}=\|\tilde{\mathbf x}-\bar{\mathbf x}\|_2^2+
+ \lambda_{\rm kl}D_{\rm KL}\!\left(q_\phi(\mathbf r\mid\bar{\mathbf x})
+ \|\mathcal N(0,\mathbf I)\right).
+ \label{eq:gen}
+\end{equation}
+For a sampled novel triplet, we draw $\mathbf r\sim\mathcal N(0,\mathbf I)$,
+generate a pseudo visual feature, and train it with the same alignment and VSP
+objectives. Subject-compatible predicates are preferred, with low-recall
+novel predicates prioritized when available.
+
+The complete transfer loss is
+$\mathcal L=\mathcal L_{\rm align}+\lambda_{\rm vsp}\mathcal L_{\rm vsp}
++\lambda_{\rm rec}\mathcal L_{\rm rec}+\lambda_{\rm kl}\mathcal L_{\rm kl}$.
+At inference, candidate score
+$a_{i,p}=\mathbf q_i^\top\mathbf t_{s_i,p,o_i}$ complements SDSGG through
+$\mathbf z_i=\mathbf z_i^{\rm S}+\alpha\mathbf a_i$. Thus the added branch
+preserves the original predictor while contributing triplet-conditioned
+open-vocabulary evidence.
