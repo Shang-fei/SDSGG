@@ -1,0 +1,21 @@
+\begin{abstract}
+Open-vocabulary scene graph generation must recognize relationships whose
+predicate labels are absent from training. However, mapping visual relation
+instances to language semantics can distort their fine-grained geometry and
+provides no visual support for unseen predicates. We study this problem under
+Predicate Classification and propose a relation-preserving modality-transfer
+framework built on SDSGG. A frozen triplet-text teacher removes a dominant
+shared semantic direction, while a learnable projector combines pointwise
+visual--text alignment with preservation of pairwise similarities among source
+visual relation features. We further adapt synthesized prompting to generate
+relation-conditioned visual features for novel predicates. Experiments under
+the SDSGG protocol on Visual Genome and GQA improve the baseline by 2.06
+percentage points on average across 30 Recall and mean-Recall entries. On the
+matched Visual Genome base and novel splits, our method also outperforms APT on
+all 12 reported metrics.
+\end{abstract}
+
+\begin{keywords}
+open-vocabulary scene graph generation, predicate classification, modality
+transfer, structure preservation, feature synthesis
+\end{keywords}
