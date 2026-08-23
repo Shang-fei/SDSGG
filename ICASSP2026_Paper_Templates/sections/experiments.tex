@@ -44,7 +44,38 @@ comparison.
 
 \subsection{Ablation Studies}
 \label{sec:exp_ablation}
-% Core and focused ablation inputs are added in the next task.
+
+\input{tables/core_ablation}
+
+\paragraph{Visual structure preservation.}
+Visual structure preservation improves every completed base and novel entry in
+Table~\ref{tab:core_ablation}. Compared with the variant without VSP, the full
+model gains 0.1--1.7 points on the base split and 0.3--3.5 points on the novel
+split, averaging 1.28 points across all 12 entries. The larger gains in novel
+mean Recall suggest that constraining the pre/post-projection similarity
+geometry is especially useful when direct predicate supervision is absent.
+
+\paragraph{Novel synthesis.}
+Novel synthesis produces a consistent but non-uniform base--novel trade-off.
+Relative to the variant without NS, the full model improves all six novel
+entries, including gains of 1.0/1.1/1.6 points in
+$\mathrm{mR}@20/50/100$, while decreasing all six base entries by
+0.1--1.3 points. We therefore interpret NS as redistributing support toward
+unseen predicates rather than uniformly improving every partition; balanced
+$\mathrm{F}@K$ reporting in Table~\ref{tab:balanced_metrics} is reserved to
+quantify this trade-off consistently.
+
+\input{tables/focused_ablations}
+
+\paragraph{Focused design choices.}
+Table~\ref{tab:focused_ablations} predeclares the controlled experiments needed
+to isolate dominant-component removal and assess sensitivity to VSP, novel
+synthesis, and score fusion. Until those empty cells are measured, the current
+evidence supports the complete transfer branch and the two available removal
+studies, but not an independent performance claim for DCR or hyperparameter
+robustness. Table~\ref{tab:efficiency} similarly reserves a common-hardware
+comparison because APT explicitly emphasizes parameter and training
+efficiency, making resource cost part of a fair practical evaluation.
 
 \subsection{Challenging Evaluation and Analysis}
 \label{sec:exp_challenging}
