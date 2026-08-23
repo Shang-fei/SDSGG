@@ -73,6 +73,8 @@ produce $\tilde{\mathbf x}=G(s,p,o,\mathbf r)$. Training uses
  \|\mathcal N(0,\mathbf I)\right).
  \label{eq:gen}
 \end{equation}
+We denote the reconstruction and divergence terms in Eq.~\eqref{eq:gen} by
+$\mathcal L_{\rm rec}$ and $\mathcal L_{\rm kl}$, respectively.
 For a sampled novel triplet, we draw $\mathbf r\sim\mathcal N(0,\mathbf I)$,
 generate a pseudo visual feature, and train it with the same alignment and VSP
 objectives. Subject-compatible predicates are preferred, with low-recall
@@ -80,7 +82,8 @@ novel predicates prioritized when available.
 
 The complete transfer loss is
 $\mathcal L=\mathcal L_{\rm align}+\lambda_{\rm vsp}\mathcal L_{\rm vsp}
-+\lambda_{\rm rec}\mathcal L_{\rm rec}+\lambda_{\rm kl}\mathcal L_{\rm kl}$.
++\lambda_{\rm rec}\mathcal L_{\rm rec}+\rho\lambda_{\rm kl}\mathcal L_{\rm kl}$,
+where $\rho$ ramps the synthesis regularizer and pseudo-novel count.
 At inference, candidate score
 $a_{i,p}=\mathbf q_i^\top\mathbf t_{s_i,p,o_i}$ complements SDSGG through
 $\mathbf z_i=\mathbf z_i^{\rm S}+\alpha\mathbf a_i$. Thus the added branch
