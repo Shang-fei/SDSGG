@@ -1,3 +1,51 @@
 \section{Experiments}
 \label{sec:experiments}
-% Experimental prose and table inputs are added in the following tasks.
+
+\subsection{Experimental Setup}
+\label{sec:exp_setup}
+% The complete verified setup is added after the comparison and ablation tables.
+
+\subsection{Comparison with State of the Art}
+\label{sec:exp_comparison}
+
+\input{tables/vg_base_novel}
+
+\paragraph{Visual Genome base and novel splits.}
+The full method consistently improves both the direct SDSGG baseline and the
+recent APT comparator under the matched Visual Genome protocol. As shown in
+Table~\ref{tab:vg_base_novel}, it outperforms SDSGG on every base and novel
+$\mathrm{R}@K$ and $\mathrm{mR}@K$ entry, giving average absolute gains of 1.85
+and 2.57 percentage points on the two splits, respectively. It also exceeds APT
+on all 12 reported entries, with particularly clear novel-predicate gains of
+1.8 points at $\mathrm{mR}@20$ and 1.6 points at $\mathrm{mR}@100$. These
+matched comparisons support the effectiveness of the proposed transfer branch
+without requiring a change to the SDSGG evaluation protocol.
+
+\input{tables/vg_semantic}
+
+\paragraph{Visual Genome semantic subset.}
+The improvement extends to predicates selected for richer semantic content.
+Table~\ref{tab:vg_semantic} shows that our method raises SDSGG by
+2.8/2.4/1.6 points in $\mathrm{R}@20/50/100$ and by 1.8/1.8/0.7 points in
+$\mathrm{mR}@20/50/100$. Because the same base-trained checkpoint is evaluated
+on this subset, the result provides a harder test of semantic transfer rather
+than additional supervised fitting to the 24 target predicates.
+
+\input{tables/gqa_base_novel}
+
+\paragraph{GQA base and novel splits.}
+The gain also transfers to the SDSGG-compatible GQA split. Relative to SDSGG,
+Table~\ref{tab:gqa_base_novel} reports positive gains on all 12 base/novel
+entries, with larger improvements on novel Recall---4.2, 4.6, and 2.7 points at
+$K=20,50,100$. We leave APT's matched-protocol row empty rather than combining
+its published GQA results with this table, because those results use different
+SDSGG reference values and therefore do not establish a controlled numerical
+comparison.
+
+\subsection{Ablation Studies}
+\label{sec:exp_ablation}
+% Core and focused ablation inputs are added in the next task.
+
+\subsection{Challenging Evaluation and Analysis}
+\label{sec:exp_challenging}
+% Hard-setting discussion and the qualitative placeholder are added after setup.
