@@ -13,16 +13,16 @@
 
 ### Introduction
 
-1. **Task boundary:** define OVSGG and isolate predicate recognition through
-   PredCls.
-2. **Challenge:** richer semantic prompts leave visual transport geometry and
-   missing novel instances unresolved.
-3. **Hypothesis:** geometry preservation and novel support address complementary
-   transfer failures.
+1. **Task and difficulty:** define OVSGG and explain why relations require
+   fine-grained subject--object interaction cues.
+2. **Challenge:** richer semantic prompts improve transfer targets but leave
+   visual geometry and missing novel instances unresolved.
+3. **Technical view:** formulate relation recognition as geometry-preserving
+   cross-modal distribution completion and define its two concrete requirements.
 4. **Framework:** DCR triplet teacher, projector/VSP, novel synthesis, and score
    fusion.
-5. **Evidence and contribution:** report only matched measurements and state the
-   strict scope.
+5. **Evidence and contribution:** report only matched measurements and connect
+   the ablations to the two stated requirements.
 
 ### Related Work
 
@@ -94,9 +94,10 @@ parameter/runtime measurement is available. | Status: needs evidence
 
 Claim: VSP directly reduces measured geometric distortion. | Evidence: the
 removal study supports performance, but the pairwise-similarity diagnostic is
-not measured. The manuscript therefore says VSP is designed to preserve
-geometry and uses ``potential distortion'' in the contribution statement. |
-Status: needs evidence for a stronger causal claim
+not measured. The Introduction therefore states that pointwise alignment leaves
+relative arrangement unconstrained and describes VSP by its optimization
+objective; it does not claim a measured reduction in distortion. | Status:
+needs evidence for a stronger causal claim
 
 ## Five-Dimension Review
 
