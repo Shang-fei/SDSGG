@@ -32,10 +32,12 @@ htmlcov/
 .vscode/
 
 ### Project outputs and generated artifacts
+ICASSP2026_Paper_Templates/
 output/
 checkpoint/
 datasets/
 logs/
+paper/
 *.txt
 *.csv
 *.log
@@ -67,6 +69,8 @@ datasets/**/tmp/
 Thumbs.db
 
 ### Editor and workspace leftovers
+*.tex
+*.bib
 *.swp
 *.swo
 *~
