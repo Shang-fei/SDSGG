@@ -147,9 +147,20 @@ class MTMPlugin(nn.Module):
     def _empty_losses(self):
         return self.loss_computer.empty(self.projector.output_normalization.weight)
 
-    def compute_losses(self, raw, subjects, objects, relations):
+    def compute_losses(
+        self,
+        raw,
+        subjects,
+        objects,
+        relations,
+        subject_features=None,
+        object_features=None,
+    ):
         self.training_step.add_(1)
         step = int(self.training_step.item())
+        fusion_enabled = bool(
+            self.config.PROJECTOR.ENTITY_FUSION_ENABLED
+        )
         max_pairs = int(self.config.MAX_TRAIN_PAIRS)
         if max_pairs > 0 and raw.size(0) > max_pairs:
             index = torch.linspace(
@@ -159,6 +170,16 @@ class MTMPlugin(nn.Module):
                 value.index_select(0, index)
                 for value in (raw, subjects, objects, relations)
             ]
+            if subject_features is not None:
+                subject_features = subject_features.index_select(0, index)
+                object_features = object_features.index_select(0, index)
+
+        base_relation_features = self.projector.fuse_inputs(
+            subject_features,
+            raw,
+            object_features,
+            fusion_enabled,
+        )
 
         base_texts, base_predicates, base_targets = self.teacher.build_targets(
             subjects, relations, objects, self.active_relations
@@ -174,10 +195,10 @@ class MTMPlugin(nn.Module):
             step, ship.WARMUP_STEPS, ship.RAMP_STEPS
         )
 
-        replay_raw = replay_targets = None
+        replay_raw = replay_targets = replay_source_indices = None
         replay_subjects = replay_objects = None
         replay_predicates = []
-        novel_raw = None
+        novel_raw = novel_source_indices = None
         if self.generator is not None:
             reconstructed, mean, logvar = self.generator.reconstruct(
                 base_texts, normalized_base_raw
@@ -200,6 +221,7 @@ class MTMPlugin(nn.Module):
                     replay_subjects,
                     replay_objects,
                     replay_predicates,
+                    replay_source_indices,
                 ) = self.sampler.sample_base(
                     subjects, objects, replay_count, self.teacher
                 )
@@ -219,6 +241,7 @@ class MTMPlugin(nn.Module):
                 novel_subjects,
                 novel_objects,
                 novel_predicates,
+                novel_source_indices,
             ) = self.sampler.sample_novel(
                 subjects, objects, novel_count, self.teacher
             )
@@ -232,7 +255,23 @@ class MTMPlugin(nn.Module):
             novel_predicates, novel_targets = [], None
             novel_subjects = novel_objects = None
 
-        all_raw = torch.cat([raw, novel_raw], dim=0) if novel_raw is not None else raw
+        novel_relation_features = None
+        if novel_raw is not None:
+            novel_relation_features = self.projector.fuse_inputs(
+                subject_features.index_select(0, novel_source_indices)
+                if fusion_enabled
+                else None,
+                novel_raw,
+                object_features.index_select(0, novel_source_indices)
+                if fusion_enabled
+                else None,
+                fusion_enabled,
+            )
+        all_raw = (
+            torch.cat([base_relation_features, novel_relation_features], dim=0)
+            if novel_relation_features is not None
+            else base_relation_features
+        )
         all_targets = (
             torch.cat([base_targets, novel_targets], dim=0)
             if novel_targets is not None
@@ -264,8 +303,19 @@ class MTMPlugin(nn.Module):
         )
         main_count = normalized_projected.size(0)
         if replay_raw is not None:
+            replay_relation_features = self.projector.fuse_inputs(
+                subject_features.index_select(0, replay_source_indices)
+                if fusion_enabled
+                else None,
+                replay_raw,
+                object_features.index_select(0, replay_source_indices)
+                if fusion_enabled
+                else None,
+                fusion_enabled,
+            )
             _, replay_projected = self.projector(
-                replay_raw, self.config.PROJECTOR.VISUAL_ADAPTER_ENABLED
+                replay_relation_features,
+                self.config.PROJECTOR.VISUAL_ADAPTER_ENABLED,
             )
             replay_projected = F.normalize(replay_projected.float(), dim=-1)
             _, replay_align_pos, replay_align_neg = self.loss_computer.alignment(
@@ -314,7 +364,7 @@ class MTMPlugin(nn.Module):
             structure_distance,
         )
         base_debug = {
-            "raw": raw,
+            "raw": base_relation_features,
             "h": visual[:base_count],
             "q": normalized_projected[:base_count],
             "t": base_targets,
@@ -338,7 +388,7 @@ class MTMPlugin(nn.Module):
                 structure_distance,
             )
             novel_debug = {
-                "raw": novel_raw,
+                "raw": novel_relation_features,
                 "h": visual[base_count:],
                 "q": normalized_projected[base_count:],
                 "t": novel_targets,
@@ -380,6 +430,7 @@ class MTMPlugin(nn.Module):
         pair_indices,
         relation_labels,
         object_labels,
+        object_clip_features=None,
     ):
         if self.training and not self.config.TRAINING_ENABLED:
             return MTMOutput()
@@ -395,18 +446,25 @@ class MTMPlugin(nn.Module):
             [],
             [],
         )
+        subject_feature_batches, object_feature_batches = [], []
         inference_scores = []
         labels_per_image = (
             relation_labels
             if relation_labels is not None
             else [None] * len(pair_indices)
         )
-        for image, proposal, pairs, predicted_objects, labels in zip(
+        clip_features_per_image = (
+            object_clip_features
+            if object_clip_features is not None
+            else [None] * len(pair_indices)
+        )
+        for image, proposal, pairs, predicted_objects, labels, clip_objects in zip(
             images,
             proposals,
             pair_indices,
             object_labels,
             labels_per_image,
+            clip_features_per_image,
         ):
             pairs = pairs.long()
             if self.training:
@@ -424,6 +482,24 @@ class MTMPlugin(nn.Module):
                     )
                 continue
             raw = self._crop_union_features(image, proposal, selected_pairs)
+            subject_visual = object_visual = None
+            if self.config.PROJECTOR.ENTITY_FUSION_ENABLED:
+                if clip_objects is None:
+                    raise ValueError(
+                        "MTM entity fusion requires precomputed object CLIP features"
+                    )
+                clip_cls = (
+                    clip_objects[:, 0, :]
+                    if clip_objects.dim() == 3
+                    else clip_objects
+                )
+                selected_on_clip = selected_pairs.to(clip_cls.device)
+                subject_visual = clip_cls.index_select(
+                    0, selected_on_clip[:, 0]
+                ).to(raw.device)
+                object_visual = clip_cls.index_select(
+                    0, selected_on_clip[:, 1]
+                ).to(raw.device)
             subjects = predicted_objects.index_select(
                 0, selected_pairs[:, 0]
             ).long().to(raw.device)
@@ -438,12 +514,21 @@ class MTMPlugin(nn.Module):
                 raw_features.append(raw)
                 subject_labels.append(subjects)
                 object_label_batches.append(objects)
+                subject_feature_batches.append(subject_visual)
+                object_feature_batches.append(object_visual)
                 target_relations.append(
                     labels.to(raw.device).index_select(0, positive)
                 )
             else:
+                relation_features = self.projector.fuse_inputs(
+                    subject_visual,
+                    raw,
+                    object_visual,
+                    self.config.PROJECTOR.ENTITY_FUSION_ENABLED,
+                )
                 _, projected = self.projector(
-                    raw, self.config.PROJECTOR.VISUAL_ADAPTER_ENABLED
+                    relation_features,
+                    self.config.PROJECTOR.VISUAL_ADAPTER_ENABLED,
                 )
                 projected = F.normalize(projected.float(), dim=-1)
                 score_chunks = []
@@ -479,6 +564,16 @@ class MTMPlugin(nn.Module):
                 torch.cat(subject_labels),
                 torch.cat(object_label_batches),
                 torch.cat(target_relations),
+                (
+                    torch.cat(subject_feature_batches)
+                    if self.config.PROJECTOR.ENTITY_FUSION_ENABLED
+                    else None
+                ),
+                (
+                    torch.cat(object_feature_batches)
+                    if self.config.PROJECTOR.ENTITY_FUSION_ENABLED
+                    else None
+                ),
             )
         )
 

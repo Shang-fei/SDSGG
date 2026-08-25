@@ -23,9 +23,39 @@ class VisualResidualAdapter(nn.Module):
         return residual + torch.sigmoid(self.feature_gate(normalized)) * delta
 
 
+class EntityRelationFusion(nn.Module):
+    def __init__(self, feature_dim, dropout):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.LayerNorm(feature_dim * 3),
+            nn.Linear(feature_dim * 3, feature_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(feature_dim, feature_dim),
+        )
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+
+    def forward(self, subject, union, object_):
+        features = torch.cat(
+            [
+                F.normalize(subject.float(), dim=-1),
+                F.normalize(union.float(), dim=-1),
+                F.normalize(object_.float(), dim=-1),
+            ],
+            dim=-1,
+        )
+        return union.float() + self.mlp(features)
+
+
 class MTMProjector(nn.Module):
     def __init__(self, config):
         super().__init__()
+        self.entity_fusion = (
+            EntityRelationFusion(config.INPUT_DIM, config.DROPOUT)
+            if config.ENTITY_FUSION_ENABLED
+            else None
+        )
         self.visual_adapter = VisualResidualAdapter(
             config.INPUT_DIM, config.EMBED_DIM, config.DROPOUT
         )
@@ -51,6 +81,17 @@ class MTMProjector(nn.Module):
             attention_layer, num_layers=config.NUM_ATTENTION_LAYERS
         )
         self.output_normalization = nn.LayerNorm(config.EMBED_DIM)
+
+    def fuse_inputs(self, subject, union, object_, enabled):
+        if not enabled:
+            return union.float()
+        if subject is None or object_ is None:
+            raise ValueError(
+                "MTM entity fusion requires subject and object CLIP features"
+            )
+        if self.entity_fusion is None:
+            raise ValueError("MTM entity fusion was not initialized")
+        return self.entity_fusion(subject, union, object_)
 
     def forward(self, raw_features, use_visual_adapter=True):
         visual_features = (

@@ -1,0 +1,80 @@
+<style>
+  .cards { grid-template-columns: 1fr; gap: 18px; }
+  .card-image { background:#fff; padding:14px; }
+  .paper-svg { width:100%; height:auto; display:block; }
+  .recommend { display:inline-block; padding:3px 8px; border-radius:999px; background:#e8f1ff; color:#2156a5; font-size:12px; font-weight:700; }
+</style>
+
+<h2>Choose the information architecture for Fig. 2</h2>
+<p class="subtitle">All three are conference-paper layouts. Select the one that makes the contribution easiest to understand in 5–8 seconds.</p>
+
+<div class="cards">
+  <div class="card" data-choice="a" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <svg class="paper-svg" viewBox="0 0 1120 280" xmlns="http://www.w3.org/2000/svg">
+        <defs><marker id="aa" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#52616b"/></marker></defs>
+        <rect width="1120" height="280" rx="12" fill="#fbfcfe"/>
+        <text x="22" y="30" font-size="17" font-weight="700" fill="#263238">Visual stream</text>
+        <rect x="22" y="50" width="122" height="72" rx="9" fill="#eaf2fb" stroke="#4d83b3"/><text x="83" y="80" text-anchor="middle" font-size="15" fill="#263238">Union-region</text><text x="83" y="102" text-anchor="middle" font-size="14" fill="#263238">feature x</text>
+        <path d="M144 86 H190" stroke="#52616b" stroke-width="2" marker-end="url(#aa)"/>
+        <rect x="192" y="50" width="152" height="72" rx="9" fill="#eaf2fb" stroke="#4d83b3"/><text x="268" y="80" text-anchor="middle" font-size="15" font-weight="700" fill="#263238">Visual Adapter</text><text x="268" y="102" text-anchor="middle" font-size="13" fill="#52616b">relation feature h</text>
+        <path d="M344 86 H398" stroke="#52616b" stroke-width="2" marker-end="url(#aa)"/>
+        <rect x="400" y="50" width="165" height="72" rx="9" fill="#eaf2fb" stroke="#4d83b3"/><text x="482" y="80" text-anchor="middle" font-size="15" font-weight="700" fill="#263238">Projector</text><text x="482" y="102" text-anchor="middle" font-size="13" fill="#52616b">aligned feature q</text>
+        <path d="M565 86 H735" stroke="#52616b" stroke-width="2" marker-end="url(#aa)"/>
+        <rect x="737" y="50" width="165" height="72" rx="9" fill="#f2ecfb" stroke="#7b61a8"/><text x="819" y="80" text-anchor="middle" font-size="15" font-weight="700" fill="#263238">Similarity</text><text x="819" y="102" text-anchor="middle" font-size="13" fill="#52616b">triplet scores</text>
+        <path d="M902 86 H962" stroke="#52616b" stroke-width="2" marker-end="url(#aa)"/>
+        <rect x="964" y="50" width="132" height="72" rx="9" fill="#e9f7ef" stroke="#4e9b70"/><text x="1030" y="80" text-anchor="middle" font-size="15" font-weight="700" fill="#263238">Predicate</text><text x="1030" y="102" text-anchor="middle" font-size="13" fill="#52616b">prediction</text>
+        <path d="M269 129 C310 176,442 176,482 129" fill="none" stroke="#d36b3f" stroke-width="2.5" stroke-dasharray="7 5" marker-end="url(#aa)"/><text x="375" y="170" text-anchor="middle" font-size="14" font-weight="700" fill="#c75b32">VSP: preserve pairwise geometry</text>
+        <text x="22" y="217" font-size="17" font-weight="700" fill="#263238">Semantic support</text>
+        <rect x="192" y="193" width="152" height="62" rx="9" fill="#fff5e7" stroke="#d8953d"/><text x="268" y="220" text-anchor="middle" font-size="14" font-weight="700">Triplet prompts</text><text x="268" y="241" text-anchor="middle" font-size="13" fill="#52616b">&lt;s, p, o&gt;</text>
+        <path d="M344 224 H398" stroke="#52616b" stroke-width="2" marker-end="url(#aa)"/>
+        <rect x="400" y="193" width="165" height="62" rx="9" fill="#fff5e7" stroke="#d8953d"/><text x="482" y="220" text-anchor="middle" font-size="14" font-weight="700">DCR Teacher</text><text x="482" y="241" text-anchor="middle" font-size="13" fill="#52616b">refined target t</text>
+        <path d="M565 224 H735 V125" fill="none" stroke="#52616b" stroke-width="2" marker-end="url(#aa)"/>
+        <rect x="593" y="145" width="142" height="48" rx="9" fill="#f6edfa" stroke="#9a66ad"/><text x="664" y="165" text-anchor="middle" font-size="13" font-weight="700">Novel Synthesis</text><text x="664" y="182" text-anchor="middle" font-size="12" fill="#52616b">pseudo visual support</text>
+        <path d="M593 169 H548 V128" fill="none" stroke="#9a66ad" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#aa)"/>
+      </svg>
+    </div>
+    <div class="card-body"><span class="recommend">Recommended</span><h3>A. Dual-stream convergence</h3><p>Separates visual evidence from semantic support, then makes VSP and novel synthesis visible as the two decisive interventions. Best match to the Introduction story.</p></div>
+  </div>
+
+  <div class="card" data-choice="b" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <svg class="paper-svg" viewBox="0 0 1120 255" xmlns="http://www.w3.org/2000/svg">
+        <defs><marker id="ab" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#52616b"/></marker></defs>
+        <rect width="1120" height="255" rx="12" fill="#fbfcfe"/>
+        <rect x="18" y="18" width="310" height="219" rx="12" fill="#fff8f5" stroke="#d79a82"/><text x="40" y="48" font-size="17" font-weight="700">Why pointwise transfer fails</text>
+        <circle cx="90" cy="108" r="14" fill="#76a5d2"/><circle cx="145" cy="88" r="14" fill="#76a5d2"/><circle cx="120" cy="158" r="14" fill="#e29b72"/><path d="M90 108 L145 88 L120 158 Z" fill="none" stroke="#73808a" stroke-width="2"/>
+        <path d="M174 124 H225" stroke="#52616b" stroke-width="2" marker-end="url(#ab)"/>
+        <circle cx="260" cy="80" r="14" fill="#76a5d2"/><circle cx="285" cy="147" r="14" fill="#76a5d2"/><circle cx="240" cy="170" r="14" fill="#e29b72"/><text x="173" y="211" text-anchor="middle" font-size="13" fill="#b14e34">visual geometry distorted</text>
+        <path d="M328 127 H380" stroke="#52616b" stroke-width="3" marker-end="url(#ab)"/>
+        <rect x="382" y="18" width="720" height="219" rx="12" fill="#f7fbff" stroke="#6f9fc6"/><text x="405" y="48" font-size="17" font-weight="700">Our structure-preserving transfer</text>
+        <rect x="405" y="74" width="130" height="60" rx="8" fill="#eaf2fb" stroke="#4d83b3"/><text x="470" y="109" text-anchor="middle" font-size="14">Visual feature</text><path d="M535 104 H585" stroke="#52616b" stroke-width="2" marker-end="url(#ab)"/>
+        <rect x="587" y="74" width="130" height="60" rx="8" fill="#eaf2fb" stroke="#4d83b3"/><text x="652" y="100" text-anchor="middle" font-size="14" font-weight="700">Projection</text><text x="652" y="120" text-anchor="middle" font-size="12">+ VSP</text><path d="M717 104 H770" stroke="#52616b" stroke-width="2" marker-end="url(#ab)"/>
+        <rect x="772" y="74" width="130" height="60" rx="8" fill="#fff5e7" stroke="#d8953d"/><text x="837" y="100" text-anchor="middle" font-size="14" font-weight="700">DCR target</text><text x="837" y="120" text-anchor="middle" font-size="12">triplet semantics</text><path d="M902 104 H952" stroke="#52616b" stroke-width="2" marker-end="url(#ab)"/>
+        <rect x="954" y="74" width="125" height="60" rx="8" fill="#e9f7ef" stroke="#4e9b70"/><text x="1016" y="109" text-anchor="middle" font-size="14">Prediction</text>
+        <rect x="587" y="164" width="315" height="48" rx="8" fill="#f6edfa" stroke="#9a66ad"/><text x="744" y="193" text-anchor="middle" font-size="14" font-weight="700">Novel synthesis expands visual support</text><path d="M744 164 V138" stroke="#9a66ad" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#ab)"/>
+      </svg>
+    </div>
+    <div class="card-body"><h3>B. Motivation + pipeline</h3><p>Combines the failure mode and the solution in one figure. Strong as a teaser, but more crowded and less suitable if Introduction already explains the pointwise-alignment problem.</p></div>
+  </div>
+
+  <div class="card" data-choice="c" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <svg class="paper-svg" viewBox="0 0 1120 245" xmlns="http://www.w3.org/2000/svg">
+        <defs><marker id="ac" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#52616b"/></marker></defs>
+        <rect width="1120" height="245" rx="12" fill="#fbfcfe"/>
+        <rect x="18" y="18" width="750" height="209" rx="12" fill="#f8fbfe" stroke="#6f9fc6"/><text x="38" y="48" font-size="17" font-weight="700">Training</text>
+        <rect x="40" y="72" width="115" height="58" rx="8" fill="#eaf2fb" stroke="#4d83b3"/><text x="97" y="106" text-anchor="middle" font-size="14">Visual x</text><path d="M155 101 H200" stroke="#52616b" stroke-width="2" marker-end="url(#ac)"/>
+        <rect x="202" y="72" width="135" height="58" rx="8" fill="#eaf2fb" stroke="#4d83b3"/><text x="269" y="106" text-anchor="middle" font-size="14">Adapter + P</text><path d="M337 101 H385" stroke="#52616b" stroke-width="2" marker-end="url(#ac)"/>
+        <rect x="387" y="72" width="135" height="58" rx="8" fill="#fff5e7" stroke="#d8953d"/><text x="454" y="98" text-anchor="middle" font-size="14">Triplet target</text><text x="454" y="117" text-anchor="middle" font-size="12">DCR</text>
+        <rect x="202" y="159" width="135" height="44" rx="8" fill="#f7ebe7" stroke="#d36b3f"/><text x="269" y="186" text-anchor="middle" font-size="13" font-weight="700">VSP loss</text>
+        <rect x="387" y="159" width="135" height="44" rx="8" fill="#f6edfa" stroke="#9a66ad"/><text x="454" y="186" text-anchor="middle" font-size="13" font-weight="700">Novel synthesis</text>
+        <rect x="570" y="88" width="170" height="82" rx="8" fill="#edf7f1" stroke="#4e9b70"/><text x="655" y="118" text-anchor="middle" font-size="14" font-weight="700">Joint objectives</text><text x="655" y="140" text-anchor="middle" font-size="12">align + VSP + gen</text>
+        <path d="M522 101 H570" stroke="#52616b" stroke-width="2" marker-end="url(#ac)"/><path d="M337 181 H570" stroke="#52616b" stroke-width="2" marker-end="url(#ac)"/><path d="M522 181 H570" stroke="#52616b" stroke-width="2" marker-end="url(#ac)"/>
+        <path d="M768 122 H808" stroke="#52616b" stroke-width="3" marker-end="url(#ac)"/>
+        <rect x="810" y="18" width="292" height="209" rx="12" fill="#f9fbf9" stroke="#71a486"/><text x="833" y="48" font-size="17" font-weight="700">Inference</text><rect x="837" y="78" width="110" height="58" rx="8" fill="#eaf2fb" stroke="#4d83b3"/><text x="892" y="112" text-anchor="middle" font-size="14">Relation q</text><path d="M947 107 H976" stroke="#52616b" stroke-width="2" marker-end="url(#ac)"/><rect x="978" y="78" width="100" height="58" rx="8" fill="#e9f7ef" stroke="#4e9b70"/><text x="1028" y="102" text-anchor="middle" font-size="13">Triplet</text><text x="1028" y="121" text-anchor="middle" font-size="13">scores</text>
+      </svg>
+    </div>
+    <div class="card-body"><h3>C. Training / inference split</h3><p>Maximizes procedural clarity and reproducibility. Conventional and safe, but visually underplays the paper’s central insight about preserving structure and completing novel support.</p></div>
+  </div>
+</div>

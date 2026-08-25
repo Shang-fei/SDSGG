@@ -354,28 +354,40 @@ class GQAClipPredictor(nn.Module):
         assert len(num_rels) == len(num_objs)
         obj_preds = obj_preds.split(num_objs, dim=0)
 
+        object_clip_features = []
+        for image, proposal in zip(img, proposals):
+            image_features = []
+            with torch.no_grad():
+                for box in proposal.bbox:
+                    crop = crop_and_resize(
+                        image.unsqueeze(0), box, box
+                    )
+                    crop_array = (
+                        crop[0].permute(1, 2, 0).detach().cpu().numpy() * 255
+                    )
+                    crop_image = Image.fromarray(np.uint8(crop_array))
+                    image_features.append(
+                        self.clip_preprocess(crop_image).unsqueeze(0).to(self.device)
+                    )
+                encoded_objects = self.clip_model.encode_image(
+                    torch.cat(image_features)
+                )
+            object_clip_features.append(encoded_objects)
+
         mtm_output = self.mtm(
             images=img,
             proposals=proposals,
             pair_indices=rel_pair_idxs,
             relation_labels=rel_labels,
             object_labels=obj_preds,
+            object_clip_features=object_clip_features,
         ) if self.mtm is not None else None
 
         rel_dists=[]
         for i in range(len(num_rels)):
             rel_dist_per_batch=[]
             union_imges=[]
-            image_features=[]
-            with torch.no_grad():
-                for j in range(len(proposals[i].bbox)):
-                    union_img = crop_and_resize(img[i].unsqueeze(0), proposals[i].bbox[j], proposals[i].bbox[j])
-                    iimg = union_img[0].permute(1, 2, 0).detach().cpu().numpy() * 255
-                    iimg = Image.fromarray(np.uint8(iimg))
-                    union_img = self.clip_preprocess(iimg).unsqueeze(0).to(self.device)
-                    image_features.append(union_img)
-                image_features = torch.cat(image_features)
-                image_features = self.clip_model.encode_image(image_features)
+            image_features = object_clip_features[i]
 
             pair_idx = rel_pair_idxs[i].long()
             if pair_idx.numel() == 0:
@@ -824,25 +836,32 @@ class ClipPredictor(nn.Module):
         assert len(num_rels) == len(num_objs)
         obj_preds = obj_preds.split(num_objs, dim=0)
 
+        object_clip_features = []
+        with torch.no_grad():
+            for image, proposal in zip(img, proposals):
+                clip_image = self.cropImagePadding(image, proposal)
+                object_clip_features.append(
+                    self.encodeClipBoxCrops(
+                        clip_image,
+                        proposal.bbox,
+                        returnTokens=True,
+                    )
+                )
+
         mtm_output = self.mtm(
             images=img,
             proposals=proposals,
             pair_indices=rel_pair_idxs,
             relation_labels=rel_labels,
             object_labels=obj_preds,
+            object_clip_features=object_clip_features,
         ) if self.mtm is not None else None
 
         rel_dists=[]
         relationnessLogitsForLoss = []
         relationnessLabelsForLoss = []
         for i in range(len(num_rels)):
-            with torch.no_grad():
-                clipImage = self.cropImagePadding(img[i], proposals[i])
-                image_features = self.encodeClipBoxCrops(
-                    clipImage,
-                    proposals[i].bbox,
-                    returnTokens=True,
-                )
+            image_features = object_clip_features[i]
 
             pair_idx = rel_pair_idxs[i].long()
             if pair_idx.numel() == 0:

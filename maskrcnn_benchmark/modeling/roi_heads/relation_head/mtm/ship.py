@@ -208,7 +208,7 @@ class PredicateSampler(nn.Module):
 
     def sample_base(self, subjects, objects, count, teacher):
         if count <= 0 or not self.base_names:
-            return [], None, None, []
+            return [], None, None, [], None
         pair_indices = torch.randint(subjects.numel(), (count,), device=subjects.device)
         sampled_subjects = subjects.index_select(0, pair_indices)
         sampled_objects = objects.index_select(0, pair_indices)
@@ -248,11 +248,11 @@ class PredicateSampler(nn.Module):
         self.base_sample_counts.add_(
             torch.bincount(sampled_slots, minlength=len(self.base_names))
         )
-        return texts, sampled_subjects, sampled_objects, predicates
+        return texts, sampled_subjects, sampled_objects, predicates, pair_indices
 
     def sample_novel(self, subjects, objects, count, teacher):
         if count <= 0 or not self.novel_names:
-            return [], None, None, []
+            return [], None, None, [], None
         indices = torch.randint(subjects.numel(), (count,), device=subjects.device)
         sampled_subjects = subjects.index_select(0, indices)
         sampled_objects = objects.index_select(0, indices)
@@ -294,4 +294,4 @@ class PredicateSampler(nn.Module):
         self.novel_sample_counts.add_(
             torch.bincount(sampled_slots, minlength=len(self.novel_names))
         )
-        return texts, sampled_subjects, sampled_objects, predicates
+        return texts, sampled_subjects, sampled_objects, predicates, indices

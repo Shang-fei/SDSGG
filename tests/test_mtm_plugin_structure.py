@@ -108,6 +108,37 @@ class MTMPluginStructureTest(unittest.TestCase):
         self.assertIn('distance == "l2"', source)
         self.assertIn("difference.pow(2).mean()", source)
 
+    def test_entity_fusion_is_optional_and_residual(self):
+        defaults = (ROOT / "maskrcnn_benchmark" / "config" / "defaults.py").read_text()
+        projector = (MTM_PACKAGE / "projector.py").read_text()
+        self.assertIn("MTM.PROJECTOR.ENTITY_FUSION_ENABLED = False", defaults)
+        self.assertIn("class EntityRelationFusion", projector)
+        self.assertIn("F.normalize(union.float(), dim=-1)", projector)
+        self.assertIn("return union.float() + self.mlp(features)", projector)
+        self.assertIn("nn.init.zeros_(self.mlp[-1].weight)", projector)
+        self.assertIn("if config.ENTITY_FUSION_ENABLED", projector)
+
+    def test_predictors_reuse_object_clip_features_for_mtm(self):
+        predictors = (
+            ROOT
+            / "maskrcnn_benchmark"
+            / "modeling"
+            / "roi_heads"
+            / "relation_head"
+            / "roi_relation_predictors.py"
+        ).read_text()
+        self.assertGreaterEqual(
+            predictors.count("object_clip_features=object_clip_features"), 2
+        )
+
+    def test_ship_sampling_exposes_source_pair_indices(self):
+        ship = (MTM_PACKAGE / "ship.py").read_text()
+        plugin = (MTM_PACKAGE / "plugin.py").read_text()
+        self.assertIn("return texts, sampled_subjects, sampled_objects, predicates, pair_indices", ship)
+        self.assertIn("return texts, sampled_subjects, sampled_objects, predicates, indices", ship)
+        self.assertIn("object_clip_features=None", plugin)
+        self.assertIn("novel_source_indices", plugin)
+
 
 if __name__ == "__main__":
     unittest.main()
