@@ -28,8 +28,17 @@ def _structure_distance(left, right, mask, distance):
 
 
 def structure_losses(
-    visual_features, projected_features, text_features, distance="l1"
+    visual_features,
+    projected_features,
+    text_features,
+    distance="l1",
+    reference="projected",
 ):
+    if reference not in ("projected", "text"):
+        raise ValueError(
+            "MTM.LOSS.STRUCTURE_REFERENCE must be 'projected' or 'text', "
+            "got '{}'".format(reference)
+        )
     if projected_features.size(0) < 2:
         zero = projected_features.sum() * 0.0
         return zero, zero
@@ -41,9 +50,12 @@ def structure_losses(
     visual_similarity = visual_features @ visual_features.t()
     projected_similarity = projected_features @ projected_features.t()
     text_similarity = text_features @ text_features.t()
+    visual_reference = (
+        projected_similarity if reference == "projected" else text_similarity
+    )
     return (
         _structure_distance(
-            visual_similarity, projected_similarity, mask, distance
+            visual_similarity, visual_reference, mask, distance
         ),
         _structure_distance(
             projected_similarity, text_similarity, mask, distance

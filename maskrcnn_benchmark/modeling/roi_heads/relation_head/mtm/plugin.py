@@ -344,6 +344,7 @@ class MTMPlugin(nn.Module):
             normalized_projected,
             all_targets,
             structure_distance,
+            loss_config.STRUCTURE_REFERENCE,
         )
         structure_ramp = linear_ramp(
             step,
@@ -362,6 +363,7 @@ class MTMPlugin(nn.Module):
             normalized_projected[:base_count],
             base_targets,
             structure_distance,
+            loss_config.STRUCTURE_REFERENCE,
         )
         base_debug = {
             "raw": base_relation_features,
@@ -386,6 +388,7 @@ class MTMPlugin(nn.Module):
                 normalized_projected[base_count:],
                 novel_targets,
                 structure_distance,
+                loss_config.STRUCTURE_REFERENCE,
             )
             novel_debug = {
                 "raw": novel_relation_features,
